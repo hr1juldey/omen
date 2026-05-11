@@ -41,9 +41,11 @@ modular = ">=26.3"
 max = ">=26.3"
 numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
 mosaic = { git = "https://github.com/brainwave-sh/mosaic", branch = "main" }
+raylib = { git = "https://github.com/kivicode/mojo-raylib", branch = "main" }
 
 [package.run-dependencies]
 modular = ">=26.3"
 max = ">=26.3"
 numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
 mosaic = { git = "https://github.com/brainwave-sh/mosaic", branch = "main" }
+raylib = { git = "https://github.com/kivicode/mojo-raylib", branch = "main" }
