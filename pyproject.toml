@@ -40,8 +40,10 @@ max = ">=26.3"
 modular = ">=26.3"
 max = ">=26.3"
 numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
+mosaic = { git = "https://github.com/brainwave-sh/mosaic", branch = "main" }
 
 [package.run-dependencies]
 modular = ">=26.3"
 max = ">=26.3"
 numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
+mosaic = { git = "https://github.com/brainwave-sh/mosaic", branch = "main" }
