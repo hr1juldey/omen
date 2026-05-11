@@ -19,6 +19,7 @@ omen = { path = ".", editable = true }
 # nabla-ml = ">=26.2251344"
 
 [tool.pixi.dependencies]
+pip = ">=26.1.1,<27"
 # mosaic-mojo = "*"  # Not available in channels yet - add via pixi add when available
 
 [package]
