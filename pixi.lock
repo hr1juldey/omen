@@ -4,6 +4,7 @@ environments:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
     - url: https://repo.prefix.dev/modular-community/
+    - url: https://conda.modular.com/max-nightly/
     indexes:
     - https://pypi.org/simple
     options:
@@ -198,7 +199,7 @@ packages:
 - pypi: ./
   name: omen
   version: 0.1.0
-  sha256: f876983b644a6efcbcc7815aec2f302753d511c077ef85bf5decc3e4778eb3f9
+  sha256: b2e3585c81d2f2700da97b49568ab579e2453355a808f3c6c9cec3fa032e2f29
   requires_python: '>=3.13'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.2-h35e630c_0.conda
   sha256: c0ef482280e38c71a08ad6d71448194b719630345b0c9c60744a2010e8a8e0cb

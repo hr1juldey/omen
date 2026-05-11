@@ -1,44 +1,46 @@
 [project]
 name = "omen"
 version = "0.1.0"
-description = "Add your description here"
+description = "Omen: Blender 5.1+ Render Engine built with Mojo for GPU compute and JEPA-based scene analysis"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = []
 
+[workspace]
+preview = ["pixi-build"]
+
 [tool.pixi.workspace]
-channels = ["conda-forge", "https://repo.prefix.dev/modular-community"]
+channels = ["conda-forge", "https://repo.prefix.dev/modular-community", "https://conda.modular.com/max-nightly"]
 platforms = ["linux-64"]
 
 [tool.pixi.pypi-dependencies]
 omen = { path = ".", editable = true }
+# nabla-ml - Temporarily disabled due to wheel compatibility
+# nabla-ml = ">=26.2251344"
 
-[tool.pixi.tasks]
-
-[workspace]
-preview = ["pixi-build"]
+[tool.pixi.dependencies]
+# mosaic-mojo = "*"  # Not available in channels yet - add via pixi add when available
 
 [package]
-name = "your_project_name"
+name = "omen"
 version = "0.1.0"
 
 [package.build]
 backend = {name = "pixi-build-mojo", version = "0.*"}
 
 [package.build.config.pkg]
-name = "your_package_name"
+name = "omen"
 
 [package.host-dependencies]
-modular = "0.26.2.*"
+modular = ">=26.3"
+max = ">=26.3"
 
 [package.build-dependencies]
-modular = "0.26.2.*"
-numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main"}
+modular = ">=26.3"
+max = ">=26.3"
+numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
 
 [package.run-dependencies]
-modular = "0.26.2.*"
-numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main"}
-
-[dependencies]
-modular = "26.2.*"
-numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main"}
+modular = ">=26.3"
+max = ">=26.3"
+numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
