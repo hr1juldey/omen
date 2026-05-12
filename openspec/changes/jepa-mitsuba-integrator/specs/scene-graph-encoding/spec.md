@@ -1,97 +1,100 @@
 ## ADDED Requirements
 
-### Requirement: Extract geometry from Mitsuba scene
+### Background: Python Dict Features (NOT C Structs)
 
-Omen SHALL extract vertex positions, face indices, and material assignments from all mesh shapes in a Mitsuba scene. Extraction SHALL use `mi.Scene.shapes()` to iterate shapes and access `vertex_positions` and `faces` attributes.
+Since both Mitsuba and Nabla are Python libraries, scene data is passed as Python dicts of numpy/nabla tensors — no C struct packing needed. Variable-length data handled naturally with Python lists.
 
-#### Scenario: Extract Cornell box geometry
+### Requirement: Extract structured scene features from Mitsuba
 
-- **WHEN** scene contains Cornell box with 2 boxes (2 meshes total)
-- **THEN** extractor returns list of Geometry objects
-- **AND** each Geometry contains vertices as Float32 array [N×3]
-- **AND** each Geometry contains faces as UInt32 array [M×3]
-- **AND** material indices are extracted per face
+Omen SHALL extract geometry, materials, and light data from Mitsuba scenes as Python dicts of numpy arrays.
 
-#### Scenario: Handle empty scene
+#### Scenario: Extract Cornell box features
 
-- **WHEN** scene contains no shapes
-- **THEN** extractor returns empty list
-- **AND** no error is raised
+- **WHEN** `extract_scene_features(mi.cornell_box())` is called
+- **THEN** the scene has: 5 shapes (floor, ceiling, back wall, red wall, green wall), 2 boxes (tall, short), 1 area light
+- **AND** for each shape:
+  - `params = mi.traverse(shape)`
+  - vertices: `np.array(params['vertex_positions']).reshape(-1, 3)`
+  - face indices: `np.array(shape.face_indices(0)).reshape(-1, 3)` if mesh
+  - normals: `np.array(params['vertex_normals']).reshape(-1, 3)` if `shape.has_vertex_normals()`
+  - material: `shape.bsdf()` → BSDF type + parameters
+- **AND** for each emitter:
+  - if `emitter.is_environment()`: type=envmap, no position
+  - else: `params = mi.traverse(emitter)` → position, intensity, radiance
+- **AND** for sensor: `sensor.fov()`, `params['to_world']` (4x4 transform)
+- **AND** return dict:
+  ```python
+  {
+      'geometry': np.array,      # (N_total_verts, 6) — pos_xyz + normal_xyz
+      'face_material_ids': np.array,  # (N_total_faces,) — material type per face
+      'materials': np.array,     # (N_materials, 9) — type_id + 8 params
+      'lights': np.array,        # (N_lights, 7) — type + pos + intensity + rgb
+      'camera': np.array,        # (16,) — 4x4 transform flattened
+      'n_objects': int,
+      'n_lights': int,
+  }
+  ```
 
-### Requirement: Extract material parameters from BSDFs
+#### Scenario: Handle variable mesh sizes
 
-Omen SHALL extract BSDF parameters from materials attached to shapes. Extraction SHALL support `PrincipledBSDF` and `RoughBSDF` types with parameters: diffuse reflectance, roughness, metallic, IOR, transmission weight.
+- **WHEN** scene has meshes of different sizes
+- **THEN** concatenate all mesh data: `np.concatenate([mesh_a_verts, mesh_b_verts, ...])`
+- **AND** track offsets for face_material_ids mapping
+- **AND** pad to fixed maximum if needed for batch processing
 
-#### Scenario: Extract PrincipledBSDF parameters
+#### Scenario: Extract BSDF parameters
 
-- **WHEN** shape has PrincipledBSDF material
-- **THEN** extractor reads base_color (RGB), roughness (float), metallic (float)
-- **AND** returns Material object with these parameters
+- **WHEN** shape has a BSDF material
+- **THEN** identify type:
+  - `RoughdielectricBSDF` → type_id=0, params: [alpha_u, alpha_v, 0, 0, 0, 0, 0, 0]
+  - `DiffuseBSDF` → type_id=1, params: [reflectance_r, g, b, 0, 0, 0, 0, 0]
+  - `ConductorBSDF` → type_id=2, params: [eta_r, eta_g, eta_b, k_r, k_g, k_b, 0, 0]
+  - `DielectricBSDF` → type_id=3, params: [int_ior, ext_ior, 0, 0, 0, 0, 0, 0]
+  - Unknown → type_id=-1, params: zeros(8)
+- **AND** material feature: `[type_id, *params]` = 9 floats per material
 
-#### Scenario: Extract rough plastic material
+### Requirement: Scene feature dict to Nabla tensors
 
-- **WHEN** shape has RoughBSDF material
-- **THEN** extractor reads reflectance (RGB), roughness (float)
-- **AND** returns Material object with these parameters
+Omen SHALL convert scene feature dicts to Nabla tensors for model input.
 
-#### Scenario: Handle unknown BSDF type
+#### Scenario: Prepare scene features for SceneGraphEncoder
 
-- **WHEN** shape has BSDF type not supported
-- **THEN** extractor logs warning
-- **AND** returns Material with default values
+- **WHEN** scene features dict is available
+- **THEN** convert to Nabla tensors:
+  ```python
+  features = {
+      'geometry': nb.Tensor.from_dlpack(scene_dict['geometry'].astype(np.float32)).cuda(),
+      'materials': nb.Tensor.from_dlpack(scene_dict['materials'].astype(np.float32)).cuda(),
+      'lights': nb.Tensor.from_dlpack(scene_dict['lights'].astype(np.float32)).cuda(),
+      'camera': nb.Tensor.from_dlpack(scene_dict['camera'].astype(np.float32)).cuda(),
+  }
+  ```
+- **AND** pass to SceneGraphEncoder which handles variable sizes internally
 
-### Requirement: Extract light emitters from scene
+### Requirement: Compute scene delta between frames
 
-Omen SHALL extract position, intensity, color, and type from all emitters in the scene. Extraction SHALL support point lights, area lights, and directional lights via `mi.Scene.emitters()`.
+Omen SHALL compute per-frame scene changes as structured delta tensors.
 
-#### Scenario: Extract point light from Cornell box
+#### Scenario: Compute camera movement delta
 
-- **WHEN** scene contains point light emitter
-- **THEN** extractor reads position (Float32[3]), intensity (float)
-- **AND** returns Light object with type=POINT
+- **WHEN** camera transforms between frames are available
+- **THEN** compute: `T_delta = T_frame_N @ np.linalg.inv(T_frame_N-1)`
+- **AND** extract translation delta (3 floats) + rotation quaternion delta (4 floats) = 7 floats
+- **AND** include in delta tensor
 
-#### Scenario: Extract area light emitter
+#### Scenario: Detect birth events (new scene elements)
 
-- **WHEN** scene contains area light emitter
-- **THEN** extractor reads position, normal (Float32[3]), surface area
-- **AND** returns Light object with type=AREA
+- **WHEN** new emitter or shape appears (not in previous frame)
+- **THEN** detect via scene features diff: compare object counts and hashes
+- **AND** encode: `[type_id, position_xyz, size_xyz, density]` = 8 floats
+- **AND** flag as high-surprise (confidence=0, trigger full path trace)
 
-#### Scenario: Handle scene with no emitters
+#### Scenario: Flatten delta for SceneDeltaEncoder
 
-- **WHEN** scene contains no emitters
-- **THEN** extractor returns empty list
-- **AND** warning is logged (scene may be black)
-
-### Requirement: Extract camera sensor parameters
-
-Omen SHALL extract camera transform, FOV, clip planes, and resolution from the scene's sensor. Extraction SHALL use `mi.Scene.sensors()[0]` to access the active sensor.
-
-#### Scenario: Extract perspective camera
-
-- **WHEN** scene has PerspectiveCamera
-- **THEN** extractor reads to_world transform matrix
-- **AND** extracts fov_x (float in radians)
-- **AND** extracts near_clip and far_clip distances
-
-#### Scenario: Extract sensor resolution
-
-- **WHEN** sensor film has size set
-- **THEN** extractor reads width and height in pixels
-- **AND** returns Camera object with resolution [W, H]
-
-### Requirement: Encode scene graph as structured tensors
-
-Omen SHALL convert extracted scene data into structured tensor format suitable for Mojo JEPA model. Encoding SHALL flatten geometry to vertex array, material parameters to fixed-size feature vectors, and lights to structured array.
-
-#### Scenario: Encode simple scene
-
-- **WHEN** scene has 1 mesh (100 vertices), 1 material, 1 light
-- **THEN** encoder produces geometry tensor [100×3] (vertices)
-- **AND** material tensor with 8 features (diffuse RGB, roughness, metallic, IOR, etc.)
-- **AND** light tensor with position[3], intensity, type
-
-#### Scenario: Handle variable geometry count
-
-- **WHEN** scene has multiple meshes with different vertex counts
-- **THEN** encoder concatenates all vertices into single tensor
-- **AND** stores mesh boundaries (start_idx, count) per object
+- **WHEN** all per-frame deltas are computed
+- **THEN** flatten into delta tensor:
+  ```
+  [camera(7), objects(N×8), lights(M×7), births(K×8), materials(P×5)]
+  ```
+- **AND** pad to fixed maximum length with zeros
+- **AND** shape: `(1, max_delta_dim)` for SceneDeltaEncoder input

@@ -2,241 +2,183 @@
 
 ### Requirement: Save model checkpoints during training
 
-Omen SHALL save JEPA model checkpoints at regular intervals during training to enable resumption and prevent loss of training progress. Checkpoints SHALL contain model weights, optimizer state, training iteration, and performance metrics.
+Omen SHALL save JEPA model checkpoints at regular intervals during training to enable resumption after crash. Checkpoints SHALL use Nabla's `state_dict()` for weight serialization.
 
-#### Scenario: Save checkpoint during training
+#### Scenario: Save checkpoint every 10 iterations
 
-- **WHEN** JEPA training is running and checkpoint interval is reached
-- **THEN** serialize model weights to file via Nabla's `state_dict()`
-- **AND** serialize optimizer state (Adam moments, learning rate)
-- **AND** save training iteration number
-- **AND** save performance metrics (loss, SSIM, PSNR)
-- **AND** write to `checkpoint_iter_<N>.omen` in training directory
-- **AND** maintain symlink `latest.omen` to most recent checkpoint
+- **WHEN** JEPA training is running and `iteration % 10 == 0`
+- **THEN** serialize model weights via Nabla `state_dict()` → ordered dict of tensor name → tensor data
+- **AND** serialize optimizer state: AdamW moments (m, v), learning rate, step count
+- **AND** save training metadata: iteration number, loss value, SSIM, PSNR
+- **AND** write checkpoint file: `~/.cache/omen/checkpoints/checkpoint_iter_{N}.omen`
+- **AND** update symlink: `latest.omen → checkpoint_iter_{N}.omen`
+- **AND** log: "Checkpoint saved at iteration {N} (loss={loss:.4f})"
 
 #### Scenario: Resume training from checkpoint
 
-- **WHEN** training is interrupted (crash, user abort, system shutdown)
-- **AND** checkpoint file exists in training directory
-- **THEN** load model weights from `latest.omen`
-- **AND** restore optimizer state
-- **AND** resume training from saved iteration number
-- **AND** log "Resumed from iteration N"
+- **WHEN** training starts and `latest.omen` exists in checkpoint directory
+- **THEN** load model weights from checkpoint via Nabla `load_state_dict()`
+- **AND** restore AdamW optimizer state (momentum buffers m, v)
+- **AND** resume from saved iteration number
+- **AND** log "Resumed from iteration {N}"
 - **AND** continue training without repeating completed iterations
 
 ### Requirement: Version model checkpoints with architecture metadata
 
-Omen SHALL store model architecture metadata alongside weights to enable compatibility checking and prevent loading incompatible models. Metadata SHALL include layer dimensions, JEPA version, and Nabla version.
+Omen SHALL store model architecture metadata alongside weights to prevent loading incompatible models.
 
-#### Scenario: Save checkpoint with metadata
+#### Scenario: Save checkpoint with metadata JSON
 
-- **WHEN** saving checkpoint file
-- **THEN** create JSON metadata file `<checkpoint>.omen.meta.json`
-- **AND** include architecture hash (layer dimensions, token counts)
-- **AND** include Omen version string
-- **AND** include Nabla version string
-- **AND** include training timestamp
-- **AND** include training dataset hash (scene type, resolution range)
+- **WHEN** saving checkpoint file `checkpoint_iter_N.omen`
+- **THEN** create `checkpoint_iter_N.omen.meta.json` alongside with:
+  - `architecture_hash`: SHA256 of layer dimensions string (e.g., "ViT-Tiny-192-3-12_AR-6-16-64-2048")
+  - `omen_version`: e.g., "0.1.0"
+  - `nabla_version`: from Nabla library version string
+  - `training_timestamp`: ISO 8601 datetime
+  - `training_config`: `{lr, weight_decay, batch_size, total_iterations}`
+  - `metrics`: `{loss, ssim, psnr}` at checkpoint time
 
 #### Scenario: Validate checkpoint before loading
 
 - **WHEN** loading checkpoint file
-- **THEN** read metadata JSON from `<checkpoint>.omen.meta.json`
-- **AND** compute current architecture hash
-- **AND** verify architecture hash matches metadata
-- **AND** verify Omen version is compatible (semver check)
-- **AND** raise error if incompatible: "Cannot load checkpoint: architecture mismatch"
-- **AND** log warning if version differs but compatible: "Loading checkpoint from Omen v0.1.2, current is v0.1.5"
+- **THEN** read metadata JSON from companion `.meta.json` file
+- **AND** compute current architecture hash from running model
+- **AND** if hashes match: proceed with loading
+- **AND** if hashes differ: raise `RuntimeError("Architecture mismatch: checkpoint has {ckpt_hash}, current model has {model_hash}")`
+- **AND** if version differs but compatible (same major.minor): log warning, proceed
+- **AND** if version incompatible: raise error
 
 ### Requirement: Store base pre-trained model in global cache
 
-Omen SHALL provide a base pre-trained JEPA model trained on Cornell box variants and stored in global user cache directory. Base model SHALL be automatically downloaded on first use if not present locally.
+Omen SHALL provide a base pre-trained JEPA model trained on Cornell box variants, stored in global user cache, auto-downloaded on first use.
 
 #### Scenario: Download base model on first use
 
-- **WHEN** Omen is invoked for first time
-- **AND** no model exists in `~/.cache/omen/models/base_v0.omen`
-- **THEN** check for base model at bundled location `<install_dir>/models/base_v0.omen`
-- **AND** if not bundled, download from `https://omen-render.org/models/base_v0.omen`
-- **AND** verify SHA256 checksum matches expected value
+- **WHEN** Omen is invoked for first time AND `~/.cache/omen/models/base_v0.omen` does not exist
+- **THEN** check bundled location: `<install_dir>/models/base_v0.omen`
+- **AND** if not bundled: download from `https://omen-render.org/models/base_v0.omen`
+- **AND** verify SHA256 checksum matches expected value from `base_v0.omen.sha256`
 - **AND** save to `~/.cache/omen/models/base_v0.omen`
-- **AND** create metadata file `base_v0.omen.meta.json`
-- **AND** log "Downloaded base model (52MB, SHA256 verified)"
+- **AND** create `~/.cache/omen/models/` directory if needed
+- **AND** log: "Downloaded base model ({size}MB, SHA256 verified)"
 
 #### Scenario: Load base model for inference
 
-- **WHEN** JEPA inference is requested
-- **AND** no scene-specific fine-tuned model exists
+- **WHEN** JEPA inference is requested AND no scene-specific model exists
 - **THEN** load `~/.cache/omen/models/base_v0.omen`
 - **AND** validate architecture compatibility
-- **AND** use for inference directly (no fine-tuning needed)
-- **AND** log "Using base model (pre-trained on Cornell box variants)"
+- **AND** use for inference directly (no fine-tuning)
+- **AND** log: "Using base model (pre-trained on Cornell box variants)"
 
 ### Requirement: Fine-tune base model per scene and cache results
 
-Omen SHALL fine-tune the base JEPA model on scene-specific training data and cache the fine-tuned weights for fast subsequent renders. Scene-specific models SHALL be indexed by scene hash to enable automatic discovery.
+Omen SHALL fine-tune the base JEPA model on scene-specific data and cache fine-tuned weights indexed by scene hash.
 
 #### Scenario: Generate scene-specific fine-tuned model
 
 - **WHEN** user renders same scene 3+ times with JEPA enabled
-- **THEN** compute scene hash from geometry + materials + lights (not camera position)
-- **AND** check `~/.cache/omen/models/scenes/<hash>/fine_tuned.omen`
-- **AND** if not exists, trigger fine-tuning (50 iterations, ~1-5 minutes)
-- **AND** render training pairs from current scene (4spp + 256spp, different camera angles)
-- **AND** train starting from base model weights
-- **AND** save fine-tuned weights to scene-specific cache
-- **AND** log "Fine-tuned model for scene (hash: <hash>, 50 iterations, SSIM improved from 0.91 to 0.97)"
+- **THEN** compute scene hash from geometry + materials + lights (exclude camera position)
+- **AND** check cache: `~/.cache/omen/models/scenes/<hash>/fine_tuned.omen`
+- **AND** if not exists:
+  - Generate training pairs: render scene at 4spp + 256spp from different camera angles
+  - Fine-tune from base model for 50 iterations using NablaAdamW(lr=5e-5, weight_decay=1e-3)
+  - Save to scene-specific cache directory
+  - Log: "Fine-tuned model for scene (hash: {hash}, 50 iters, SSIM 0.91 → 0.97)"
 
 #### Scenario: Load scene-specific cached model
 
 - **WHEN** rendering scene with JEPA enabled
 - **THEN** compute scene hash from current Mitsuba scene
-- **AND** check if fine-tuned model exists: `~/.cache/omen/models/scenes/<hash>/fine_tuned.omen`
-- **AND** if exists, load fine-tuned model instead of base model
+- **AND** check `~/.cache/omen/models/scenes/<hash>/fine_tuned.omen`
+- **AND** if exists: load fine-tuned model (skip base model)
 - **AND** validate scene hash matches cached metadata
-- **AND** use fine-tuned model for inference
-- **AND** log "Using scene-specific model (SSIM: 0.97, trained on 20 frames)"
+- **AND** log: "Using scene-specific model (SSIM: 0.97, trained on {N} frames)"
 
-### Requirement: Aggregate learning from user scenes into improved base model
+### Requirement: Topology-based scene hashing for animation cache
 
-Omen SHALL support optional aggregation of scene-specific fine-tuned models to improve the base model over time. Aggregation SHALL be opt-in with local-only default to preserve user privacy.
+Omen SHALL compute scene hash based on topology (face connectivity, material types, light types) NOT vertex positions, so animated scenes maintain stable cache key across frames.
 
-#### Scenario: Opt-in to model improvement program
+#### Scenario: Compute topology hash
 
-- **WHEN** user enables "Help improve Omen" setting in configuration
-- **THEN** prompt: "Omen can learn from your scenes to improve rendering quality for everyone. Your scene data (geometry, materials, lights) will be used to train future models. No uploads without explicit consent."
-- **AND** offer options:
-  - "Local only: Improve models on my machine only (default)"
-  - "Anonymous upload: Contribute de-identified models to improve Omen for everyone"
-- **AND** save user preference to `~/.config/omen/config.yaml`
+- **WHEN** cache lookup is needed for animated scene
+- **THEN** hash from:
+  - Face connectivity (triangle adjacency indices, NOT vertex positions)
+  - Material type IDs per face (diffuse=0, glass=1, metal=2, etc.)
+  - Light type IDs (point=0, area=1, environment=2)
+  - Object count and hierarchy structure
+- **AND** exclude: vertex positions, light intensities, material parameter values, camera transform
+- **AND** verify: rotating object does NOT change hash
+- **AND** verify: deforming mesh does NOT change hash
+- **AND** verify: adding new light DOES change hash
 
-#### Scenario: Local model aggregation
+### Requirement: Aggregate learning from user scenes
 
-- **WHEN** "Local only" mode is enabled
-- **AND** 5+ scene-specific fine-tuned models exist
-- **THEN** trigger periodic background aggregation (weekly, or manual trigger)
-- **AND** load base model + all fine-tuned models
-- **AND** compute weight updates via federated averaging
-- **AND** update base model with aggregated improvements
+Omen SHALL support optional local aggregation of scene-specific models to improve the base model. Opt-in with local-only default.
+
+#### Scenario: Local federated averaging
+
+- **WHEN** "Local only" mode enabled AND 5+ scene-specific models exist
+- **THEN** load base model + all fine-tuned models
+- **AND** compute federated average of weight updates
 - **AND** save as `~/.cache/omen/models/base_v1_local.omen`
-- **AND** log "Aggregated 7 scene models → improved base model (SSIM +0.03 on average)"
 - **AND** no data leaves user's machine
+- **AND** log: "Aggregated {N} scene models → improved base model"
 
-#### Scenario: Anonymous model contribution
+#### Scenario: Anonymous contribution (opt-in)
 
-- **WHEN** "Anonymous upload" mode is enabled
-- **AND** user has trained scene-specific model
-- **THEN** prompt: "Share fine-tuned model for scene <hash> to help improve Omen? Scene data (geometry, materials) will be de-identified before upload."
-- **AND** if user consents:
-  - Remove identifiable features from scene graph (exact coordinates, specific textures)
-  - Upload only weight deltas (difference from base model)
-  - Include metadata only: scene type (indoor, outdoor), complexity metrics, training performance
-  - Send to `https://omen-render.org/api/contribute`
-- **AND** log "Contributed model for scene <hash> (de-identified, 2.1MB upload)"
+- **WHEN** "Anonymous upload" mode enabled AND user consents
+- **THEN** de-identify scene data: remove coordinates, textures, keep only structure
+- **AND** compute weight deltas (difference from base model)
+- **AND** upload only deltas + anonymized metadata to `https://omen-render.org/api/contribute`
 
-### Requirement: Detect similar scenes and reuse cached models
+### Requirement: GPU rendering backend detection for zero-copy
 
-Omen SHALL analyze scene features to detect similarity with previously cached models and automatically reuse appropriate fine-tuned models without retraining.
+Omen SHALL detect Mitsuba rendering backend and configure zero-copy buffer passing when both Mitsuba and JEPA are on the same GPU.
 
-#### Scenario: Scene similarity detection
+#### Scenario: Detect GPU backend from variant
 
-- **WHEN** computing scene hash for cache lookup
-- **AND** no exact match exists
-- **THEN** compute scene feature vector:
-  - Number of meshes, triangles, materials, lights
-  - Material type distribution (glass, metal, diffuse count)
-  - Scene bounding box, light position variance
-- **AND** query scene database for similar feature vectors (cosine similarity > 0.85)
-- **AND** if similar scene found:
-  - Load cached model from similar scene
-  - Run 10-iteration quick adaptation on current scene
-  - Save as new fine-tuned model
-- **AND** log "Reused model from similar scene (similarity: 0.92), adapted in 10 iterations"
+- **WHEN** JEPABridge initializes
+- **THEN** query `mi.variant()`:
+  - `cuda_ad_rgb` → NVIDIA CUDA GPU, `is_gpu=True`
+  - `llvm_ad_rgb` → CPU/ROCm, check for GPU
+  - `scalar_rgb` → CPU only, `is_gpu=False`
+- **AND** store `is_gpu_render` flag and `gpu_device_id`
 
-#### Scenario: Scene feature database
+#### Scenario: Zero-copy on same GPU
 
-- **WHEN** fine-tuned model is saved
-- **THEN** extract scene feature vector
-- **AND** save to `~/.cache/omen/models/scene_index.json`
-- **AND** include mapping: feature hash → model path, scene type, metadata
-- **AND** enable fast similarity queries without loading all models
+- **WHEN** both Mitsuba and JEPA are on GPU (same device)
+- **THEN** pass GPU pointer directly via C ABI: `ctypes.c_void_p(ptr_value)`
+- **AND** Mojo wraps as `DeviceBuffer(ctx, raw_ptr, count, owning=False)`
+- **AND** NO memcpy — Mojo reads Mitsuba's GPU memory directly
 
-### Requirement: GPU rendering configuration for zero-copy buffers
+#### Scenario: CPU-to-GPU memcpy fallback
 
-Omen SHALL detect Mitsuba rendering backend (CPU/GPU) and configure JEPA inference to use zero-copy buffer passing when both Mitsuba and JEPA are on the same GPU device.
-
-#### Scenario: Detect GPU rendering backend
-
-- **WHEN** JEPABridge is initialized
-- **THEN** query Mitsuba variant via `mi.variant()`
-- **AND** parse variant string:
-  - `cuda_ad_*` → NVIDIA CUDA GPU
-  - `llvm_ad_*` → AMD ROCm GPU
-  - `metal_ad_*` → Apple Metal GPU
-  - `cpu_ad_*` → CPU rendering
-- **AND** store `is_gpu_render` flag (True for GPU variants)
-
-#### Scenario: Configure zero-copy buffer passing
-
-- **WHEN** both Mitsuba and JEPA are on GPU
-- **AND** `mi.variant()` is GPU variant (e.g., `cuda_ad_rgb`)
-- **THEN** detect GPU device ID from Mitsuba context
-- **AND** pass `gpu_device_id` parameter to Mojo `omen_denoise()`
-- **AND** wrap Mitsuba GPU tensor pointer as `UnsafePointer` with `owning=False`
-- **AND** Mojo creates `DeviceBuffer` from pointer without `memcpy`
-- **AND** log "Zero-copy mode: Mitsuba CUDA device 0 → Mojo CUDA device 0"
-
-#### Scenario: Fallback to CPU-GPU memcpy
-
-- **WHEN** Mitsuba is rendering on CPU (`cpu_ad_*` variant)
-- **AND** JEPA is running on GPU
-- **THEN** detect mismatch: `is_gpu_render = False`, `jepa_device_id >= 0`
-- **AND** allocate GPU buffer in Mojo
-- **AND** copy CPU render data to GPU via `memcpy`
-- **AND** log "Memcpy mode: CPU → GPU (10-50ms overhead)"
-- **AND** run JEPA inference on GPU
-- **AND** copy result back to CPU if needed
+- **WHEN** Mitsuba on CPU and JEPA on GPU
+- **THEN** allocate GPU buffer in Mojo
+- **AND** copy CPU data → GPU via `ctx.enqueue_copy(dst_buf=dev_buf, src_buf=host_buf)`
+- **AND** log: "Memcpy mode: CPU → GPU (10-50ms overhead)"
+- **AND** run JEPA inference on GPU, copy result back to CPU
 
 ### Requirement: GPU memory budget management
 
-Omen SHALL monitor GPU memory usage during JEPA inference and training to prevent out-of-memory errors. System SHALL pre-allocate memory budget and gracefully degrade if insufficient memory available.
+Omen SHALL monitor GPU memory and gracefully degrade when insufficient.
 
-#### Scenario: Detect GPU memory availability
+#### Scenario: Check memory availability
 
-- **WHEN** JEPABridge initializes
-- **AND** GPU device is selected
-- **THEN** query GPU memory info via CUDA/HIP/Metal API
-- **AND** record total memory, free memory, reserved memory
-- **AND** compute available budget (free - 500MB safety margin)
-- **AND** log "GPU memory: 8GB total, 6GB free, 5.5GB available for Omen"
+- **WHEN** JEPABridge initializes with GPU
+- **THEN** query GPU memory: total, free, available = free - 500MB safety margin
+- **AND** log: "GPU memory: {total}GB total, {free}GB free, {available}GB for Omen"
 
-#### Scenario: Allocate memory within budget
+#### Scenario: Inference memory estimate
 
-- **WHEN** loading JEPA model for inference
-- **THEN** estimate memory requirements:
-  - Model weights: ~500MB
-  - Scene graph tensors: ~100MB (varies by scene complexity)
-  - Render buffers: ~50MB (varies by resolution)
-  - Workspace (activations): ~200MB
-- **AND** verify total estimate < available budget
-- **AND** if insufficient:
-  - Log warning: "Insufficient GPU memory (need 2.5GB, have 1.8GB)"
-  - Fall back to CPU inference or reduce resolution
-- **AND** if sufficient:
-  - Allocate model and buffers
-  - Proceed with inference
+- **WHEN** loading model for inference
+- **THEN** estimate: model ~500MB + scene graph ~100MB + buffers ~50MB + workspace ~200MB ≈ 850MB
+- **AND** if estimate > available: fall back to CPU inference or reduce resolution
+- **AND** if sufficient: allocate and proceed
 
-#### Scenario: Training memory budget
+#### Scenario: Training memory management
 
-- **WHEN** starting JEPA training
-- **THEN** estimate training memory:
-  - Model weights: ~500MB
-  - Optimizer state (Adam moments): ~1GB (2× model weights)
-  - Gradients: ~500MB
-  - Batch data: ~200MB
-  - Workspace: ~500MB
-- **AND** verify total < available budget
-- **AND** if insufficient:
-  - Reduce batch size (e.g., 8 → 4 → 2 → 1)
-  - Log "Reduced batch size to 1 due to memory constraints"
-  - If still insufficient, fall back to CPU training
+- **WHEN** starting training
+- **THEN** estimate: model ~500MB + optimizer ~1GB (Adam moments) + gradients ~500MB + batch ~200MB ≈ 2.2GB
+- **AND** if insufficient: reduce batch size (8 → 4 → 2 → 1)
+- **AND** if still insufficient: fall back to CPU training

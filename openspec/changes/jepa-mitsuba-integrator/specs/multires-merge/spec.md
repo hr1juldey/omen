@@ -1,90 +1,122 @@
 ## ADDED Requirements
 
-### Requirement: Render low-resolution high-quality pass
+### Requirement: Mode 3 multi-resolution render pipeline
 
-Omen SHALL render scene at reduced resolution (25% scale) with high samples per pixel (256 spp) using Mitsuba's path tracer. Low-res pass SHALL provide converged color but lack high-frequency detail.
+Omen SHALL implement a two-pass multi-resolution pipeline that renders low-res high-quality + high-res noisy, then merges using JEPA with scene graph guidance. Target: 8-16× speedup vs uniform 256spp.
 
-#### Scenario: Render low-res Cornell box
+#### Scenario: PASS 1 — Render low-res high-quality
 
-- **WHEN** mode=3 (multires) and first pass is requested
-- **THEN** set sensor film size to [H/4, W/4]
-- **AND** call `mi.render(scene, spp=256)`
-- **AND** store result as low_res_tensor [H/4, W/4, 4]
-- **AND** verify result is converged (low noise)
+- **WHEN** `render_multires(scene, scale=4)` is called
+- **THEN** modify sensor film size to `[H//scale, W//scale]` = `[H//4, W//4]`:
+  ```python
+  params = mi.traverse(sensor)
+  params['film.size'] = [H // scale, W // scale]
+  params.update()
+  ```
+- **AND** render at 256spp: `low_res = mi.render(scene, spp=256)` → `(H//4, W//4, 3)`
+- **AND** memory usage: ~6.25% of full resolution (pixels = (1/4)²)
+- **AND** render time: ~16× faster than full res at 256spp (fewer pixels + same spp)
+- **AND** store as `low_res_rgba` with alpha channel → `(H//4, W//4, 4)`
 
-#### Scenario: Handle low-res memory efficiency
+#### Scenario: PASS 2 — Render high-res noisy
 
-- **WHEN** rendering at 25% resolution
-- **THEN** memory usage is ~6.25% of full resolution
-- **AND** render time is ~16× faster than full res at 256 spp
-- **AND** logs timing and memory metrics
+- **WHEN** PASS 1 completes
+- **THEN** restore sensor film size to `[H, W]`:
+  ```python
+  params['film.size'] = [H, W]
+  params.update()
+  ```
+- **AND** render at 4spp: `high_res = mi.render(scene, spp=4)` → `(H, W, 3)`
+- **AND** store as `high_res_rgba` → `(H, W, 4)`
+- **AND** this pass captures full geometric detail (edges, thin geometry) but with Monte Carlo noise
 
-### Requirement: Render high-resolution noisy pass
+#### Scenario: JEPA merge with scene graph guidance
 
-Omen SHALL render scene at full resolution (100% scale) with low samples per pixel (4 spp) using Mitsuba's path tracer. High-res pass SHALL provide full geometric detail but with Monte Carlo noise.
+- **WHEN** both `low_res_rgba (H//4, W//4, 4)` and `high_res_rgba (H, W, 4)` are available
+- **THEN** extract scene graph: `scene_graph = extract_scene_graph(scene)`
+- **AND** call `merged = bridge.merge_multires(scene_graph, low_res_rgba, high_res_rgba, scale=4)`
+- **AND** internally Mojo kernel:
+  - Upsamples low-res to full res using bilinear interpolation (base color)
+  - Extracts high-frequency detail from high-res noisy pass (edges, geometry)
+  - Uses scene graph geometry edges to guide where to preserve detail vs smooth
+  - Uses material boundaries to prevent texture bleeding across surfaces
+- **AND** output: `merged (H, W, 4)` — clean color from low-res, sharp edges from high-res
 
-#### Scenario: Render high-res noisy Cornell box
+### Requirement: Geometry-aware upsampling in Mojo kernel
 
-- **WHEN** mode=3 (multires) and second pass is requested
-- **THEN** set sensor film size to [H, W]
-- **AND** call `mi.render(scene, spp=4)`
-- **AND** store result as high_res_tensor [H, W, 4]
-- **AND** verify result has geometric detail (edges, textures)
+Omen SHALL implement scene-graph-guided merge in Mojo GPU kernels using TileTensor. The merge kernel SHALL use exact geometry edges and material boundaries from scene graph to prevent DLSS-style hallucination.
 
-#### Scenario: Handle high-res noise pattern
+#### Scenario: Merge kernel launch
 
-- **WHEN** high-res render at 4 spp completes
-- **THEN** result has visible Monte Carlo noise
-- **AND** noise is especially noticeable in flat regions
-- **AND** detail is preserved in edges and textures
+- **WHEN** `omen_merge_multires` is called
+- **THEN** create `DeviceContext()`
+- **AND** zero-copy wrap low-res and high-res buffers as `DeviceBuffer(owning=False)`
+- **AND** create TileTensors:
+  ```mojo
+  comptime high_layout = row_major[H, W, 4]()
+  comptime low_layout = row_major[H//4, W//4, 4]()
+  ```
+- **AND** bind kernel: `comptime kernel = merge_kernel[type_of(high_layout), type_of(low_layout)]`
+- **AND** launch with 2D grid: `grid_dim=(ceildiv(W, 16), ceildiv(H, 16)), block_dim=(16, 16)`
+- **AND** `ctx.synchronize()` then copy output to host
 
-### Requirement: Merge multi-resolution passes with JEPA
+#### Scenario: Edge-aware merge logic per pixel
 
-Omen SHALL invoke JEPA model to merge low-res clean and high-res noisy renders using scene graph knowledge. Merge SHALL use exact geometry edges (from scene graph) to guide upsampling, avoiding DLSS-style hallucination artifacts.
+- **WHEN** merge kernel processes pixel (row, col) in the high-res output
+- **THEN** compute corresponding low-res position: `lr_row = row / scale, lr_col = col / scale`
+- **AND** bilinear sample low-res: `low_color = bilinear(low_res, lr_row, lr_col)`
+- **AND** read high-res noisy: `high_color = high_res[row, col]`
+- **AND** check scene graph: is this pixel near a geometry edge or material boundary?
+  - If near edge: weight toward `high_color` (preserve detail)
+  - If flat region: weight toward `low_color` (smooth, converged)
+- **AND** blend: `output[row, col] = edge_weight * high_color + (1 - edge_weight) * low_color`
 
-#### Scenario: Merge multi-resolution inputs
+#### Scenario: No hallucination artifacts
 
-- **WHEN** low_res_high_qual [H/4, W/4, 4] and high_res_noisy [H, W, 4] are available
-- **THEN** call `omen_merge_multires` with scene graph
-- **AND** pass scale_factor=4 (upsampling ratio)
-- **AND** receive output_merged [H, W, 4]
-- **AND** verify output has clean color (from low-res) and sharp detail (from high-res)
-
-#### Scenario: Validate edge quality
-
-- **WHEN** multi-resolution merge completes
-- **THEN** edges are sharp (no bilinear upsampling blur)
-- **AND** no DLSS-style hallucination artifacts (invented textures)
-- **AND** material boundaries are preserved (from scene graph knowledge)
+- **WHEN** merge completes
+- **THEN** verify edges are sharp (no bilinear blur across geometry boundaries)
+- **AND** verify no invented textures (DLSS-style hallucination)
+- **AND** verify material boundaries preserved (flat wall doesn't bleed into adjacent glass)
+- **AND** verify: PSNR > 30dB vs 256spp ground truth at full resolution
 
 ### Requirement: Validate speedup from multi-resolution
 
-Omen SHALL measure effective speedup of multi-resolution rendering compared to uniform sampling at target quality. Speedup calculation SHALL compare (25% res 256 spp + 100% res 4 spp) vs (100% res 256 spp).
+Omen SHALL measure effective speedup and quality of multi-resolution rendering.
 
 #### Scenario: Calculate effective speedup
 
 - **WHEN** mode=3 render completes
-- **THEN** measure time for PASS 1 (low-res 256 spp)
-- **AND** measure time for PASS 2 (high-res 4 spp)
-- **AND** measure time for JEPA merge
-- **AND** calculate: time_uniform_full / (time_multi_total)
-- **AND** verify speedup > 4× (target: 8-16×)
+- **THEN** measure time for PASS 1 (low-res 256spp): `t_low`
+- **AND** measure time for PASS 2 (high-res 4spp): `t_high`
+- **AND** measure time for JEPA merge: `t_merge`
+- **AND** measure time for uniform 256spp at full res: `t_uniform`
+- **AND** compute speedup: `t_uniform / (t_low + t_high + t_merge)`
+- **AND** target: 8-16× speedup (PASS 1 is ~16× faster due to 6.25% pixels, PASS 2 is ~64× faster due to 4spp)
 
-### Requirement: Self-training on multi-resolution pairs
+#### Scenario: Quality vs ground truth
 
-Omen SHALL train JEPA multi-resolution merge head using self-supervised pairs. Training SHALL render same scene at (low_res, high_spp) and (high_res, low_spp) and (high_res, high_spp) as ground truth.
+- **WHEN** 256spp full-res ground truth is available
+- **THEN** compute SSIM between merged output and GT
+- **AND** compute PSNR between merged output and GT
+- **AND** target: SSIM > 0.92, PSNR > 30dB
+- **AND** log: "Multires: {speedup:.1f}× speedup, SSIM={ssim:.3f}, PSNR={psnr:.1f}dB"
 
-#### Scenario: Generate multi-res training data
+### Requirement: Self-training for multi-res merge
 
-- **WHEN** training mode is enabled for multi-resolution
-- **THEN** render at 25% res 256 spp (input A)
-- **AND** render at 100% res 4 spp (input B)
-- **AND** render at 100% res 256 spp (ground truth)
-- **AND** store triplet (A, B, GT) as training sample
+Omen SHALL train merge model using triplets of (low-res clean, high-res noisy, full-res ground truth).
 
-#### Scenario: Train multi-res merge model
+#### Scenario: Generate multi-res training triplets
 
-- **WHEN** training triplets (low_res_clean, high_res_noisy, ground_truth) are available
-- **THEN** call JEPA training function with batch of samples
-- **AND** update merge model weights to minimize L1 loss vs ground truth
-- **AND** log training metrics (PSNR, SSIM vs ground truth)
+- **WHEN** training mode for multires is enabled
+- **THEN** render at 25% res 256spp → `low_res_clean` (input A)
+- **AND** render at 100% res 4spp → `high_res_noisy` (input B)
+- **AND** render at 100% res 256spp → `ground_truth` (target)
+- **AND** store triplet `(low_res_clean, high_res_noisy, ground_truth)`
+
+#### Scenario: Train merge model
+
+- **WHEN** training triplets are available
+- **THEN** pass to Mojo via `omen_train_step` C ABI
+- **AND** loss: `L1(merge(low_res, high_res, scene_graph), ground_truth)`
+- **AND** train for 100 iterations on Cornell box
+- **AND** validate: PSNR > 30dB on held-out views
