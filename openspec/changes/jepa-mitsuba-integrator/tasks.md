@@ -1,26 +1,26 @@
 ## 1. Project Structure
 
-- [ ] 1.1 Create `src/omen/` package directory
-- [ ] 1.2 Create `src/omen/__init__.py` with Nabla import guard
-- [ ] 1.3 Create `src/omen/scene_extractor.py` for scene graph extraction
-- [ ] 1.4 Create `src/omen/jepa_bridge.py` for model loading + DLPack transfer
-- [ ] 1.5 Create `src/omen/model/` directory for Nabla model modules
-- [ ] 1.6 Create `src/omen/model/__init__.py`
-- [ ] 1.7 Create `src/omen/model/scene_encoder.py` (SceneGraphEncoder + RenderFeatureEncoder + CrossAttention)
-- [ ] 1.8 Create `src/omen/model/arpredictor.py` (ConditionalBlock + ARPredictor)
-- [ ] 1.9 Create `src/omen/model/decoder.py` (Conv2dTranspose decoder + ConfidenceHead)
-- [ ] 1.10 Create `src/omen/model/sigreg.py` (SIGReg as custom Nabla kernel)
-- [ ] 1.11 Create `src/omen/model/jepa.py` (OmenJEPA top-level module combining all components)
-- [ ] 1.12 Create `src/omen/kernels/` for custom Mojo GPU kernels (SIGReg, merge)
-- [ ] 1.13 Create `src/omen/modes/` directory for render mode implementations
-- [ ] 1.14 Create `src/omen/modes/__init__.py`
-- [ ] 1.15 Create `src/omen/modes/denoiser.py`
-- [ ] 1.16 Create `src/omen/modes/adaptive.py`
-- [ ] 1.17 Create `src/omen/modes/multires.py`
-- [ ] 1.18 Create `src/omen/modes/animation.py`
-- [ ] 1.19 Create `src/omen/training/` directory
-- [ ] 1.20 Create `src/omen/training/trainer.py` (Nabla training loop with LoRA)
-- [ ] 1.21 Create `src/omen/training/data_gen.py` (Dr.Jit training pair generation)
+- [x] 1.1 Create `src/omen/` package directory
+- [x] 1.2 Create `src/omen/__init__.py` with Nabla import guard
+- [x] 1.3 Create `src/omen/scene_extractor.py` for scene graph extraction
+- [x] 1.4 Create `src/omen/jepa_bridge.py` for model loading + DLPack transfer
+- [x] 1.5 Create `src/omen/model/` directory for Nabla model modules
+- [x] 1.6 Create `src/omen/model/__init__.py`
+- [x] 1.7 Create `src/omen/model/scene_encoder.py` (SceneGraphEncoder + RenderFeatureEncoder + CrossAttention)
+- [x] 1.8 Create `src/omen/model/arpredictor.py` (ConditionalBlock + ARPredictor)
+- [x] 1.9 Create `src/omen/model/decoder.py` (Conv2dTranspose decoder + ConfidenceHead)
+- [x] 1.10 Create `src/omen/model/sigreg.py` (SIGReg as custom Nabla kernel)
+- [x] 1.11 Create `src/omen/model/jepa.py` (OmenJEPA top-level module combining all components)
+- [x] 1.12 Create `src/omen/kernels/` for custom Mojo GPU kernels (SIGReg, merge)
+- [x] 1.13 Create `src/omen/modes/` directory for render mode implementations
+- [x] 1.14 Create `src/omen/modes/__init__.py`
+- [x] 1.15 Create `src/omen/modes/denoiser.py`
+- [x] 1.16 Create `src/omen/modes/adaptive.py`
+- [x] 1.17 Create `src/omen/modes/multires.py`
+- [x] 1.18 Create `src/omen/modes/animation.py`
+- [x] 1.19 Create `src/omen/training/` directory
+- [x] 1.20 Create `src/omen/training/trainer.py` (Nabla training loop with LoRA)
+- [x] 1.21 Create `src/omen/training/data_gen.py` (Dr.Jit training pair generation)
 
 > Spec: cross-cutting (all specs reference these files)
 
@@ -28,23 +28,23 @@
 
 > Spec: `specs/scene-graph-encoding/`
 
-- [ ] 2.1 Implement `extract_geometry()` iterating `mi.Scene.shapes()`
-- [ ] 2.2 Extract vertex positions via `mi.traverse(shape)['vertex_positions']` -> Float array Nx3
-- [ ] 2.3 Extract face indices via `shape.face_indices(0)` or `shape.faces_buffer()` -> UInt array Fx3
-- [ ] 2.4 Check `shape.has_vertex_normals()` and extract normals if available
-- [ ] 2.5 Assign sequential material_id per unique BSDF (first BSDF -> id=0, etc.)
-- [ ] 2.6 Implement `extract_materials()` calling `mi.traverse(shape.bsdf())`
-- [ ] 2.7 Support `mi.PrincipledBSDF`: extract diffuse_reflectance, roughness, metallic, specular_reflectance
-- [ ] 2.8 Support `mi.RoughBSDF`: extract alpha, diffuse_reflectance, specular_reflectance
-- [ ] 2.9 Handle unknown BSDF: extract available params via `mi.traverse()`, log warning
-- [ ] 2.10 Implement `extract_lights()` iterating `mi.Scene.emitters()`
-- [ ] 2.11 Extract point light: position (Point3f) + intensity (Color3f)
-- [ ] 2.12 Extract area light: `shape.emitter()` + radiance + surface_area
-- [ ] 2.13 Detect environment light via `emitter.is_environment()`
-- [ ] 2.14 Implement `extract_camera()` from `mi.Scene.sensors()[0]`
-- [ ] 2.15 Extract camera transform, FOV, clip planes, film size
-- [ ] 2.16 Return scene graph as Python dict: `{geometry: np.array, materials: np.array, lights: np.array, camera: np.array}`
-- [ ] 2.17 Handle variable mesh counts: concatenate with boundary offsets
+- [x] 2.1 Implement `extract_geometry()` iterating `mi.Scene.shapes()`
+- [x] 2.2 Extract vertex positions via `mi.traverse(shape)['vertex_positions']` -> Float array Nx3
+- [x] 2.3 Extract face indices via `shape.face_indices(0)` or `shape.faces_buffer()` -> UInt array Fx3
+- [x] 2.4 Check `shape.has_vertex_normals()` and extract normals if available
+- [x] 2.5 Assign sequential material_id per unique BSDF (first BSDF -> id=0, etc.)
+- [x] 2.6 Implement `extract_materials()` calling `mi.traverse(shape.bsdf())`
+- [x] 2.7 Support `mi.PrincipledBSDF`: extract diffuse_reflectance, roughness, metallic, specular_reflectance
+- [x] 2.8 Support `mi.RoughBSDF`: extract alpha, diffuse_reflectance, specular_reflectance
+- [x] 2.9 Handle unknown BSDF: extract available params via `mi.traverse()`, log warning
+- [x] 2.10 Implement `extract_lights()` iterating `mi.Scene.emitters()`
+- [x] 2.11 Extract point light: position (Point3f) + intensity (Color3f)
+- [x] 2.12 Extract area light: `shape.emitter()` + radiance + surface_area
+- [x] 2.13 Detect environment light via `emitter.is_environment()`
+- [x] 2.14 Implement `extract_camera()` from `mi.Scene.sensors()[0]`
+- [x] 2.15 Extract camera transform, FOV, clip planes, film size
+- [x] 2.16 Return scene graph as Python dict: `{geometry: np.array, materials: np.array, lights: np.array, camera: np.array}`
+- [x] 2.17 Handle variable mesh counts: concatenate with boundary offsets
 - [ ] 2.18 Test: Extract Cornell box, verify 2 meshes, 1 area light, 1 camera
 
 ## 3. DLPack Tensor Bridge
