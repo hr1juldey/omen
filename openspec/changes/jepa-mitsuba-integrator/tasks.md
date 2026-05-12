@@ -140,36 +140,145 @@
 - [ ] 10.6 Fuse material boundaries (material-aware)
 - [ ] 10.7 Test: Merge 25% + 100% renders
 
-## 11. Training Infrastructure
+## 11. Model Checkpointing & Storage
 
-- [ ] 11.1 Create `training/cornell_box_trainer.py`
-- [ ] 11.2 Implement `generate_training_pair()` for denoiser
-- [ ] 11.3 Render Cornell box at 4spp + 256spp (same seed)
-- [ ] 11.4 Save training pairs to disk
-- [ ] 11.5 Implement `generate_variance_pairs()` for confidence
-- ] 11.6 Render Cornell box 8× at 4spp (different seeds)
-- [ ] 11.7 Compute variance across renders → uncertainty labels
-- [ ] 11.8 Implement `generate_multires_pairs()` for merge
-- [ ] 11.9 Render 25% res 256spp + 100% res 4spp + 100% res 256spp
-- [ ] 11.10 Create training loop in Mojo (Nabla autograd)
-- [ ] 11.11 Implement L1 loss for denoiser training
-- [ ] 11.12 Implement MSE loss for confidence training
-- [ ] 11.13 Implement L1 loss for multires training
-- [ ] 11.14 Test: Train for 100 iterations, verify loss decreases
+- [ ] 11.1 Create `src/omen_integrator/model_store.py` module
+- [ ] 11.2 Implement `ModelStore` class with cache directory management
+- [ ] 11.3 Create `~/.cache/omen/models/` directory if not exists
+- [ ] 11.4 Implement `save_checkpoint()` function in Mojo
+- [ ] 11.5 Serialize model weights via Nabla `state_dict()`
+- [ ] 11.6 Serialize optimizer state (Adam moments, learning rate)
+- [ ] 11.7 Save training iteration number and metrics
+- [ ] 11.8 Write checkpoint to `checkpoint_iter_<N>.omen`
+- [ ] 11.9 Update symlink `latest.omen` to most recent checkpoint
+- [ ] 11.10 Implement `load_checkpoint()` function in Mojo
+- [ ] 11.11 Load model weights and optimizer state from file
+- [ ] 11.12 Resume training from saved iteration
+- [ ] 11.13 Implement checkpoint metadata JSON creation
+- [ ] 11.14 Include architecture hash, Omen version, Nabla version in metadata
+- [ ] 11.15 Implement checkpoint validation before loading
+- [ ] 11.16 Verify architecture hash matches current model
+- [ ] 11.17 Implement graceful error on incompatible checkpoint
+- [ ] 11.18 Create `jepa_kernels/checkpoint.mojo` for save/load operations
+- [ ] 11.19 Test: Save checkpoint, crash, resume from checkpoint
+- [ ] 11.20 Implement scene hash computation (geometry + materials + lights)
+- [ ] 11.21 Use SHA256 for scene hash, exclude camera position
+- [ ] 11.22 Implement scene-specific model cache lookup
+- [ ] 11.23 Check `~/.cache/omen/models/scenes/<hash>/fine_tuned.omen`
+- [ ] 11.24 Implement base model download on first use
+- [ ] 11.25 Download from `https://omen-render.org/models/base_v0.omen`
+- [ ] 11.26 Verify SHA256 checksum after download
+- [ ] 11.27 Implement scene similarity detection
+- [ ] 11.28 Compute scene feature vector (mesh count, material types, etc.)
+- [ ] 11.29 Query `scene_index.json` for similar scenes (cosine > 0.85)
+- [ ] 11.30 Implement quick adaptation from similar scene model (10 iters)
+- [ ] 11.31 Implement model aggregation (local learning)
+- [ ] 11.32 Load base model + fine-tuned models for federated averaging
+- [ ] 11.33 Save aggregated model as `base_v1_local.omen`
+- [ ] 11.34 Implement anonymous model contribution (opt-in)
+- [ ] 11.35 De-identify scene data before upload (remove coordinates, textures)
+- [ ] 11.36 Upload only weight deltas (difference from base model)
+- [ ] 11.37 Test: Full lifecycle (base → fine-tune → aggregate → reuse)
+- [ ] 11.38 Implement GPU rendering backend detection
+- [ ] 11.39 Query `mi.variant()` to detect CPU vs GPU rendering
+- [ ] 11.40 Parse variant: `cuda_ad_*` → NVIDIA, `metal_ad_*` → Apple, `cpu_ad_*` → CPU
+- [ ] 11.41 Configure zero-copy buffer passing when both on GPU
+- [ ] 11.42 Implement `UnsafePointer` wrapping for GPU tensors
+- [ ] 11.43 Implement memcpy fallback for CPU→GPU path
+- [ ] 11.44 Implement GPU memory detection via CUDA/HIP/Metal API
+- [ ] 11.45 Query total memory, free memory, compute available budget
+- [ ] 11.46 Estimate memory requirements for model + scene + buffers
+- [ ] 11.47 Implement graceful degradation on insufficient memory
+- [ ] 11.48 Reduce batch size if training memory insufficient
+- [ ] 11.49 Fall back to CPU if GPU memory exhausted
+- [ ] 11.50 Test: Zero-copy on GPU, memcpy fallback on CPU
 
-## 12. Testing & Validation
+## 12. Temporal Coherence & JEPA World Model
 
-- [ ] 12.1 Create `tests/test_scene_extractor.py`
-- [ ] 12.2 Test: Extract Cornell box scene, verify geometry/materials/lights
-- [ ] 12.3 Create `tests/test_jepa_bridge.py`
-- [ ] 12.4 Test: Load .so, call functions, verify return codes
-- [ ] 12.5 Create `tests/test_cornell_denoise.py`
-- [ ] 12.6 Test: Mode 1 on Cornell box, compare SSIM
-- [ ] 12.7 Create `tests/test_cornell_adaptive.py`
-- [ ] 12.8 Test: Mode 2 on Cornell box, measure sample reduction
-- [ 12.9 Create `tests/test_cornell_multires.py`
-- [ ] 12.10 Test: Mode 3 on Cornell box, measure speedup
-- [ ] 12.11 Benchmark: Time each mode, verify targets met
-- [ ] 12.12 Verify: Mode 2 achieves 4-8× sample reduction
-- [ ] 12.13 Verify: Mode 3 achieves 8-16× speedup
-- [ 12.14 Verify: All modes produce clean renders (no artifacts)
+- [ ] 12.1 Create `jepa_kernels/world_model.mojo` with OmenWorldModel struct
+- [ ] 12.2 Implement ARPredictor struct (autoregressive next-step predictor from LeWM)
+- [ ] 12.3 Implement history window circular buffer (configurable, default 3 frames)
+- [ ] 12.4 Implement SceneDelta struct: camera delta, object deltas, light deltas, birth events
+- [ ] 12.5 Implement SceneDeltaEncoder (replaces LeWM's action_encoder)
+- [ ] 12.6 Encode camera movement delta: translation + rotation quaternion → embedding
+- [ ] 12.7 Encode per-object animation deltas: transform delta per object → aggregated embedding
+- [ ] 12.8 Encode fluid/smoke introduction as birth event: type + position + size → embedding
+- [ ] 12.9 Encode light parameter deltas: intensity + color + position changes → embedding
+- [ ] 12.10 Encode material animation deltas: parameter changes → embedding
+- [ ] 12.11 Implement SIGReg loss (Sketch Isotropic Gaussian Regularizer from LeWM)
+- [ ] 12.12 Implement prediction loss: MSE(predicted_latent, target_latent)
+- [ ] 12.13 Total loss: L = L_pred + λ * L_sigreg (λ configurable, default 1.0)
+- [ ] 12.14 Implement surprise detection: MSE(predicted, actual) > threshold (2σ)
+- [ ] 12.15 Detect birth events (new fluid, smoke, light) as auto-surprise (skip prediction)
+- [ ] 12.16 Detect camera jump cuts: translation > 1 unit or rotation > 45° → clear history
+- [ ] 12.17 Implement periodic validation: every N predicted frames, render + compare
+- [ ] 12.18 Implement topology-based scene hash (face connectivity, not vertex positions)
+- [ ] 12.19 Verify: rotating object does NOT change topology hash
+- [ ] 12.20 Verify: adding new light DOES change topology hash
+- [ ] 12.21 Implement Mode 4 animation pipeline in `modes/animation.py`
+- [ ] 12.22 Frame 0: render 4spp → JEPA denoise → store as anchor latent
+- [ ] 12.23 Frames 1..N: ALWAYS render 1spp → encode dirty + scene graph → predict clean
+- [ ] 12.24 Never predict from nothing - always conditioned on 1spp dirty render + scene graph
+- [ ] 12.25 On surprise: re-render at 4spp → JEPA denoise → update history anchor
+- [ ] 12.26 On jump cut: clear history → render 4spp → new anchor
+- [ ] 12.27 Implement scene graph diffing between frames
+- [ ] 12.28 Detect new/deleted scene elements (emitters, objects, lights)
+- [ ] 12.29 Test: Render Cornell box animation with camera orbit (100 frames)
+- [ ] 12.30 Test: Verify temporal coherence (no flickering between frames)
+- [ ] 12.31 Test: Introduce new light mid-animation, verify surprise detection
+- [ ] 12.32 Test: Jump cut mid-animation, verify history clear + re-anchor
+- [ ] 12.33 Benchmark: 256x256 animation speed, target >30fps with 90% predicted frames
+
+## 13. Mitsuba JEPA Gym (Differentiable Training)
+
+- [ ] 13.1 Verify Mitsuba variant `cuda_ad_rgb` works with Dr.Jit autodiff
+- [ ] 13.2 Create `training/jepa_gym.py` for differentiable training loop
+- [ ] 13.3 Implement gym loop: 1spp render → JEPA predict → 256spp GT → loss → backward
+- [ ] 13.4 Use `dr.backward(loss)` to propagate gradients through JEPA
+- [ ] 13.5 Use `drjit.opt.Adam` optimizer for JEPA weight updates
+- [ ] 13.6 Verify gradient flow: loss → JEPA weights (not through Mitsuba C++ path tracer)
+- [ ] 13.7 Implement self-supervised data generation: random camera + light variations
+- [ ] 13.8 Generate Cornell box animation training data: 500 frames with camera orbit
+- [ ] 13.9 Generate surprise training data: random light on/off, object spawn/despawn
+- [ ] 13.10 Generate fluid introduction training data: volume emitter appears mid-sequence
+- [ ] 13.11 Train temporal predictor: 500 iterations on animation data
+- [ ] 13.12 Validate: predicted frame SSIM > 0.85 vs 256spp ground truth
+- [ ] 13.13 Validate: surprise detection catches >90% of actual surprises
+- [ ] 13.14 Validate: false positive rate <10% (don't over-trigger path tracing)
+- [ ] 13.15 Implement FLIP-style forward prediction: frame N + delta → predict frame N+1
+- [ ] 13.16 Implement closed-loop validation: predict 10 frames, render actual, compare drift
+- [ ] 13.17 Test: Train on Cornell box animation, verify loss decreases over 500 iterations
+
+## 14. Training Infrastructure
+
+- [ ] 14.1 Create `training/cornell_box_trainer.py`
+- [ ] 14.2 Implement `generate_training_pair()` for denoiser
+- [ ] 14.3 Render Cornell box at 4spp + 256spp (same seed)
+- [ ] 14.4 Save training pairs to disk
+- [ ] 14.5 Implement `generate_variance_pairs()` for confidence
+- [ ] 14.6 Render Cornell box 8× at 4spp (different seeds)
+- [ ] 14.7 Compute variance across renders → uncertainty labels
+- [ ] 14.8 Implement `generate_multires_pairs()` for merge
+- [ ] 14.9 Render 25% res 256spp + 100% res 4spp + 100% res 256spp
+- [ ] 14.10 Create training loop in Mojo (Nabla autograd)
+- [ ] 14.11 Implement L1 loss for denoiser training
+- [ ] 14.12 Implement MSE loss for confidence training
+- [ ] 14.13 Implement L1 loss for multires training
+- [ ] 14.14 Test: Train for 100 iterations, verify loss decreases
+
+## 15. Testing & Validation
+
+- [ ] 15.1 Create `tests/test_scene_extractor.py`
+- [ ] 15.2 Test: Extract Cornell box scene, verify geometry/materials/lights
+- [ ] 15.3 Create `tests/test_jepa_bridge.py`
+- [ ] 15.4 Test: Load .so, call functions, verify return codes
+- [ ] 15.5 Create `tests/test_cornell_denoise.py`
+- [ ] 15.6 Test: Mode 1 on Cornell box, compare SSIM
+- [ ] 15.7 Create `tests/test_cornell_adaptive.py`
+- [ ] 15.8 Test: Mode 2 on Cornell box, measure sample reduction
+- [ ] 15.9 Create `tests/test_cornell_multires.py`
+- [ ] 15.10 Test: Mode 3 on Cornell box, measure speedup
+- [ ] 15.11 Benchmark: Time each mode, verify targets met
+- [ ] 15.12 Verify: Mode 2 achieves 4-8× sample reduction
+- [ ] 15.13 Verify: Mode 3 achieves 8-16× speedup
+- [ ] 15.14 Verify: All modes produce clean renders (no artifacts)

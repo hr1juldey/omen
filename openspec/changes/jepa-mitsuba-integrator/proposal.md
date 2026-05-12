@@ -40,6 +40,10 @@ Self-training makes JEPA practical: render same scene at 4spp AND 256spp → per
 
 - **multires-merge**: Multi-resolution rendering with scene-guided upsampling. PASS 1: low-res high-quality (25%, 256 spp). PASS 2: high-res noisy (100%, 4 spp). JEPA merges using exact geometry edges (from scene graph) and material boundaries. Avoids DLSS-style artifacts.
 
+- **checkpoint-storage**: Model checkpointing and continuous learning system. Saves JEPA weights during training (every 10 iterations), enables resume after crash. Scene-specific fine-tuning cached by hash (geometry + materials + lights). Base model pre-trained on Cornell box variants, automatically improves with usage via local model aggregation. Opt-in anonymous contribution uploads only weight deltas (de-identified). Similar scene detection enables model reuse without retraining.
+
+- **temporal-coherence**: JEPA world model (based on LeWM architecture, LeCun et al. 2026) for animation acceleration. Autoregressive prediction of next-frame latents from history window + scene deltas replaces path tracing for most frames. Scene delta encoder handles camera moves, object animation, fluid/smoke introduction, new lights. Surprise detection triggers path tracing only when prediction is unreliable. Topology-based scene hashing for stable animation cache. Target: 10-50x speedup on animations, path-traced quality at EEVEE/UE5 speeds.
+
 ### Modified Capabilities
 
 None (new functionality, building on existing `omen-integrator` spec)
