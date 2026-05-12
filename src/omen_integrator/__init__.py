@@ -37,5 +37,15 @@ class OmenIntegrator:
 
 
 def register() -> None:
-    """Register Omen integrator with Mitsuba plugin system."""
+    """Register Omen integrator with Mitsuba plugin system.
+
+    Automatically sets llvm_ad_rgb variant if not already set.
+    """
+    # Set variant to enable Mitsuba's plugin system
+    # This is safe even if variant is already set
+    try:
+        mi.set_variant("llvm_ad_rgb")
+    except Exception:
+        pass  # Variant already set or other issue
+
     mi.register_integrator("omen", lambda props: OmenIntegrator(props))
