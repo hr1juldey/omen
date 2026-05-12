@@ -27,10 +27,10 @@
 - [x] 1.25 Upgrade `src/omen_integrator/jepa.py` (model loading + tile fingerprint computation 23-dim)
 - [x] 1.26 Upgrade `src/omen_integrator/gpu.py` (VRAM budget tracking + FP8 detection)
 - [x] 1.27 Upgrade `src/omen_integrator/path.py` (AOV-aware path tracing reference)
-- [ ] 1.28 Create `src/omen/model/mla_skip.py` (MLA skip connection compression — 16× down/up projection)
-- [ ] 1.29 Create `src/omen/model/moe.py` (TileMoERouter + tile fingerprint + expert FFNs + shared expert)
-- [ ] 1.30 Create `src/omen/aov.py` (AOV pass reader + graceful degradation for missing passes)
-- [ ] 1.31 Create `src/omen/kernels/tile_fingerprint.mojo` (GPU-accelerated 8×8 tile histogram + variance + edge density)
+- [x] 1.28 Create `src/omen/model/mla_skip.py` (MLA skip connection compression — 16× down/up projection)
+- [x] 1.29 Create `src/omen/model/moe.py` (TileMoERouter + tile fingerprint + expert FFNs + shared expert)
+- [x] 1.30 Create `src/omen/aov.py` (AOV pass reader + graceful degradation for missing passes)
+- [x] 1.31 Create `src/omen/kernels/tile_fingerprint.mojo` (GPU-accelerated 8×8 tile histogram + variance + edge density)
 
 > Spec: cross-cutting (all specs reference these files)
 
@@ -91,7 +91,7 @@
 
 > Spec: `specs/jepa-model-architecture/` (MLA requirement)
 
-- [ ] 5.1 Create MLASkipConnection module in `model/mla_skip.py`: down-projection Linear(C, C//16) + up-projection Linear(C//16, C)
+- [x] 5.1 Create MLASkipConnection module in `model/mla_skip.py`: down-projection Linear(C, C//16) + up-projection Linear(C//16, C)
 - [ ] 5.2 Integrate into U-Net encoder: each encoder level compresses features before storing as skip latent
 - [ ] 5.3 Integrate into U-Net decoder: reconstruct skip features from latent before concatenation
 - [ ] 5.4 Implement edge-aware compression: detect high normal discontinuity tiles, optionally store full-resolution features for those tiles, compressed for smooth regions
@@ -103,23 +103,23 @@
 
 > Spec: `specs/moe-tile-routing/`
 
-- [ ] 6.1 Create TileMoERouter in `model/moe.py`: tile fingerprint computation + expert selection
-- [ ] 6.2 Implement `compute_tile_fingerprint()`: reshape (B,H,W,8) aux buffers into 8×8 windows -> compute material histogram (8-dim) + normal variance (3-dim) + depth variance (1-dim) + edge density (1-dim) + dominant material (1-dim) + mean albedo (3-dim) = 17-dim fingerprint per tile
-- [ ] 6.3 Implement material expert routing: Linear(17, 8) on fingerprint -> top-K selection (K=2 medium, K=3 high)
-- [ ] 6.4 Implement light expert routing: Linear(17, 5) on fingerprint -> top-1 selection
-- [ ] 6.5 Implement geometry expert routing: Linear(17, 5) on fingerprint -> top-1 selection
-- [ ] 6.6 Route ALL 64 tokens in a tile together to selected experts (no per-pixel routing)
-- [ ] 6.7 Implement 8 material expert FFNs: diffuse, glossy/glass, metal, SSS/skin, volume/smoke, emissive, hair/fur, cloth
-- [ ] 6.8 Implement 5 light expert FFNs: point/spot, area, sun/directional, environment/HDRI, emissive geometry
-- [ ] 6.9 Implement 5 geometry expert FFNs: flat, curved/organic, edges/silhouettes, fine detail/hair, transparent
-- [ ] 6.10 Implement 4 motion expert FFNs: static, linear motion, fast motion/blur, occlusion boundary
-- [ ] 6.11 Implement 1 shared expert (always active, base denoising) — from DeepSeekMoE shared expert isolation
-- [ ] 6.12 Implement expert combination: `output = shared_expert(x) + Σ(weight_i × expert_i(x))`
-- [ ] 6.13 Implement mixed-tile handling: tiles spanning material boundaries activate multiple experts with histogram-weighted blending
-- [ ] 6.14 Implement motion-aware tile handling: tiles with high velocity variance activate deblur expert, occlusion tiles activate inpainting expert
-- [ ] 6.15 Implement auxiliary-loss-free load balancing (DeepSeek-V3): per-expert bias vector (now 23 experts), adjusted ±0.001 per training step, NO gradient
-- [ ] 6.16 Implement tier config: Fast = no MoE, Medium = MoE bottleneck top-2 (+motion top-1), High = MoE bottleneck+encoder top-3 (+motion top-1)
-- [ ] 6.17 Update all routing projections from Linear(17, n) to Linear(23, n) for 23-dim fingerprints
+- [x] 6.1 Create TileMoERouter in `model/moe.py`: tile fingerprint computation + expert selection
+- [x] 6.2 Implement `compute_tile_fingerprint()`: reshape (B,H,W,8) aux buffers into 8×8 windows -> compute material histogram (8-dim) + normal variance (3-dim) + depth variance (1-dim) + edge density (1-dim) + dominant material (1-dim) + mean albedo (3-dim) = 17-dim fingerprint per tile
+- [x] 6.3 Implement material expert routing: Linear(17, 8) on fingerprint -> top-K selection (K=2 medium, K=3 high)
+- [x] 6.4 Implement light expert routing: Linear(17, 5) on fingerprint -> top-1 selection
+- [x] 6.5 Implement geometry expert routing: Linear(17, 5) on fingerprint -> top-1 selection
+- [x] 6.6 Route ALL 64 tokens in a tile together to selected experts (no per-pixel routing)
+- [x] 6.7 Implement 8 material expert FFNs: diffuse, glossy/glass, metal, SSS/skin, volume/smoke, emissive, hair/fur, cloth
+- [x] 6.8 Implement 5 light expert FFNs: point/spot, area, sun/directional, environment/HDRI, emissive geometry
+- [x] 6.9 Implement 5 geometry expert FFNs: flat, curved/organic, edges/silhouettes, fine detail/hair, transparent
+- [x] 6.10 Implement 4 motion expert FFNs: static, linear motion, fast motion/blur, occlusion boundary
+- [x] 6.11 Implement 1 shared expert (always active, base denoising) — from DeepSeekMoE shared expert isolation
+- [x] 6.12 Implement expert combination: `output = shared_expert(x) + Σ(weight_i × expert_i(x))`
+- [x] 6.13 Implement mixed-tile handling: tiles spanning material boundaries activate multiple experts with histogram-weighted blending
+- [x] 6.14 Implement motion-aware tile handling: tiles with high velocity variance activate deblur expert, occlusion tiles activate inpainting expert
+- [x] 6.15 Implement auxiliary-loss-free load balancing (DeepSeek-V3): per-expert bias vector (now 23 experts), adjusted ±0.001 per training step, NO gradient
+- [x] 6.16 Implement tier config: Fast = no MoE, Medium = MoE bottleneck top-2 (+motion top-1), High = MoE bottleneck+encoder top-3 (+motion top-1)
+- [x] 6.17 Update all routing projections from Linear(17, n) to Linear(23, n) for 23-dim fingerprints
 - [ ] 6.18 Test: Route synthetic tiles (pure diffuse, glass-metal boundary, hair edge, fast motion, occlusion) and verify correct expert activation
 
 ## 7. Mojo GPU Tile Fingerprint Kernel
@@ -127,33 +127,33 @@
 > Uses: Mojo GPU fundamentals (TileTensor, row_major, enqueue_function)
 > Spec: `specs/moe-tile-routing/` (tile fingerprint computation)
 
-- [ ] 7.1 Create `kernels/tile_fingerprint.mojo`: GPU kernel for computing 8×8 tile fingerprints from auxiliary buffer data
-- [ ] 7.2 Input: TileTensor[float32, row_major[H, W, 10]] (albedo(3) + normal(3) + depth(1) + material_id(1) + motion(2))
-- [ ] 7.3 Output: TileTensor[float32, row_major[H//8, W//8, 23]] (one 23-dim fingerprint per tile)
-- [ ] 7.4 Each GPU block processes one 8×8 tile: load 64 pixels into shared memory via `stack_allocation`
-- [ ] 7.5 Compute material histogram in shared memory: atomic counter per material_id, normalize by 64
-- [ ] 7.6 Compute normal variance: sum of squared deviations across 64 pixels for 3 normal channels
-- [ ] 7.7 Compute depth variance: sum of squared deviations for depth channel
-- [ ] 7.8 Compute edge density: count pixels where `||normal[i+1] - normal[i]|| > threshold` within tile
-- [ ] 7.9 Compute velocity mean and variance across tile via warp reduction (`warp.sum`)
-- [ ] 7.10 Compute velocity max and occlusion fraction (velocity discontinuity > threshold)
-- [ ] 7.11 Write 23-dim fingerprint to output tensor
-- [ ] 7.11 Bind and launch: `comptime kernel = tile_fingerprint_kernel[type_of(layout)]`, grid_dim=(W//8, H//8), block_dim=(8, 8)
-- [ ] 7.12 Expose to Python via `call_custom_kernel()` or DLPack interop (input numpy -> DeviceBuffer -> kernel -> DeviceBuffer -> numpy)
-- [ ] 7.13 Fallback path: pure numpy tile fingerprint computation if Mojo GPU not available
+- [x] 7.1 Create `kernels/tile_fingerprint.mojo`: GPU kernel for computing 8×8 tile fingerprints from auxiliary buffer data
+- [x] 7.2 Input: TileTensor[float32, row_major[H, W, 10]] (albedo(3) + normal(3) + depth(1) + material_id(1) + motion(2))
+- [x] 7.3 Output: TileTensor[float32, row_major[H//8, W//8, 23]] (one 23-dim fingerprint per tile)
+- [x] 7.4 Each GPU block processes one 8×8 tile: load 64 pixels into shared memory via `stack_allocation`
+- [x] 7.5 Compute material histogram in shared memory: atomic counter per material_id, normalize by 64
+- [x] 7.6 Compute normal variance: sum of squared deviations across 64 pixels for 3 normal channels
+- [x] 7.7 Compute depth variance: sum of squared deviations for depth channel
+- [x] 7.8 Compute edge density: count pixels where `||normal[i+1] - normal[i]|| > threshold` within tile
+- [x] 7.9 Compute velocity mean and variance across tile via warp reduction (`warp.sum`)
+- [x] 7.10 Compute velocity max and occlusion fraction (velocity discontinuity > threshold)
+- [x] 7.11 Write 23-dim fingerprint to output tensor
+- [x] 7.11 Bind and launch: `comptime kernel = tile_fingerprint_kernel[type_of(layout)]`, grid_dim=(W//8, H//8), block_dim=(8, 8)
+- [x] 7.12 Expose to Python via `call_custom_kernel()` or DLPack interop (input numpy -> DeviceBuffer -> kernel -> DeviceBuffer -> numpy)
+- [x] 7.13 Fallback path: pure numpy tile fingerprint computation if Mojo GPU not available
 - [ ] 7.14 Test: Compare Mojo GPU fingerprint output vs numpy reference for 256×256 Cornell box aux buffers
 
 ## 8. AOV Auxiliary Buffer Handling
 
 > Spec: `specs/moe-tile-routing/` (Blender-compatible auxiliary buffers)
 
-- [ ] 8.1 Create `aov.py` module: read auxiliary render passes from Mitsuba/Blender with graceful degradation
-- [ ] 8.2 Read albedo pass: Mitsuba `mi.render()` with albedo AOV or Blender Diffuse Color pass (3 channels)
-- [ ] 8.3 Read normal pass: Mitsuba normal AOV or Blender Normal pass (3 channels, world-space)
-- [ ] 8.4 Read depth pass: Mitsuba depth AOV or Blender Depth/Z pass (1 channel)
-- [ ] 8.5 Read material ID pass: Cryptomatte from Blender (integer per pixel), or BSDF type index from Mitsuba scene extraction
-- [ ] 8.6 Read motion vector pass: Blender `scene.render.use_pass_vector = True` → (H, W, 2), Mitsuba AOV `motion:vector`
-- [ ] 8.7 **Graceful degradation when AOVs missing**: zero-fill missing channels and flag `aov_available=False` for each pass
+- [x] 8.1 Create `aov.py` module: read auxiliary render passes from Mitsuba/Blender with graceful degradation
+- [x] 8.2 Read albedo pass: Mitsuba `mi.render()` with albedo AOV or Blender Diffuse Color pass (3 channels)
+- [x] 8.3 Read normal pass: Mitsuba normal AOV or Blender Normal pass (3 channels, world-space)
+- [x] 8.4 Read depth pass: Mitsuba depth AOV or Blender Depth/Z pass (1 channel)
+- [x] 8.5 Read material ID pass: Cryptomatte from Blender (integer per pixel), or BSDF type index from Mitsuba scene extraction
+- [x] 8.6 Read motion vector pass: Blender `scene.render.use_pass_vector = True` → (H, W, 2), Mitsuba AOV `motion:vector`
+- [x] 8.7 **Graceful degradation when AOVs missing**: zero-fill missing channels and flag `aov_available=False` for each pass
   - No albedo → fill zeros, material experts rely more on shared expert
   - No normals → fill zeros, geometry routing disabled, rely on shared + material experts
   - No depth → fill zeros, transparency detection disabled
@@ -164,8 +164,8 @@
   - This produces auxiliary channels WITHOUT requiring user to set up custom passes
 - [ ] 8.9 **Render-time AOV enabling for Blender**: if integrated with Blender, enable required render passes programmatically:
   - `scene.render.use_pass_normal = True`, `scene.render.use_pass_z = True`, `scene.render.use_pass_vector = True`, etc.
-- [ ] 8.10 Pack auxiliary buffers into single (H, W, 10) tensor for tile fingerprint computation (8 original + 2 motion)
-- [ ] 8.11 Log AOV status: "AOV available: albedo=yes, normal=yes, depth=no, material_id=no, motion=no — using degraded mode"
+- [x] 8.10 Pack auxiliary buffers into single (H, W, 10) tensor for tile fingerprint computation (8 original + 2 motion)
+- [x] 8.11 Log AOV status: "AOV available: albedo=yes, normal=yes, depth=no, material_id=no, motion=no — using degraded mode"
 - [ ] 8.12 Test: Run denoiser with ALL AOVs missing → verify it still works (shared expert only), log degradation warning
 - [ ] 8.13 Test: Run denoiser with partial AOVs (only albedo, no motion) → verify degraded but functional
 - [ ] 8.14 Test: Run denoiser with motion vectors → verify motion experts activate on moving tiles
