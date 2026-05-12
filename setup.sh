@@ -30,13 +30,30 @@ echo "📦 Installing Mitsuba 3 renderer..."
 pixi run pip install mitsuba drjit --quiet
 echo ""
 
-# Verify Mitsuba installation
-echo "🔍 Verifying Mitsuba installation..."
-pixi run python -c "import mitsuba as mi; print(f'✅ Mitsuba {mi.__version__}')"
+# Install Omen integrator to pixi environment
+echo "📦 Installing Omen integrator..."
+cd "$PROJECT_ROOT/integrator-package"
+pixi run uv pip install -e . --prefix "$PROJECT_ROOT/.pixi/envs/default" > /dev/null 2>&1
+cd "$PROJECT_ROOT"
+echo ""
+
+# Verify installation
+echo "🔍 Verifying installation..."
+pixi run python -c "
+import mitsuba as mi
+from omen_integrator import register
+register()
+print('✅ Omen integrator ready!')
+" 2>&1 | grep -v WARN | grep -v deprecated
 echo ""
 
 echo "✅ Setup complete!"
 echo ""
-echo "🚀 Quick test:"
-echo "   pixi run python -c \"import mitsuba as mi; print('Omen ready!')\""
+echo "🚀 Usage:"
+echo "   pixi run python your_script.py"
+echo ""
+echo "   In your Python code:"
+echo "   import mitsuba as mi"
+echo "   from omen_integrator import register"
+echo "   register()  # Registers 'omen' integrator"
 echo ""

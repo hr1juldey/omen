@@ -1,51 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "omen"
+name = "omen-integrator"
 version = "0.1.0"
-description = "Omen: Blender 5.1+ Render Engine built with Mojo for GPU compute and JEPA-based scene analysis"
+description = "Mitsuba 3 integrator with JEPA acceleration"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.10"
 
-[workspace]
-preview = ["pixi-build"]
+dependencies = [
+    "mitsuba>=3.8.0",
+    "drjit>=0.5.0",
+]
 
-[tool.pixi.workspace]
-channels = ["conda-forge", "https://repo.prefix.dev/modular-community", "https://conda.modular.com/max-nightly"]
-platforms = ["linux-64"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
-[tool.pixi.pypi-dependencies]
-omen = { path = ".", editable = true }
-# nabla-ml - Temporarily disabled due to wheel compatibility
-# nabla-ml = ">=26.2251344"
-
-[tool.pixi.dependencies]
-pip = ">=26.1.1,<27"
-# mosaic-mojo = "*"  # Not available in channels yet - add via pixi add when available
-
-[package]
-name = "omen"
-version = "0.1.0"
-
-[package.build]
-backend = {name = "pixi-build-mojo", version = "0.*"}
-
-[package.build.config.pkg]
-name = "omen"
-
-[package.host-dependencies]
-modular = ">=26.3"
-max = ">=26.3"
-
-[package.build-dependencies]
-modular = ">=26.3"
-max = ">=26.3"
-numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
-mosaic = { git = "https://github.com/brainwave-sh/mosaic", branch = "main" }
-raylib = { git = "https://github.com/kivicode/mojo-raylib", branch = "main" }
-
-[package.run-dependencies]
-modular = ">=26.3"
-max = ">=26.3"
-numojo = { git = "https://github.com/Mojo-Numerics-and-Algorithms-group/NuMojo", branch = "main" }
-mosaic = { git = "https://github.com/brainwave-sh/mosaic", branch = "main" }
-raylib = { git = "https://github.com/kivicode/mojo-raylib", branch = "main" }
+[tool.setuptools.package-data]
+"omen_integrator" = ["*.py"]
