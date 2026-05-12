@@ -451,6 +451,12 @@ GEOMETRY EXPERTS (routed by tile normal/depth statistics):
 
 SHARED EXPERT (always active — from DeepSeekMoE shared expert isolation):
   Base denoising — Gaussian noise removal, spatial filtering, universal patterns
+
+MOTION EXPERTS (routed by tile velocity statistics — see Decision 14):
+  Expert 0: Static            — low velocity variance, high temporal reuse
+  Expert 1: Linear motion     — uniform velocity, warp + accumulate
+  Expert 2: Fast motion/blur  — high velocity, shutter smear, deblur
+  Expert 3: Occlusion boundary — velocity discontinuity, inpainting-style
 ```
 
 **Tile-based routing with cryptomatte masks:**
@@ -556,11 +562,11 @@ TILE-BASED (correct):
 
 **Expert config per tier:**
 
-| Tier | Material | Light | Geo | Shared | Top-K | MoE? |
-|------|----------|-------|-----|--------|-------|------|
-| Fast (4M) | — | — | — | 1 | — | No MoE (too small) |
-| Medium (16M) | 8 | 5 | 5 | 1 | 2 | MoE in bottleneck only |
-| High (64M) | 8 | 5 | 5 | 1 | 3 | MoE in bottleneck + encoder |
+| Tier | Material | Light | Geo | Motion | Shared | Top-K | MoE? |
+|------|----------|-------|-----|--------|--------|-------|------|
+| Fast (4M) | — | — | — | — | 1 | — | No MoE (too small) |
+| Medium (16M) | 8 | 5 | 5 | 4 | 1 | 2 | MoE in bottleneck only |
+| High (64M) | 8 | 5 | 5 | 4 | 1 | 3 | MoE in bottleneck + encoder |
 
 **Auxiliary-loss-free load balancing (DeepSeek-V3):**
 Per-expert bias adjusted dynamically — zero gradient interference with denoising quality:
@@ -830,6 +836,226 @@ def omen_denoise_compiled(model_weights, noisy_render, scene_features):
 # model.max can be loaded via MAX Engine C API without Python
 ```
 
+### Decision 14: Motion Blur & Temporal Reprojection
+
+**Choice:** Handle motion blur via motion vector AOV + previous-frame reprojection + motion-aware MoE experts. Motion blur is NOT just denoising — pixels at different shutter times mix materials, making standard auxiliary buffers ambiguous.
+
+**The problem:**
+```
+Motion blur = samples at different TIME instants averaged together
+
+Frame with object moving left to right:
+  Pixel (100, 200) at t=0.0 → material_id = metal
+  Pixel (100, 200) at t=0.5 → material_id = glass (object moved)
+  Pixel (100, 200) at t=1.0 → material_id = background
+
+  Rendered pixel = average of all three → blurry mix
+  Auxiliary buffer captures ONE instant → material_id says "glass"
+  But pixel is 33% metal + 33% glass + 33% bg
+  → Tile fingerprint is WRONG → MoE routes to wrong experts
+```
+
+**Solution: Motion vector pass + temporal reprojection**
+
+Motion vectors (2D screen-space velocity) are a standard AOV in both Blender and Mitsuba:
+- Blender: `scene.render.use_pass_vector = True`
+- Mitsuba: AOV integrator with motion time samples
+
+**Temporal reprojection pipeline (how DLSS/FSR do it):**
+```
+Frame N-1 clean output  +  Frame N motion vectors
+         │                          │
+         └──── warp(prev_clean, motion_vectors) ────┐
+                                                      ▼
+                              reprojected_prev (aligned to frame N)
+                                      │
+                                      ▼
+                  merge: α * reprojected_prev + (1-α) * current_noisy
+                  where α = confidence(prev_frame) × motion_coherence
+```
+
+**Motion-aware MoE experts (4th routing dimension):**
+```
+MOTION EXPERTS (routed by tile velocity statistics):
+  Expert 0: Static (low velocity variance) → standard denoise, high temporal reuse
+  Expert 1: Linear motion (uniform velocity, object moving) → warp + accumulate
+  Expert 2: Fast motion / blur (high velocity, shutter smear) → deblur expert
+  Expert 3: Occlusion boundary (velocity discontinuity) → inpainting-style, low temporal reuse
+
+Added to tile fingerprint:
+  velocity_mean: mean(motion_vectors) in tile → 2-dim
+  velocity_var: variance(motion_vectors) in tile → 2-dim
+  velocity_max: max(||motion_vector||) in tile → 1-dim
+  occlusion_fraction: pixels where velocity discontinuity > threshold → 1-dim
+```
+
+**Updated tile fingerprint (17 → 23 dim):**
+```
+Original:  [mat_hist(8) + normal_var(3) + depth_var(1) + edge_density(1) + dominant_mat(1) + mean_albedo(3)] = 17
+Add motion: [velocity_mean(2) + velocity_var(2) + velocity_max(1) + occlusion_frac(1)] = 6
+Total:     23-dim tile fingerprint
+```
+
+**Shutter-aware auxiliary buffers:**
+When motion blur is enabled, capture auxiliary buffers at multiple time samples:
+- albedo_t0, albedo_t1, albedo_t2 (start, mid, end of shutter)
+- Tile fingerprint uses VARIANCE across time samples
+- High temporal variance = motion blur zone → route to deblur expert
+
+**Graceful degradation (no motion vectors):**
+- Fill motion vector channels with zeros
+- Motion experts never activated → static-only mode (Expert 0 handles everything)
+- No temporal reprojection → single-frame denoise (current behavior)
+- Log: "Motion vectors unavailable — static denoise mode (no temporal reprojection)"
+
+**Updated MoE expert config per tier:**
+
+| Tier | Material | Light | Geo | Motion | Shared | Top-K | MoE? |
+|------|----------|-------|-----|--------|--------|-------|------|
+| Fast (4M) | — | — | — | — | 1 | — | No MoE |
+| Medium (16M) | 8 | 5 | 5 | 4 | 1 | 2 | MoE bottleneck |
+| High (64M) | 8 | 5 | 5 | 4 | 1 | 3 | MoE bottleneck+encoder |
+
+### Decision 15: Performance Optimizations
+
+**Choice:** Six additional optimizations beyond the base architecture to maximize throughput. These are independent — each can be enabled incrementally.
+
+**15a: Async pipeline (DualPipe from DeepSeek-V3)**
+```
+Sequential (current):   Mitsuba render → JEPA denoise → Mitsuba render → JEPA denoise
+                       Frame N:  [======render======][======denoise======]
+                       Frame N+1:                                        [======render======][======denoise======]
+
+Async (DualPipe):       Frame N:  [======render======][======denoise======]
+                       Frame N+1:          [======render======][======denoise======]
+                                         ^ overlaps with N's denoise
+
+Implementation:
+- Thread 1: Mitsuba render loop (produces noisy frames)
+- Thread 2: JEPA denoise loop (consumes noisy frames)
+- Bounded queue (size 2) between them
+- ~1.8× throughput for animation sequences
+- Requires double-buffering GPU memory (2× VRAM for ping-pong)
+```
+
+**15b: Speculative multi-frame prediction (MTP from DeepSeek-V3)**
+```
+Current ARPredictor: predict frame N+1 only
+MTP: predict N+1, N+2, N+3 simultaneously (shared trunk, separate heads)
+
+Implementation:
+  latent_N = encode(frame_N, scene_graph)
+  frame_N1 = decode(predict_next(latent_N, delta_N1))     # predicted frame N+1
+  frame_N2 = decode(predict_next(latent_N, delta_N2))     # predicted frame N+2
+  frame_N3 = decode(predict_next(latent_N, delta_N3))     # predicted frame N+3
+
+  Verify N+1 with cheap 1spp render:
+    if SSIM(predicted_N1, render_1spp_N1) > 0.85: use prediction (skip render)
+    else: fall back to normal render for N+2, N+3
+
+  Speedup: 1.8× on animation (3 frames for price of ~1.7)
+  Only active in Mode 4 (animation) with history buffer populated
+```
+
+**15c: Scene latent caching with smart invalidation**
+```
+Problem: Re-encoding scene graph every frame is wasteful if scene structure hasn't changed.
+But: animated geometry changes vertex positions, lights change intensity, materials animate.
+
+Smart cache — two-level hashing:
+  Level 1: topology_hash (face connectivity + material TYPES + light TYPES)
+    → Same across animation if no objects added/removed
+    → Cheap to compute (integer comparison)
+  Level 2: dynamic_hash (vertex positions + light intensities + material VALUES)
+    → Changes every frame with animation
+    → More expensive but still fast (hash of float arrays)
+
+Cache strategy:
+  Frame 0: full encode → cache (scene_latent, topology_hash, dynamic_hash)
+  Frame N>0:
+    compute topology_hash
+    if topology_hash != cached:
+      → Scene structure changed. Full re-encode. Update cache.
+    elif topology_hash == cached:
+      → Structure same, check dynamic changes
+      compute delta = scene_delta(frame_N-1, frame_N)
+      if delta.is_small():  # no births, no structural changes
+        → cached_latent += SceneDeltaEncoder(delta)  # incremental update (~5ms)
+        → Update dynamic_hash in cache
+      else:
+        → Large dynamic change. Full re-encode. Update cache.
+
+What counts as "large dynamic change":
+  - New object appeared (birth event)
+  - Light added/removed
+  - Material type changed (diffuse → glass)
+  - Vertex count changed (subdivision level changed)
+
+What's "small" (incremental update OK):
+  - Object moved (vertex positions changed, same topology)
+  - Light intensity/color changed
+  - Material parameter values changed (roughness, color)
+  - Camera moved
+
+Savings: ~30ms per frame on static scenes, ~25ms on animated scenes (delta encode vs full)
+```
+
+**15d: Progressive adaptive (more aggressive than current Mode 2)**
+```
+Current Mode 2: PASS 1 (4spp everywhere) → PASS 2 (128spp everywhere) → merge
+Progressive:    PASS 1 (2spp everywhere) → confidence → only add samples WHERE needed
+
+Implementation:
+  preview = mi.render(scene, spp=2)  # even cheaper preview
+  clean_preview, confidence = model.predict_confidence(features, preview)
+
+  # Build per-tile spp map based on confidence
+  for tile in tiles:
+    if confidence_tile > 0.8:    spp_map[tile] = 0    # done, use JEPA prediction
+    elif confidence_tile > 0.5:  spp_map[tile] = 16   # moderate, add some samples
+    elif confidence_tile > 0.2:  spp_map[tile] = 64   # low confidence, add more
+    else:                        spp_map[tile] = 128  # very low, full path trace
+
+  # Render with variable spp (Mitsuba doesn't support per-tile spp directly,
+  # so render at max_spp and mask — or render multiple passes at different spp
+  # and composite based on confidence regions)
+
+Target: 10-16× sample reduction (vs current 4-8×) on scenes with >50% easy regions
+```
+
+**15e: Early exit in U-Net decoder**
+```
+U-Net decoder has multiple levels (4-6 depending on tier).
+For high-confidence tiles (flat diffuse, no edges), skip deeper decoder levels:
+
+  Level 0 output confidence per tile from bottleneck
+  if tile_confidence > 0.9 AND tile is flat (low normal variance):
+    → Use Level 0 decoder output directly (skip levels 1-3)
+    → Saves ~40% of decoder compute on easy regions
+
+  Implementation: decoder returns early for "done" tiles, continues for complex tiles
+  Requires per-tile processing (not batched) — may hurt GPU utilization
+  → Only enable for High tier at 4K where decoder is the bottleneck
+```
+
+**15f: FP8 mixed precision inference (from DeepSeek-V3)**
+```
+Current: BF16 for all tensors
+FP8:     E4M3 for forward matmuls, per-tile dynamic scaling
+
+  U-Net encoder Conv2d:   FP8 weights, BF16 accumulation
+  Swin attention QKV:     BF16 (softmax needs precision)
+  MoE expert FFN:         FP8 weights (experts are small, FP8 saves VRAM)
+  U-Net decoder Conv2d:   FP8 weights, BF16 accumulation
+
+  VRAM savings: 700MB → ~400MB at inference (MLA already compressed, FP8 halves rest)
+  Speed: 1.5-2× faster matmuls on Ada Lovelace / Hopper GPUs
+  Quality: validate PSNR drop < 0.5dB vs BF16 baseline
+
+  Implementation: Nabla mixed precision via `nb.nn.Linear(..., dtype=nb.float8_e4m3fn)`
+  Fallback: if GPU doesn't support FP8 (pre-Ada), use BF16 automatically
+```
+
 ## Data Flow Diagrams
 
 ### Mode 1: Denoiser
@@ -841,7 +1067,7 @@ Mitsuba Scene
     │   └─> {geometry, materials, lights, camera}
     │
     ├─> mi.render(spp=4)
-    │   └─> noisy_rgba [H, W, 4] + albedo [H,W,3] + normal [H,W,3]
+    │   └─> noisy_rgba [H, W, 4] + albedo [H,W,3] + normal [H,W,3] + motion_vectors [H,W,2]
     │
     └─> model.denoise(features, noisy, prev_clean=None)
         ├─> SceneEncoder(features)              # 3D scene → scene_latent (1024)
@@ -894,7 +1120,7 @@ src/omen/
 │   ├── scene_encoder.py           # SceneGraphEncoder (~0.3-1M params depending on tier)
 │   ├── unet.py                    # UNetDenoiser (3-55M params depending on tier)
 │   ├── mla_skip.py                # MLASkipConnection — low-rank skip compression (DeepSeek-V2)
-│   ├── moe.py                     # TileMoERouter (8×8 tile fingerprint + cryptomatte masks) + expert FFNs
+│   ├── moe.py                     # TileMoERouter (8×8 tile fingerprint + cryptomatte masks) + expert FFNs + motion experts
 │   ├── arpredictor.py             # ARPredictor + ConditionalBlock (0.5-6M depending on tier)
 │   ├── decoder.py                 # Conv2dTranspose decoder (used by UNet internally)
 │   ├── sigreg.py                  # SIGReg loss (custom kernel wrapper)
@@ -904,12 +1130,14 @@ src/omen/
 │   ├── __init__.mojo              # Empty init
 │   ├── sigreg_kernel.mojo         # SIGReg Epps-Pulley statistic
 │   ├── merge_kernel.mojo          # Edge-aware multires merge
+│   ├── tile_fingerprint.mojo      # GPU 8×8 tile histogram + variance + velocity stats for MoE routing
 │   └── sigreg_op.py               # Python wrapper: UnaryOperation subclass
 │
 ├── scene/
 │   ├── __init__.py
 │   ├── extractor.py               # extract_scene_features(mi.Scene) → dict (Mitsuba today, portable)
-│   └── delta.py                   # compute_delta(frame_A, frame_B) → SceneDelta
+│   ├── delta.py                   # compute_delta(frame_A, frame_B) → SceneDelta
+│   └── latent_cache.py            # Two-level scene latent cache (topology_hash + dynamic_hash)
 │
 ├── training/
 │   ├── __init__.py
@@ -927,7 +1155,9 @@ src/omen/
 ├── jepa_bridge.py                 # Load model, DLPack transfer, inference wrapper
 ├── checkpoint.py                  # Save/load state_dict, LoRA adapters
 ├── config.py                      # Tier configs (Fast/Medium/High), hyperparameters
-└── inference.py                   # @nb.compile inference functions
+├── inference.py                   # @nb.compile inference functions
+├── aov.py                         # AOV pass reader + graceful degradation for missing passes
+└── motion.py                      # Motion vector processing + temporal reprojection
 ```
 
 ### No Mojo `.so` compilation needed
@@ -1039,6 +1269,11 @@ save_finetune_checkpoint(scene_cache_path, lora_params=adapters, optimizer_state
 | MoE tile routing misclassifies region | Tile fingerprint (cryptomatte histogram) relies on auxiliary buffers; validate with ground-truth material ID maps |
 | MoE load imbalance (some experts starved) | Auxiliary-loss-free bias adjustment from DeepSeek-V3; monitor expert utilization during training |
 | MLA reconstruction introduces artifacts at edges | Add edge-aware loss term; apply MLA only on smooth regions, keep full-res at discontinuities |
+| Motion blur makes auxiliary buffers ambiguous | Shutter-aware multi-time sampling + motion vector AOV + motion-aware MoE experts; fallback to static mode if no motion vectors |
+| Temporal reprojection ghosting on fast motion | Clamp α by motion coherence; occlusion detection via velocity discontinuity; fall back to single-frame at boundaries |
+| Scene latent cache stale after animation changes | Two-level hashing: topology hash (structure) + dynamic hash (values); invalidate on births, material type changes, vertex count changes |
+| FP8 precision loss on HDR values | Per-tile dynamic scaling; validate PSNR drop < 0.5dB vs BF16; fallback to BF16 on pre-Ada GPUs |
+| Async pipeline double-buffering doubles VRAM | Only enable async when VRAM > 2× inference budget; fall back to sequential otherwise |
 
 ## Implementation Phases
 

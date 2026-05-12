@@ -24,14 +24,19 @@ Omen SHALL compute a compact fingerprint for each 8×8 tile from auxiliary buffe
 #### Scenario: Compute fingerprint from 8×8 auxiliary window
 
 - **WHEN** the U-Net bottleneck reshapes feature maps into 8×8 Swin windows
-- **THEN** for each window, extract auxiliary channels: albedo(3) + normal(3) + depth(1) + material_id(1) = 8 channels per pixel
+- **THEN** for each window, extract auxiliary channels: albedo(3) + normal(3) + depth(1) + material_id(1) + motion(2) = 10 channels per pixel
 - **AND** compute material histogram: count pixels per material_id (0-7) → normalize by 64 → 8-dim vector
 - **AND** compute normal variance: `var(normals, axis=spatial)` across 64 pixels → 3-dim (indicates edge/curvature density)
 - **AND** compute depth variance: `var(depth, axis=spatial)` → 1-dim (indicates transparency/overlap)
 - **AND** compute edge density: fraction of pixels where `||normal_gradient|| > threshold` → 1-dim
 - **AND** compute dominant material: `argmax(material_histogram)` → 1-dim
 - **AND** compute mean albedo: `mean(albedo, axis=spatial)` → 3-dim
-- **AND** concatenate: fingerprint = [mat_hist(8) + normal_var(3) + depth_var(1) + edge_density(1) + dominant_mat(1) + mean_albedo(3)] = 17-dim
+- **AND** compute velocity mean: `mean(motion_vectors, axis=spatial)` across 64 pixels → 2-dim
+- **AND** compute velocity variance: `var(motion_vectors, axis=spatial)` across 64 pixels → 2-dim
+- **AND** compute velocity max: `max(||motion_vector||)` across 64 pixels → 1-dim
+- **AND** compute occlusion fraction: pixels where velocity discontinuity > threshold → 1-dim
+- **AND** concatenate: fingerprint = [mat_hist(8) + normal_var(3) + depth_var(1) + edge_density(1) + dominant_mat(1) + mean_albedo(3) + vel_mean(2) + vel_var(2) + vel_max(1) + occ_frac(1)] = 23-dim
+- **AND** when motion vectors unavailable: zero-fill velocity/occlusion channels, fingerprint is still 23-dim
 - **AND** fingerprint is a FIXED-SIZE vector regardless of tile content
 
 #### Scenario: Fingerprint captures tile semantics
@@ -50,7 +55,7 @@ Omen SHALL route entire 8×8 tiles (all 64 tokens) to expert FFNs based on the t
 #### Scenario: Route tile to material experts
 
 - **WHEN** tile fingerprint (17-dim) is computed
-- **THEN** project fingerprint via learned Linear(17, n_material) → material routing scores
+- **THEN** project fingerprint via learned Linear(23, n_material) → material routing scores
 - **AND** add auxiliary-loss-free bias: `scores = linear(fingerprint) + bias`
 - **AND** select top-K material experts (K=2 for medium tier, K=3 for high tier)
 - **AND** compute softmax weights for selected experts
@@ -60,14 +65,14 @@ Omen SHALL route entire 8×8 tiles (all 64 tokens) to expert FFNs based on the t
 #### Scenario: Route tile to light experts
 
 - **WHEN** tile fingerprint is computed
-- **THEN** project fingerprint via learned Linear(17, n_light) → light routing scores
+- **THEN** project fingerprint via learned Linear(23, n_light) → light routing scores
 - **AND** select top-1 light expert (light type is usually uniform within 8×8 tile)
 - **AND** combine with material expert output
 
 #### Scenario: Route tile to geometry experts
 
 - **WHEN** tile fingerprint is computed
-- **THEN** project fingerprint via learned Linear(17, n_geo) → geometry routing scores
+- **THEN** project fingerprint via learned Linear(23, n_geo) → geometry routing scores
 - **AND** select top-1 geometry expert
 - **AND** combine with material + light expert output
 
@@ -107,6 +112,12 @@ Omen SHALL define fixed expert categories for material, light, and geometry type
   - Expert 2: Edges/silhouettes — high normal discontinuity, aliasing, fireflies
   - Expert 3: Fine detail/hair — sub-pixel geometry, anisotropic noise
   - Expert 4: Transparent/overlapping — depth discontinuity, refraction artifacts
+
+MOTION EXPERTS (routed by tile velocity statistics — see motion-blur-handling spec):
+  - Expert 0: Static — low velocity variance, high temporal reuse
+  - Expert 1: Linear motion — uniform velocity, warp + accumulate
+  - Expert 2: Fast motion/blur — high velocity, shutter smear, deblur
+  - Expert 3: Occlusion boundary — velocity discontinuity, inpainting-style
 
 ### Requirement: Shared expert (always active)
 
@@ -170,17 +181,17 @@ Omen SHALL configure MoE complexity based on model tier.
 
 - **WHEN** using Medium tier model
 - **THEN** MoE in U-Net bottleneck only (not in encoder/decoder)
-- **AND** 8 material + 5 light + 5 geometry + 1 shared = 19 total experts
-- **AND** top-K=2 material experts, top-1 light, top-1 geo per tile
-- **AND** active experts per tile: 2 + 1 + 1 + 1 shared = 5 active
+- **AND** 8 material + 5 light + 5 geometry + 4 motion + 1 shared = 23 total experts
+- **AND** top-K=2 material experts, top-1 light, top-1 geo, top-1 motion per tile
+- **AND** active experts per tile: 2 + 1 + 1 + 1 + 1 shared = 6 active
 
 #### Scenario: High tier (64M params) — MoE in bottleneck and encoder
 
 - **WHEN** using High tier model
 - **THEN** MoE in U-Net bottleneck AND encoder path
-- **AND** 8 material + 5 light + 5 geometry + 1 shared = 19 total experts
-- **AND** top-K=3 material experts, top-1 light, top-1 geo per tile
-- **AND** active experts per tile: 3 + 1 + 1 + 1 shared = 6 active
+- **AND** 8 material + 5 light + 5 geometry + 4 motion + 1 shared = 23 total experts
+- **AND** top-K=3 material experts, top-1 light, top-1 geo, top-1 motion per tile
+- **AND** active experts per tile: 3 + 1 + 1 + 1 + 1 shared = 7 active
 - **AND** encoder MoE uses smaller expert FFNs (fewer params per expert)
 
 ### Requirement: Blender-compatible auxiliary buffers

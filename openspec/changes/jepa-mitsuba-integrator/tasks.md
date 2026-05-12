@@ -106,12 +106,15 @@
 - [ ] 6.7 Implement 8 material expert FFNs: diffuse, glossy/glass, metal, SSS/skin, volume/smoke, emissive, hair/fur, cloth
 - [ ] 6.8 Implement 5 light expert FFNs: point/spot, area, sun/directional, environment/HDRI, emissive geometry
 - [ ] 6.9 Implement 5 geometry expert FFNs: flat, curved/organic, edges/silhouettes, fine detail/hair, transparent
-- [ ] 6.10 Implement 1 shared expert (always active, base denoising) — from DeepSeekMoE shared expert isolation
-- [ ] 6.11 Implement expert combination: `output = shared_expert(x) + Σ(weight_i × expert_i(x))`
-- [ ] 6.12 Implement mixed-tile handling: tiles spanning material boundaries activate multiple experts with histogram-weighted blending
-- [ ] 6.13 Implement auxiliary-loss-free load balancing (DeepSeek-V3): per-expert bias vector, adjusted ±0.001 per training step, NO gradient
-- [ ] 6.14 Implement tier config: Fast = no MoE, Medium = MoE bottleneck top-2, High = MoE bottleneck+encoder top-3
-- [ ] 6.15 Test: Route synthetic tiles (pure diffuse, glass-metal boundary, hair edge) and verify correct expert activation
+- [ ] 6.10 Implement 4 motion expert FFNs: static, linear motion, fast motion/blur, occlusion boundary
+- [ ] 6.11 Implement 1 shared expert (always active, base denoising) — from DeepSeekMoE shared expert isolation
+- [ ] 6.12 Implement expert combination: `output = shared_expert(x) + Σ(weight_i × expert_i(x))`
+- [ ] 6.13 Implement mixed-tile handling: tiles spanning material boundaries activate multiple experts with histogram-weighted blending
+- [ ] 6.14 Implement motion-aware tile handling: tiles with high velocity variance activate deblur expert, occlusion tiles activate inpainting expert
+- [ ] 6.15 Implement auxiliary-loss-free load balancing (DeepSeek-V3): per-expert bias vector (now 23 experts), adjusted ±0.001 per training step, NO gradient
+- [ ] 6.16 Implement tier config: Fast = no MoE, Medium = MoE bottleneck top-2 (+motion top-1), High = MoE bottleneck+encoder top-3 (+motion top-1)
+- [ ] 6.17 Update all routing projections from Linear(17, n) to Linear(23, n) for 23-dim fingerprints
+- [ ] 6.18 Test: Route synthetic tiles (pure diffuse, glass-metal boundary, hair edge, fast motion, occlusion) and verify correct expert activation
 
 ## 7. Mojo GPU Tile Fingerprint Kernel
 
@@ -119,15 +122,16 @@
 > Spec: `specs/moe-tile-routing/` (tile fingerprint computation)
 
 - [ ] 7.1 Create `kernels/tile_fingerprint.mojo`: GPU kernel for computing 8×8 tile fingerprints from auxiliary buffer data
-- [ ] 7.2 Input: TileTensor[float32, row_major[H, W, 8]] (albedo(3) + normal(3) + depth(1) + material_id(1))
-- [ ] 7.3 Output: TileTensor[float32, row_major[H//8, W//8, 17]] (one 17-dim fingerprint per tile)
+- [ ] 7.2 Input: TileTensor[float32, row_major[H, W, 10]] (albedo(3) + normal(3) + depth(1) + material_id(1) + motion(2))
+- [ ] 7.3 Output: TileTensor[float32, row_major[H//8, W//8, 23]] (one 23-dim fingerprint per tile)
 - [ ] 7.4 Each GPU block processes one 8×8 tile: load 64 pixels into shared memory via `stack_allocation`
 - [ ] 7.5 Compute material histogram in shared memory: atomic counter per material_id, normalize by 64
 - [ ] 7.6 Compute normal variance: sum of squared deviations across 64 pixels for 3 normal channels
 - [ ] 7.7 Compute depth variance: sum of squared deviations for depth channel
 - [ ] 7.8 Compute edge density: count pixels where `||normal[i+1] - normal[i]|| > threshold` within tile
-- [ ] 7.9 Compute dominant material and mean albedo via warp reduction (`warp.sum`, `warp.max`)
-- [ ] 7.10 Write 17-dim fingerprint to output tensor
+- [ ] 7.9 Compute velocity mean and variance across tile via warp reduction (`warp.sum`)
+- [ ] 7.10 Compute velocity max and occlusion fraction (velocity discontinuity > threshold)
+- [ ] 7.11 Write 23-dim fingerprint to output tensor
 - [ ] 7.11 Bind and launch: `comptime kernel = tile_fingerprint_kernel[type_of(layout)]`, grid_dim=(W//8, H//8), block_dim=(8, 8)
 - [ ] 7.12 Expose to Python via `call_custom_kernel()` or DLPack interop (input numpy -> DeviceBuffer -> kernel -> DeviceBuffer -> numpy)
 - [ ] 7.13 Fallback path: pure numpy tile fingerprint computation if Mojo GPU not available
@@ -142,20 +146,23 @@
 - [ ] 8.3 Read normal pass: Mitsuba normal AOV or Blender Normal pass (3 channels, world-space)
 - [ ] 8.4 Read depth pass: Mitsuba depth AOV or Blender Depth/Z pass (1 channel)
 - [ ] 8.5 Read material ID pass: Cryptomatte from Blender (integer per pixel), or BSDF type index from Mitsuba scene extraction
-- [ ] 8.6 **Graceful degradation when AOVs missing**: zero-fill missing channels and flag `aov_available=False` for each pass
+- [ ] 8.6 Read motion vector pass: Blender `scene.render.use_pass_vector = True` → (H, W, 2), Mitsuba AOV `motion:vector`
+- [ ] 8.7 **Graceful degradation when AOVs missing**: zero-fill missing channels and flag `aov_available=False` for each pass
   - No albedo → fill zeros, material experts rely more on shared expert
   - No normals → fill zeros, geometry routing disabled, rely on shared + material experts
   - No depth → fill zeros, transparency detection disabled
   - No material_id → all pixels get material_id=0 (diffuse default), histogram becomes uniform, shared expert dominates
-- [ ] 8.7 **Render-time AOV enabling for Mitsuba**: when calling `mi.render()`, configure integrator to output auxiliary AOVs:
-  - `mi.load_dict({'type': 'aov', 'aovs': 'albedo:color,normal:color,depth:color'})` wrapping the path integrator
+  - No motion vectors → fill zeros, motion experts never activated, temporal reprojection disabled, static denoise mode
+- [ ] 8.8 **Render-time AOV enabling for Mitsuba**: when calling `mi.render()`, configure integrator to output auxiliary AOVs:
+  - `mi.load_dict({'type': 'aov', 'aovs': 'albedo:color,normal:color,depth:color,motion:vector'})` wrapping the path integrator
   - This produces auxiliary channels WITHOUT requiring user to set up custom passes
-- [ ] 8.8 **Render-time AOV enabling for Blender**: if integrated with Blender, enable required render passes programmatically:
-  - `scene.render.use_pass_normal = True`, `scene.render.use_pass_z = True`, etc.
-- [ ] 8.9 Pack auxiliary buffers into single (H, W, 8) tensor for tile fingerprint computation
-- [ ] 8.10 Log AOV status: "AOV available: albedo=yes, normal=yes, depth=no, material_id=no — using degraded mode"
-- [ ] 8.11 Test: Run denoiser with ALL AOVs missing → verify it still works (shared expert only), log degradation warning
-- [ ] 8.12 Test: Run denoiser with partial AOVs (only albedo) → verify degraded but functional
+- [ ] 8.9 **Render-time AOV enabling for Blender**: if integrated with Blender, enable required render passes programmatically:
+  - `scene.render.use_pass_normal = True`, `scene.render.use_pass_z = True`, `scene.render.use_pass_vector = True`, etc.
+- [ ] 8.10 Pack auxiliary buffers into single (H, W, 10) tensor for tile fingerprint computation (8 original + 2 motion)
+- [ ] 8.11 Log AOV status: "AOV available: albedo=yes, normal=yes, depth=no, material_id=no, motion=no — using degraded mode"
+- [ ] 8.12 Test: Run denoiser with ALL AOVs missing → verify it still works (shared expert only), log degradation warning
+- [ ] 8.13 Test: Run denoiser with partial AOVs (only albedo, no motion) → verify degraded but functional
+- [ ] 8.14 Test: Run denoiser with motion vectors → verify motion experts activate on moving tiles
 
 ## 9. JEPA Inference
 
@@ -261,14 +268,16 @@
 - [ ] 16.6 Train MoE tile routing: fingerprint projections learn which tiles belong to which experts
 - [ ] 16.7 MoE load balancing: after each training step, update per-expert bias ±0.001 based on tile routing counts
 - [ ] 16.8 Energy conservation loss: `L_total = L_denoise + 0.1 * L_energy + 0.09 * L_sigreg`
-- [ ] 16.9 Cornell box bootstrap validation: denoiser(100) -> confidence(100) -> multires(100) -> temporal(200)
-- [ ] 16.10 Build scene library: convert 50+ production Blender scenes across 7 categories (interiors, architecture, products, vehicles, characters, nature, volumes)
-- [ ] 16.11 Batch training pair generation: per-scene random cameras (20+ angles), light variations (0.5x-2.0x), material perturbations, spp pairs (4/8/16/256)
-- [ ] 16.12 Full pre-training: denoiser(5000) -> confidence(2000) -> multires(2000) -> temporal(5000) on production data
-- [ ] 16.13 Validate on held-out production scenes (NOT Cornell box): SSIM > 0.92 all categories
-- [ ] 16.14 Background fine-tuning: trigger on 3+ renders of same scene, LoRA rank=8, 50 iterations
-- [ ] 16.15 Export base model: Nabla state_dict, SHA256, metadata JSON, bundle for distribution (~30MB)
-- [ ] 16.16 Validate with degraded AOVs: train on scenes with full AOVs, test with partial AOVs missing to ensure graceful degradation
+- [ ] 16.9 Train motion experts: generate training pairs with motion blur enabled (animated camera + objects), motion vectors as AOV
+- [ ] 16.10 Train temporal reprojection: supervise warped previous frame blending with ground truth
+- [ ] 16.11 Cornell box bootstrap validation: denoiser(100) -> confidence(100) -> multires(100) -> motion(100) -> temporal(200)
+- [ ] 16.12 Build scene library: convert 50+ production Blender scenes across 7 categories (interiors, architecture, products, vehicles, characters, nature, volumes), include animated variants
+- [ ] 16.13 Batch training pair generation: per-scene random cameras (20+ angles), light variations (0.5x-2.0x), material perturbations, spp pairs (4/8/16/256), motion blur variants
+- [ ] 16.14 Full pre-training: denoiser(5000) -> confidence(2000) -> multires(2000) -> motion(1000) -> temporal(5000) on production data
+- [ ] 16.15 Validate on held-out production scenes (NOT Cornell box): SSIM > 0.92 all categories
+- [ ] 16.16 Background fine-tuning: trigger on 3+ renders of same scene, LoRA rank=8, 50 iterations
+- [ ] 16.17 Export base model: Nabla state_dict, SHA256, metadata JSON, bundle for distribution (~30MB)
+- [ ] 16.18 Validate with degraded AOVs: train on scenes with full AOVs, test with partial AOVs missing (including no motion vectors) to ensure graceful degradation
 
 ## 17. Testing & Validation
 
@@ -283,3 +292,85 @@
 - [ ] 17.7 Verify AOV degradation: quality degrades gracefully, never crashes when passes missing
 - [ ] 17.8 Verify Mojo GPU tile fingerprint kernel matches numpy reference within tolerance
 - [ ] 17.9 Memory validation: 4K inference under 700MB with MLA compression, 1.6GB training budget
+- [ ] 17.10 Verify motion blur handling: denoise motion-blurred frames, verify motion experts activate correctly, no ghosting
+- [ ] 17.11 Verify temporal reprojection: compare with/without previous frame reuse, measure quality delta on animation
+- [ ] 17.12 Verify motion vector degradation: denoise motion-blurred scene WITHOUT motion vectors, verify no crash, quality degrades gracefully
+
+## 18. Motion Blur & Temporal Reprojection
+
+> Spec: `specs/motion-blur-handling/`
+
+- [ ] 18.1 Create `motion.py` module: motion vector processing + temporal reprojection
+- [ ] 18.2 Implement motion vector reading: extract (H, W, 2) from Blender vector pass or Mitsuba AOV
+- [ ] 18.3 Implement temporal reprojection: `bilinear_warp(prev_clean, motion_vectors)` → reprojected frame aligned to current coordinates
+- [ ] 18.4 Compute motion coherence per pixel: `coherence = 1.0 - clamp(length(motion) / max_velocity, 0, 1)`
+- [ ] 18.5 Compute occlusion mask: detect velocity discontinuity between neighboring pixels
+- [ ] 18.6 Compute reprojection weight: `alpha = prev_confidence × coherence × (1 - occluded)`
+- [ ] 18.7 Merge reprojected + current: `output = alpha * reprojected + (1 - alpha) * current_noisy`
+- [ ] 18.8 Handle first frame: no previous frame → skip reprojection, single-frame denoise
+- [ ] 18.9 Handle jump cut: clear prev frame buffer, disable reprojection
+- [ ] 18.10 Handle missing motion vectors: fill zeros, disable reprojection, log "static denoise mode"
+- [ ] 18.11 Extend tile fingerprint from 17-dim to 23-dim: add velocity_mean(2) + velocity_var(2) + velocity_max(1) + occlusion_frac(1)
+- [ ] 18.12 Implement motion expert routing: Linear(23, 4) on fingerprint → select static/linear/fast/occlusion expert
+- [ ] 18.13 Test: Animated Cornell box (camera orbit) with motion blur, verify temporal reprojection reduces noise vs single-frame
+- [ ] 18.14 Test: Fast-moving object with occlusion, verify no ghosting artifacts in disoccluded regions
+- [ ] 18.15 Test: Motion-blurred scene WITHOUT motion vectors, verify graceful fallback to static mode
+
+## 19. Performance Optimizations
+
+> Design: `design.md` Decision 15
+
+### 19a: Async Pipeline (DualPipe)
+
+- [ ] 19a.1 Implement double-buffered render pipeline: Thread 1 = Mitsuba render, Thread 2 = JEPA denoise
+- [ ] 19a.2 Bounded queue (size 2) between render and denoise threads
+- [ ] 19a.3 GPU memory ping-pong: allocate 2× inference buffers for overlapping frames
+- [ ] 19a.4 Only enable async when VRAM > 2× single-frame inference budget, fall back to sequential otherwise
+- [ ] 19a.5 Benchmark: measure throughput gain on 100-frame animation sequence (target ~1.8×)
+
+### 19b: Speculative Multi-Frame Prediction (MTP)
+
+- [ ] 19b.1 Implement MTP heads on ARPredictor: predict N+1, N+2, N+3 from shared trunk
+- [ ] 19b.2 Implement verification: render 1spp of predicted frame, check SSIM > 0.85
+- [ ] 19b.3 If prediction verified: skip full render for that frame, use predicted output
+- [ ] 19b.4 If prediction fails: fall back to normal render for remaining predicted frames
+- [ ] 19b.5 Only active in Mode 4 (animation) with history buffer populated
+- [ ] 19b.6 Benchmark: measure effective frame rate gain on camera orbit sequence (target 1.8×)
+
+### 19c: Scene Latent Caching with Smart Invalidation
+
+- [ ] 19c.1 Create `scene/latent_cache.py`: two-level cache (topology_hash + dynamic_hash)
+- [ ] 19c.2 Implement topology_hash: hash of face connectivity + material TYPES + light TYPES (excludes positions, values)
+- [ ] 19c.3 Implement dynamic_hash: hash of vertex positions + light intensities + material VALUES
+- [ ] 19c.4 Cache strategy: if topology_hash matches cached → incremental update via SceneDeltaEncoder (delta encode ~5ms vs full ~30ms)
+- [ ] 19c.5 Smart invalidation: full re-encode on births, material type changes, vertex count changes, light additions
+- [ ] 19c.6 Small delta path: object moves, light intensity changes, material param values change → delta update only
+- [ ] 19c.7 Test: Static scene, verify latent reused across frames (0ms re-encode after first frame)
+- [ ] 19c.8 Test: Animated object (position changes only), verify delta encode works correctly
+- [ ] 19c.9 Test: New object added mid-animation, verify cache invalidation triggers full re-encode
+
+### 19d: Progressive Adaptive Sampling
+
+- [ ] 19d.1 Implement 2spp ultra-cheap preview (instead of 4spp)
+- [ ] 19d.2 Build per-tile spp map from confidence: high-conf tiles → 0 extra spp, low-conf → variable 4-128 spp
+- [ ] 19d.3 Implement multi-pass variable spp rendering (render at different spp levels, composite by confidence mask)
+- [ ] 19d.4 Benchmark: target 10-16× sample reduction on scenes with >50% easy regions
+- [ ] 19d.5 Test: Cornell box, verify progressive adaptive beats standard adaptive on sample reduction
+
+### 19e: Early Exit in U-Net Decoder
+
+- [ ] 19e.1 Implement per-tile confidence estimation at U-Net bottleneck output
+- [ ] 19e.2 Skip deeper decoder levels for high-confidence flat tiles (confidence > 0.9, low normal variance)
+- [ ] 19e.3 Continue full decoder depth for complex tiles (edges, mixed materials, motion blur)
+- [ ] 19e.4 Only enable for High tier at 4K (decoder is bottleneck only at high res)
+- [ ] 19e.5 Benchmark: measure inference speedup on scene with >60% flat surfaces
+
+### 19f: FP8 Mixed Precision Inference
+
+- [ ] 19f.1 Enable FP8 (E4M3) for U-Net encoder Conv2d weights with per-tile dynamic scaling
+- [ ] 19f.2 Keep BF16 for Swin attention QKV (softmax needs precision)
+- [ ] 19f.3 Enable FP8 for MoE expert FFN weights (experts are small, FP8 saves VRAM)
+- [ ] 19f.4 Enable FP8 for U-Net decoder Conv2d weights
+- [ ] 19f.5 Auto-detect GPU FP8 support (Ada Lovelace / Hopper+), fall back to BF16 on older GPUs
+- [ ] 19f.6 Validate: PSNR drop < 0.5dB vs BF16 baseline on Cornell box and production scenes
+- [ ] 19f.7 Benchmark: VRAM (700MB → ~400MB) and matmul speedup (target 1.5-2×)
