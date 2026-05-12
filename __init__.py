@@ -2,6 +2,17 @@
 
 Blender 5.1+ render engine built with Mojo for GPU compute
 and JEPA-based scene analysis.
+
+Development Setup:
+    Option 1 - Environment Variable:
+        export BLENDER_SYSTEM_SCRIPTS=/home/riju279/Documents/Projects/MOJO/Cycles_mojo/omen
+
+    Option 2 - Symlink (Linux):
+        ln -s /home/riju279/Documents/Projects/MOJO/Cycles_mojo/omen \
+              ~/.config/blender/5.1/scripts/addons/omen
+
+    Option 3 - Install (copies files, not recommended for dev):
+        Blender > Edit > Preferences > Add-ons > Install > Select omen folder
 """
 
 bl_info = {
