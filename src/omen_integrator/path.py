@@ -1,4 +1,14 @@
-"""Single path sampling logic for Omen integrator."""
+"""Single path sampling logic for Omen integrator.
+
+Implements path tracing with:
+- Next event estimation (NEE) for direct illumination
+- BSDF sampling for indirect illumination
+- Russian roulette termination
+- AOV buffer accumulation (albedo, normal, depth)
+
+This module will eventually be replaced by Mitsuba's built-in path tracer
+for production rendering, but serves as reference for the sampling logic.
+"""
 
 import mitsuba as mi
 import drjit as dr
@@ -26,7 +36,6 @@ def trace_path(scene, ray, integrator, sampler, radiance):
         # No intersection - add environment emitter and terminate
         if not si.is_valid():
             if dr.any(active):
-                # Sample environment emitters
                 for emitter in scene.emitters():
                     if emitter.is_environment():
                         ds, emitter_val = emitter.sample_direction(

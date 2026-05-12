@@ -21,10 +21,16 @@
 - [x] 1.19 Create `src/omen/training/` directory
 - [x] 1.20 Create `src/omen/training/trainer.py` (Nabla training loop with LoRA)
 - [x] 1.21 Create `src/omen/training/data_gen.py` (Dr.Jit training pair generation)
-- [ ] 1.22 Create `src/omen/model/mla_skip.py` (MLA skip connection compression — 16× down/up projection)
-- [ ] 1.23 Create `src/omen/model/moe.py` (TileMoERouter + tile fingerprint + expert FFNs + shared expert)
-- [ ] 1.24 Create `src/omen/aov.py` (AOV pass reader + graceful degradation for missing passes)
-- [ ] 1.25 Create `src/omen/kernels/tile_fingerprint.mojo` (GPU-accelerated 8×8 tile histogram + variance + edge density)
+- [x] 1.22 Create `src/python/render_engine.py` (Blender RenderEngine plugin — OmenRenderEngine + OmenProperties + scene graph extraction)
+- [x] 1.23 Create `src/python/test_pattern.py` (test patterns + camera animation generators for training data)
+- [x] 1.24 Upgrade `src/omen_integrator/core.py` (AOV extraction + JEPA denoise pipeline + DLPack transfer)
+- [x] 1.25 Upgrade `src/omen_integrator/jepa.py` (model loading + tile fingerprint computation 23-dim)
+- [x] 1.26 Upgrade `src/omen_integrator/gpu.py` (VRAM budget tracking + FP8 detection)
+- [x] 1.27 Upgrade `src/omen_integrator/path.py` (AOV-aware path tracing reference)
+- [ ] 1.28 Create `src/omen/model/mla_skip.py` (MLA skip connection compression — 16× down/up projection)
+- [ ] 1.29 Create `src/omen/model/moe.py` (TileMoERouter + tile fingerprint + expert FFNs + shared expert)
+- [ ] 1.30 Create `src/omen/aov.py` (AOV pass reader + graceful degradation for missing passes)
+- [ ] 1.31 Create `src/omen/kernels/tile_fingerprint.mojo` (GPU-accelerated 8×8 tile histogram + variance + edge density)
 
 > Spec: cross-cutting (all specs reference these files)
 
@@ -374,3 +380,70 @@
 - [ ] 19f.5 Auto-detect GPU FP8 support (Ada Lovelace / Hopper+), fall back to BF16 on older GPUs
 - [ ] 19f.6 Validate: PSNR drop < 0.5dB vs BF16 baseline on Cornell box and production scenes
 - [ ] 19f.7 Benchmark: VRAM (700MB → ~400MB) and matmul speedup (target 1.5-2×)
+
+## 20. Blender Plugin (RenderEngine + Shared Node System)
+
+> Spec: `specs/blender-plugin/` (NEW)
+> References: `src/python/render_engine.py`, `src/python/test_pattern.py`
+> Blender source: `source/blender/render/RE_engine.h`, `intern/cycles/blender/`
+
+- [ ] 20.1 Register `OmenRenderEngine(bpy.types.RenderEngine)` with `bl_idname = "OMEN_RENDER"`, `bl_use_eevee_viewport = True`
+- [ ] 20.2 Implement `update_render_passes()` — declare Combined(4), Depth(1), Diffuse Color(3), Specular Color(3), Normal(3), Vector(4), CryptoMaterial(4)
+- [ ] 20.3 Implement `render(depsgraph)` — scene graph extraction → Mitsuba render → JEPA denoise → return result via `self.begin_result()`
+- [ ] 20.4 Implement `view_update()` / `view_draw()` — delegate to EEVEE for viewport preview (bl_use_eevee_viewport = True)
+- [ ] 20.5 Create `OmenProperties(bpy.types.PropertyGroup)` — spp, spp_gt, use_denoiser, model_tier (Fast/Medium/High), model_path, export_motion_vectors, export_cryptomatte
+- [ ] 20.6 Register properties on `bpy.types.Scene.omen_props` via PointerProperty
+- [ ] 20.7 Implement `_extract_scene_graph(depsgraph)` — iterate depsgraph.objects, extract meshes/lights/cameras per-object
+- [ ] 20.8 Implement `_extract_mesh(obj)` — `obj.to_mesh()` → vertices, faces, normals, UVs, material_indices, transform (4x4 matrix_world)
+- [ ] 20.9 Implement `_extract_material(mat)` — read `mat.node_tree` (bNodeTree, NTREE_SHADER) → nodes (bNode) + links (bNodeLink) + input socket values
+- [ ] 20.10 Implement `_extract_light(obj)` — light.type, energy, color, transform
+- [ ] 20.11 Implement `_extract_camera(obj)` — fov, clip_start, clip_end, transform
+- [ ] 20.12 Implement `_get_socket_value(socket)` — extract default values from bNodeSocket (VALUE/RGBA/VECTOR/INT/BOOLEAN types)
+- [ ] 20.13 Implement `_render_mitsuba()` — convert scene graph → Mitsuba scene dict → mi.render() → return pixels
+- [ ] 20.14 Implement `_denoise()` — load JEPA model, stack noisy RGBA + AOV buffers (14ch), forward pass → clean RGBA
+- [ ] 20.15 Create Blender addon `__init__.py` with register()/unregister() functions and panel UI for OmenProperties
+- [ ] 20.16 Test: Install addon in Blender, select Omen render engine, render test scene, verify gradient output
+- [ ] 20.17 Test: Open Blender demo file (Classroom), verify scene graph extraction produces correct mesh/material/light/camera counts
+- [ ] 20.18 Test: Toggle AOV passes (motion vectors, cryptomatte on/off), verify passes appear/disappear correctly
+
+## 21. Blender Demo Files — Training Data Generation
+
+> Spec: `specs/blender-scene-converter/` (UPDATED)
+> References: `src/omen/training/data_gen.py`, `src/python/test_pattern.py` (camera animation)
+> Scene list: `docs/research/research-paper-grade-evaluation.md` Section 11
+
+- [ ] 21.1 Download Blender demo files (15 scenes): Singularity(670MB), DOGWALK(383MB), Gold(300MB), Barbershop(280MB), Laundromat(230MB), Classroom(72MB), Barcelona(24MB), ItalianFlat(368MB), Charge(1.4GB), MonsterBed, HairStyles, AnimalFur, EmberForest, WaspBot, NishitaSky
+- [ ] 21.2 Create `src/omen/training/scene_library/` directory with scene manifest JSON listing all 15 scenes with category, license, expected complexity
+- [ ] 21.3 Implement `scene_library/download.py` — automated download of Blender demo files from blender.org (wget/curl)
+- [ ] 21.4 Implement `scene_library/validate.py` — open each .blend headless via bpy, verify opens without error, log object/material/light/camera counts
+- [ ] 21.5 Implement camera animation generators in `test_pattern.py`: orbit(), dolly(), pan(), flythrough() — return Mitsuba-compatible look_at transforms
+- [ ] 21.6 Implement `training/batch_generate.py` — for each scene: iterate 30-50 camera positions, render noisy (1-4 spp) + GT (256-4096 spp) pairs via Mitsuba
+- [ ] 21.7 Extract AOV buffers per training pair: albedo(3), normal(3), depth(1), motion_vectors(2), cryptomatte_material(4), cryptomatte_object(4)
+- [ ] 21.8 Compute tile fingerprints (23-dim) per training pair using `omen_integrator.jepa.compute_tile_fingerprint()`
+- [ ] 21.9 Store training pairs as HDF5: group per scene, datasets per frame (noisy, gt, albedo, normal, depth, motion, cryptomatte, fingerprint)
+- [ ] 21.10 Implement scene diversity validation: compute material type distribution, light count distribution, geometric complexity stats across dataset — ensure no single category >40%
+- [ ] 21.11 Generate random light intensity variations per render (0.5x-2.0x baseline), random material perturbations (roughness ±0.1, color shift ±5%)
+- [ ] 21.12 Generate motion blur variants: enable Blender motion blur, render with animated objects, extract motion vectors as AOV
+- [ ] 21.13 Target: 500-750 total training pairs across 15 scenes (30-50 frames per scene × 15 scenes)
+- [ ] 21.14 Validate dataset: run scene_extractor on each pair, verify scene graphs are non-empty and consistent with source .blend
+- [ ] 21.15 Split dataset: 80% train, 10% validation, 10% hold-out test (stratified by scene category)
+
+## 22. Research Paper — Experimental Validation
+
+> Reference: `docs/research/research-paper-grade-evaluation.md`
+> Target venue: EGSR 2026 or HPG 2026 (Paper 1: tile-based MoE routing)
+
+- [ ] 22.1 Implement evaluation metrics: PSNR, SSIM, LPIPS, FLIP (NVIDIA's rendering perceptual metric)
+- [ ] 22.2 Run baseline comparisons: render hold-out test set with OIDN 2.x, OptiX denoiser, KPCN — compute all metrics
+- [ ] 22.3 Run Omen (full model) on same hold-out test set — compute all metrics
+- [ ] 22.4 Ablation 1: Full model vs no MoE (single FFN with same param budget) — quantify MoE routing benefit
+- [ ] 22.5 Ablation 2: Tile-based routing (8×8) vs per-pixel routing — measure seam artifacts, routing quality
+- [ ] 22.6 Ablation 3: Scene graph conditioning vs raw AOV only — quantify JEPA scene understanding contribution
+- [ ] 22.7 Ablation 4: With vs without motion experts — measure temporal flicker reduction on animation sequences
+- [ ] 22.8 Ablation 5: With vs without MLA skip compression — quality vs memory at 4K (target: cosine sim > 0.95)
+- [ ] 22.9 Generate convergence curves: quality vs spp plots for each baseline and Omen
+- [ ] 22.10 Generate speed/quality Pareto: inference time vs SSIM frontier plot
+- [ ] 22.11 Generate expert activation visualizations: heatmap showing which MoE experts fire on which scene regions
+- [ ] 22.12 Analyze failure cases: caustics, volumetrics, very low spp (<2), complex hair — document where Omen breaks
+- [ ] 22.13 Write Paper 1 draft: "Tile-Based Mixture-of-Experts Routing for Monte Carlo Denoising" — target EGSR/HPG
+- [ ] 22.14 Create supplementary material: side-by-side comparison images, video of temporal denoising, expert routing animation
