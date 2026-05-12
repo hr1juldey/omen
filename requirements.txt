@@ -2,3 +2,4 @@ mojo>=0.26.2.0
 max>=26.3.0
 modular>=26.3.0
 nabla-ml>=26.2251344
+mitsuba>=3.8.0
