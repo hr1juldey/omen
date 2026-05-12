@@ -1,102 +1,154 @@
-# Omen — Scene-Aware JEPA Render Accelerator for Blender
+# Omen — Scene-Aware JEPA Render Accelerator
 
-> **Omen** is a Blender addon that uses a JEPA (Joint Embedding Predictive Architecture) world model to denoise and accelerate Cycles path-traced rendering by understanding the 3D scene graph.
+> **Omen** is a research rendering engine that uses JEPA (Joint Embedding Predictive Architecture) for scene-aware path tracing acceleration.
 
-## What Omen Does
+## Components
 
-| Mode | What It Does | Impact | Complexity |
-|------|-------------|--------|------------|
-| **Mode 1: Denoiser** | Post-process denoising with 3D scene knowledge | Replace OptiX/OIDN | Baseline |
-| **Mode 2: Accelerator** | Predict "obvious" pixels, only path-trace the "confusing" ones | 4-8x fewer samples needed | Medium |
-| **Mode 3: Multi-Resolution** | High spp at low res + low spp at high res, JEPA fills the gap | 8-16x effective speedup | Hard |
+| Component | Description | Status |
+|-----------|-------------|--------|
+| **Mitsuba Integrator** | JEPA-accelerated path tracing plugin for Mitsuba 3 | ✅ Implemented |
+| **Blender Addon** | Blender integration via Mitsuba-Blender bridge | 🚧 In Development |
+| **JEPA Acceleration** | World model for adaptive sampling | 📋 Planned |
+| **Mojo GPU Kernels** | High-performance rendering kernels | 📋 Planned |
 
-## The Fundamental Advantage
+## Quick Start (Mitsuba Integrator)
 
-Existing denoisers (OptiX, OIDN) operate on 2D image data only. They have no concept of:
-- What objects are in the scene
-- Where lights are positioned
-- What materials are being rendered
-- The underlying 3D geometry
+### Setup
 
-**Omen knows the scene**. We extract the exact scene graph from Blender:
-- Evaluated geometry from the BVH (modifiers, armatures, subdivision applied)
-- Exact material parameters from Principled BSDF inputs
-- All light sources: light objects, emissive materials, **and geometry node instances**
-- Ground truth on demand — render at any spp for self-training
+```bash
+# One-command setup
+./setup.sh
+```
 
-This allows JEPA to learn "what this scene *should* look like" rather than just removing noise from pixels.
+Or manually:
+```bash
+pixi install
+pixi run pip install mitsuba drjit
+```
+
+### Basic Usage
+
+```python
+import mitsuba as mi
+mi.set_variant('llvm_ad_rgb')
+
+# Register Omen
+from omen_integrator import register
+register()
+
+# Render with Omen
+scene = mi.load_dict(mi.cornell_box())
+result = mi.render(scene, integrator=mi.load_dict({'type': 'omen'}))
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_depth` | int | -1 (infinite) | Maximum path bounces |
+| `rr_depth` | int | 5 | Russian roulette start depth |
+| `jepa_model` | string | "" | Path to JEPA model (future) |
+| `use_gpu` | boolean | true | Enable GPU acceleration (future) |
 
 ## Installation
 
 ### Prerequisites
 
-- Blender 5.1+
-- Mojo SDK (Q1 2026 or later)
-- CUDA-capable GPU (NVIDIA) or HIP-capable GPU (AMD)
+- Python 3.14
+- Pixi package manager
+- CUDA-capable GPU (optional, for future GPU acceleration)
 
-### Build
-
-```bash
-cd omen/lib
-./build.sh  # Builds libomen_core.so from Mojo source
-```
-
-### Install as Blender Addon
+### Install as Blender Addon (Future)
 
 1. In Blender, go to **Edit → Preferences → Add-ons → Install...**
 2. Navigate to `omen/` and select the folder
 3. Enable the "Omen: JEPA Render Accelerator" addon
 
-## Usage
+## Architecture
 
-### Quick Start
-
-```python
-import bpy
-
-# Enable Omen
-scene = bpy.context.scene
-scene.omen.use_denoiser = True
-scene.omen.mode = 'DENOISER'  # or 'ACCELERATOR' or 'MULTIRES'
-
-# Render as normal
-bpy.ops.render.render(animation=True)
+```
+Blender Scene → Mitsuba-Blender → Mitsuba Engine → Omen Integrator
+     │               │                  │                │
+     ├─ bpy.data    ├─ Export          ├─ Scene        ├─ Path Tracer
+     ├─ Depsgraph  │ to XML           │ Graph         │ (current)
+     └─ Render     │                  │ Sensors       │
+       Engine      └─ Integrator      │ Film          │
+                   Selection          └─ BSDFs        │
+                                       │                │
+                                       └────────────────┘
+                                              │
+                                        JEPA Model
+                                        (future)
 ```
 
-### Python API
+## Development
 
-```python
-import bpy
+### Project Structure
 
-scene = bpy.context.scene
-omen = scene.omen
-
-# Mode selection
-omen.mode = 'DENOISER'       # Basic denoising
-omen.mode = 'ACCELERATOR'    # Predict obvious pixels
-omen.mode = 'MULTIRES'       # Multi-resolution upscaling
-
-# Training settings
-omen.self_training = True
-omen.training_interval = 8   # Train every 8 frames
-omen.high_spp_multiplier = 4  # Ground truth = 4x samples
-
-# Performance tuning
-omen.patch_size = 8          # JEPA patch size (pixels)
-omen.tile_size = 128         # Render tile size (patches)
-omen.gpu_device_id = 0       # GPU to use
-
-# Memory management
-omen.texture_cache_mb = 2048
-omen.geometry_cache_mb = 1024
+```
+omen/
+├── README.md                 # This file
+├── SETUP.md                  # Setup instructions
+├── setup.sh                  # One-command setup script
+├── pixi.toml                 # Pixi environment configuration
+│
+├── src/                      # Mitsuba integrator plugin
+│   └── omen_integrator/
+│       ├── __init__.py       # Plugin registration
+│       ├── core.py           # Main render loop
+│       ├── path.py           # Path tracing logic
+│       ├── direct.py         # Direct illumination
+│       ├── jepa.py           # JEPA integration (future)
+│       └── gpu.py            # GPU kernels (future)
+│
+├── openspec/                 # Change management
+│   └── changes/
+│       └── omen-mitsuba-integrator-plugin/
+│           ├── proposal.md
+│           ├── design.md
+│           ├── specs/
+│           └── tasks.md
+│
+└── docs/                     # Documentation
+    ├── ARCHITECTURE.md
+    ├── BPY_MITSUBA_FINDINGS.md
+    └── ...
 ```
 
-### Panel Location
+### Key Design Decisions
 
-Find Omen settings in the **Render Properties** tab under:
-- **Omen Denoiser** section (for Mode 1)
-- **Omen Accelerator** section (for Mode 2)
-- **Omen Training** section (self-training controls)
+1. **Mitsuba-First Development**: Start with Mitsuba 3 plugin, proven renderer for research
+2. **Python Plugin**: Pure Python implementation for rapid prototyping
+3. **Blender-Free**: No Blender dependency for core rendering logic
+4. **Incremental JEPA Integration**: Add JEPA acceleration in phases
+
+## Status
+
+[![Mitsuba](https://img.shields.io/badge/Mitsuba-3.8.0-green)]()
+[![Python](https://img.shields.io/badge/Python-3.14-blue)]()
+[![Pixi](https://img.shields.io/badge/Pixi-Ready-orange)]()
+
+**Current Phase**: Mitsuba integrator implemented. JEPA acceleration pending.
+
+## Contributing
+
+This is a research project. Contributions welcome in:
+- JEPA model architecture
+- Mitsuba integration improvements
+- Blender addon development
+- GPU kernel optimization
+
+## License
+
+GPL-3.0-or-later (required for Blender addon distribution)
+
+## Acknowledgments
+
+- **Mitsuba 3** — Research rendering system
+- **Dr.Jit** — Just-in-time compilation for rendering
+- **Facebook AI Research** — JEPA architecture (arxiv 2504.14151, CC-BY-NC license)
+- **Modular** — Mojo programming language
+
 
 ## Architecture
 
