@@ -22,12 +22,14 @@ LATENT_DIM = 192
 class Decoder(nn.Module):
     """Decode latent vector to RGBA image.
 
+    Uses nb.conv2d_transpose() functional API (NHWC format).
+    Filter layout for conv2d_transpose: (K_h, K_w, C_out, C_in).
     Architecture:
     Linear(latent_dim, 128 * h_base * w_base)
-    Reshape -> (128, h_base, w_base)
-    Conv2dTranspose(128, 64, 3, stride=2) -> SiLU
-    Conv2dTranspose(64, 32, 3, stride=2) -> SiLU
-    Conv2dTranspose(32, 4, 3, stride=2) -> Sigmoid
+    Reshape -> (batch, h_base, w_base, 128)  [NHWC]
+    conv2d_transpose(128, 64, 3, stride=2) -> SiLU
+    conv2d_transpose(64, 32, 3, stride=2) -> SiLU
+    conv2d_transpose(32, 4, 3, stride=2) -> Sigmoid
     """
 
     def __init__(self, latent_dim: int = LATENT_DIM, base_size: int = 8):
@@ -38,10 +40,19 @@ class Decoder(nn.Module):
         # Project latent to spatial feature map
         self.proj = nn.Linear(latent_dim, 128 * base_size * base_size)
 
-        # Upsampling via transposed convolutions
-        self.deconv1 = nn.Conv2dTranspose(128, 64, kernel_size=3, stride=2, padding=1)
-        self.deconv2 = nn.Conv2dTranspose(64, 32, kernel_size=3, stride=2, padding=1)
-        self.deconv3 = nn.Conv2dTranspose(32, 4, kernel_size=3, stride=2, padding=1)
+        # Transposed conv filters: layout is (K_h, K_w, C_out, C_in)
+        self.deconv1_filter = F.he_normal((3, 3, 64, 128))
+        self.deconv1_filter.requires_grad = True
+        self.deconv1_bias = nb.zeros(64)
+        self.deconv1_bias.requires_grad = True
+        self.deconv2_filter = F.he_normal((3, 3, 32, 64))
+        self.deconv2_filter.requires_grad = True
+        self.deconv2_bias = nb.zeros(32)
+        self.deconv2_bias.requires_grad = True
+        self.deconv3_filter = F.he_normal((3, 3, 4, 32))
+        self.deconv3_filter.requires_grad = True
+        self.deconv3_bias = nb.zeros(4)
+        self.deconv3_bias.requires_grad = True
 
     def forward(self, latent, height, width):
         """Decode latent to RGBA image.
@@ -56,17 +67,14 @@ class Decoder(nn.Module):
         """
         batch = latent.shape[0]
 
-        # Project to spatial features
+        # Project to spatial features and reshape to NHWC
         x = self.proj(latent)
-        x = x.reshape(batch, 128, self.base_size, self.base_size)
+        x = x.reshape(batch, self.base_size, self.base_size, 128)
 
-        # Upsample
-        x = F.silu(self.deconv1(x))
-        x = F.silu(self.deconv2(x))
-        x = F.sigmoid(self.deconv3(x))
-
-        # Convert NCHW -> NHWC
-        x = x.transpose(0, 2, 3, 1)
+        # Upsample via transposed convolutions (NHWC throughout)
+        x = nb.silu(nb.conv2d_transpose(x, self.deconv1_filter, stride=2, padding=1, bias=self.deconv1_bias))
+        x = nb.silu(nb.conv2d_transpose(x, self.deconv2_filter, stride=2, padding=1, bias=self.deconv2_bias))
+        x = nb.sigmoid(nb.conv2d_transpose(x, self.deconv3_filter, stride=2, padding=1, bias=self.deconv3_bias))
 
         # Resize to target if needed
         if x.shape[1] != height or x.shape[2] != width:

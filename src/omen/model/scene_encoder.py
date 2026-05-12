@@ -46,7 +46,7 @@ class SceneGraphEncoder(nn.Module):
         # Lights: 7 params per light
         self.light_linear = nn.Linear(7, 64)
         # Self-attention to aggregate
-        self.self_attn = nn.MultiHeadAttention(embed_dim=64, num_heads=4)
+        self.self_attn = nn.MultiHeadAttention(d_model=64, num_heads=4)
         # Project to latent dim
         self.proj = nn.Linear(64, latent_dim)
 
@@ -113,8 +113,9 @@ class SceneGraphEncoder(nn.Module):
 
 
 class RenderFeatureEncoder(nn.Module):
-    """Encode render image features via Conv2d stack.
+    """Encode render image features via Conv2d functional stack.
 
+    Uses nb.conv2d() functional API (NHWC format, HWIO filter layout).
     Architecture:
     Conv2d(4, 32, 3, stride=2) -> SiLU
     Conv2d(32, 64, 3, stride=2) -> SiLU
@@ -125,29 +126,40 @@ class RenderFeatureEncoder(nn.Module):
 
     def __init__(self, latent_dim: int = LATENT_DIM):
         super().__init__()
-        self.conv1 = nn.Conv2d(4, 32, kernel_size=3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        # Store conv filters as learnable parameters (HWIO layout for nb.conv2d)
+        # conv1: (3, 3, 4, 32) - 4 input channels, 32 output
+        self.conv1_filter = F.he_normal((3, 3, 4, 32))
+        self.conv1_filter.requires_grad = True
+        self.conv1_bias = nb.zeros(32)
+        self.conv1_bias.requires_grad = True
+        # conv2: (3, 3, 32, 64)
+        self.conv2_filter = F.he_normal((3, 3, 32, 64))
+        self.conv2_filter.requires_grad = True
+        self.conv2_bias = nb.zeros(64)
+        self.conv2_bias.requires_grad = True
+        # conv3: (3, 3, 64, 128)
+        self.conv3_filter = F.he_normal((3, 3, 64, 128))
+        self.conv3_filter.requires_grad = True
+        self.conv3_bias = nb.zeros(128)
+        self.conv3_bias.requires_grad = True
         self.proj = nn.Linear(128, latent_dim)
 
     def forward(self, rgba: "nb.Tensor"):
         """Encode RGBA render image to latent vector.
 
         Args:
-            rgba: (batch, H, W, 4) RGBA render
+            rgba: (batch, H, W, 4) RGBA render (already NHWC)
 
         Returns:
             latent: (batch, latent_dim)
         """
-        # Convert NHWC -> NCHW for Conv2d
-        x = rgba.transpose(0, 3, 1, 2)  # (B, 4, H, W)
+        # nb.conv2d expects NHWC input, HWIO filter
+        x = nb.silu(nb.conv2d(rgba, self.conv1_filter, stride=2, padding=1, bias=self.conv1_bias))
+        x = nb.silu(nb.conv2d(x, self.conv2_filter, stride=2, padding=1, bias=self.conv2_bias))
+        x = nb.silu(nb.conv2d(x, self.conv3_filter, stride=2, padding=1, bias=self.conv3_bias))
 
-        x = F.silu(self.conv1(x))
-        x = F.silu(self.conv2(x))
-        x = F.silu(self.conv3(x))
-
-        # Global average pool over spatial dims
-        x = x.mean(axis=(-2, -1))  # (B, 128)
+        # Global average pool over spatial dims (H, W) -> (B, 128)
+        x = x.mean(axis=(1, 2))
 
         return self.proj(x)
 
@@ -160,7 +172,7 @@ class CrossAttentionFusion(nn.Module):
 
     def __init__(self, latent_dim: int = LATENT_DIM, num_heads: int = NUM_HEADS):
         super().__init__()
-        self.cross_attn = nn.MultiHeadAttention(embed_dim=latent_dim, num_heads=num_heads)
+        self.cross_attn = nn.MultiHeadAttention(d_model=latent_dim, num_heads=num_heads)
         self.norm = nn.LayerNorm(latent_dim)
 
     def forward(self, render_latent: "nb.Tensor", scene_latent: "nb.Tensor"):

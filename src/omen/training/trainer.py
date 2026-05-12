@@ -41,14 +41,18 @@ class OmenTrainer:
         self.lr = lr
         self.weight_decay = weight_decay
         self.optimizer = nn.optim.AdamW(
-            model.parameters(),
+            model,
             lr=lr,
             weight_decay=weight_decay,
         )
         self.iteration = 0
 
     def train_step(self, noisy, ground_truth, scene_graph):
-        """Run a single training step.
+        """Run a single JEPA training step — in LATENT space, not pixel space.
+
+        JEPA paradigm: encode both noisy and clean renders into latent space,
+        then train the model to predict the clean latent from the noisy latent.
+        The decoder is NOT used during training. It's only for inference output.
 
         Args:
             noisy: (batch, H, W, 4) noisy render
@@ -60,14 +64,18 @@ class OmenTrainer:
         """
         self.model.train()
 
-        # Forward pass
-        latent = self.model.encode(scene_graph, noisy)
-        predicted = self.model.decode(latent, ground_truth.shape[1], ground_truth.shape[2])
+        # Encode noisy render -> predicted latent
+        predicted_latent = self.model.encode(scene_graph, noisy)
 
-        # Compute losses
-        pred_loss = F.mse_loss(predicted, ground_truth)
-        sigreg_loss = self.model.sigreg(latent)
-        total_loss = pred_loss + SIGREG_LAMBDA * sigreg_loss
+        # Encode clean ground truth -> target latent (stop-grad not needed,
+        # we want the model to match this representation)
+        target_latent = self.model.encode(scene_graph, ground_truth)
+
+        # JEPA loss: latent prediction + SIGReg collapse prevention
+        total_loss, pred_loss, sigreg_loss = self.model.compute_loss(
+            predicted_latent, target_latent, embeddings=predicted_latent,
+            lambda_sigreg=SIGREG_LAMBDA,
+        )
 
         # Backward pass
         total_loss.backward()
@@ -75,44 +83,63 @@ class OmenTrainer:
         # Gradient clipping
         _clip_grad_norm(self.model.parameters(), DEFAULT_GRADIENT_CLIP)
 
-        # Optimizer step
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+        # Optimizer step (Nabla returns updated model)
+        self.model = self.optimizer.step()
+        self.model.zero_grad()
 
         self.iteration += 1
 
         return {
-            "total_loss": float(total_loss.numpy().sum()),
-            "pred_loss": float(pred_loss.numpy().sum()),
-            "sigreg_loss": float(sigreg_loss.numpy().sum()),
+            "total_loss": float(total_loss.to_numpy().sum()),
+            "pred_loss": float(pred_loss.to_numpy().sum()),
+            "sigreg_loss": float(sigreg_loss.to_numpy().sum()),
             "iteration": self.iteration,
         }
 
     def save_checkpoint(self, path):
-        """Save model and optimizer state."""
+        """Save model state dict to disk via numpy .npz serialization."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        state = {
-            "model": self.model.state_dict(),
-            "iteration": self.iteration,
-            "lr": self.lr,
+        # Convert state_dict tensors to numpy for serialization
+        state_dict = self.model.state_dict()
+        save_data = {
+            "__iteration__": np.array(self.iteration),
+            "__lr__": np.array(self.lr),
         }
-        nb.save(state, path)
+        for key, tensor in state_dict.items():
+            save_data[key] = tensor.to_numpy()
+
+        np.savez_compressed(path, **save_data)
         logger.info("Checkpoint saved: %s (iter %d)", path, self.iteration)
 
     def load_checkpoint(self, path):
-        """Load model and optimizer state."""
-        state = nb.load(path)
-        self.model.load_state_dict(state["model"])
-        self.iteration = state.get("iteration", 0)
+        """Load model state dict from disk."""
+        npz_path = path if path.endswith(".npz") else path + ".npz"
+        data = np.load(npz_path)
+        # Rebuild state dict with Nabla tensors
+        state_dict = {}
+        for key in data.files:
+            if key.startswith("__"):
+                continue
+            state_dict[key] = nb.Tensor.from_dlpack(data[key])
+        self.model.load_state_dict(state_dict)
+        self.iteration = int(data.get("__iteration__", 0))
         logger.info("Resumed from iteration %d", self.iteration)
 
     def init_lora(self, rank=8):
-        """Initialize LoRA adapter for parameter-efficient fine-tuning."""
+        """Initialize LoRA adapters on all Linear weight parameters.
+
+        Nabla LoRA API: init_lora_adapter(weight, rank) returns {'A', 'B'}.
+        Adapters are stored per-parameter for use with lora_linear().
+        """
         try:
             from nabla.nn.finetune.lora import init_lora_adapter
-            init_lora_adapter(self.model, rank=rank)
-            logger.info("LoRA adapter initialized (rank=%d)", rank)
+            self._lora_adapters = {}
+            for name, param in self.model.named_parameters():
+                if param.ndim == 2:  # Linear weight matrices
+                    self._lora_adapters[name] = init_lora_adapter(param, rank=rank)
+            logger.info("LoRA adapters initialized (rank=%d) on %d params",
+                        rank, len(self._lora_adapters))
         except ImportError:
             logger.warning("LoRA not available in this Nabla version")
 
@@ -123,7 +150,7 @@ def _clip_grad_norm(parameters, max_norm):
         total_norm = 0.0
         for p in parameters:
             if p.grad is not None:
-                total_norm += (p.grad ** 2).sum().numpy().item()
+                total_norm += (p.grad ** 2).sum().to_numpy().item()
         total_norm = total_norm ** 0.5
 
         if total_norm > max_norm:

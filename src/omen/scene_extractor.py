@@ -303,7 +303,7 @@ def _extract_camera(scene) -> dict:
     """
     sensors = scene.sensors()
     if not sensors:
-        return {"params": np.zeros(21, dtype=np.float32)}
+        return {"params": np.zeros(22, dtype=np.float32)}
 
     sensor = sensors[0]
     import mitsuba as mi

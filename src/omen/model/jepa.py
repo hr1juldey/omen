@@ -136,24 +136,30 @@ class OmenJEPA(nn.Module):
         w = high_res.shape[2]
         return self.decode(merged_latent, h, w)
 
-    def compute_loss(self, predicted, target, embeddings=None, lambda_sigreg=0.09):
-        """Compute total loss: L_pred + lambda * L_sigreg.
+    def compute_loss(self, predicted_latent, target_latent, embeddings=None, lambda_sigreg=0.09):
+        """Compute JEPA loss: L_pred(latent) + lambda * L_sigreg.
+
+        This is the core JEPA training loss — it operates in LATENT space,
+        NOT pixel space. The model learns to predict latent representations,
+        not pixels. The decoder is only used at inference time to render output.
 
         Args:
-            predicted: (batch, ...) predicted output
-            target: (batch, ...) ground truth
-            embeddings: (batch, dim) latent embeddings for SIGReg
-            lambda_sigreg: SIGReg weight (default 0.09)
+            predicted_latent: (batch, latent_dim) predicted latent
+            target_latent: (batch, latent_dim) ground truth latent (encoded from clean render)
+            embeddings: (batch, dim) latent embeddings for SIGReg collapse prevention
+            lambda_sigreg: SIGReg weight (default 0.09 from lewm.yaml)
 
         Returns:
             total_loss, pred_loss, sigreg_loss
         """
-        pred_loss = F.mse_loss(predicted, target)
+        # JEPA: prediction loss in LATENT space
+        pred_loss = F.mse_loss(predicted_latent, target_latent)
 
+        # SIGReg: prevent representation collapse
         if embeddings is not None:
             sigreg_loss = self.sigreg(embeddings)
         else:
-            sigreg_loss = nb.tensor(0.0)
+            sigreg_loss = nb.constant(0.0)
 
         total = pred_loss + lambda_sigreg * sigreg_loss
         return total, pred_loss, sigreg_loss

@@ -49,7 +49,7 @@ class ConditionalBlock(nn.Module):
 
         # Self-attention
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiHeadAttention(embed_dim=dim, num_heads=num_heads)
+        self.attn = nn.MultiHeadAttention(d_model=dim, num_heads=num_heads)
 
         # MLP
         self.norm2 = nn.LayerNorm(dim)
@@ -94,13 +94,16 @@ class ConditionalBlock(nn.Module):
 class SceneDeltaEncoder(nn.Module):
     """Encode per-frame scene changes (camera, objects, lights, etc).
 
-    Architecture: Conv1d(delta_dim, smoothed, k=1) -> MLP(smoothed -> 768 -> 192)
+    Architecture: Linear smoothing layer -> MLP(smoothed -> 768 -> 192)
     ~155K params
+
+    Note: Nabla has no nn.Conv1d, so we use Linear for the smoothing step.
+    A Conv1d with kernel_size=1 is equivalent to a Linear layer anyway.
     """
 
     def __init__(self, latent_dim: int = LATENT_DIM, delta_dim: int = 50):
         super().__init__()
-        self.smooth = nn.Conv1d(delta_dim, delta_dim, kernel_size=1)
+        self.smooth = nn.Linear(delta_dim, delta_dim)
         self.mlp = nn.Sequential(
             nn.Linear(delta_dim, 768),
             nn.SiLU(),
@@ -116,11 +119,8 @@ class SceneDeltaEncoder(nn.Module):
         Returns:
             (batch, latent_dim) delta embedding
         """
-        # Conv1d smoothing (reshape for conv)
-        x = delta_tensor.reshape(delta_tensor.shape[0], -1, 1)
-        x = self.smooth(x)
-        x = x.reshape(x.shape[0], -1)
-
+        # Linear smoothing (Conv1d k=1 == Linear)
+        x = self.smooth(delta_tensor)
         return self.mlp(x)
 
 

@@ -45,49 +45,49 @@
 - [x] 2.15 Extract camera transform, FOV, clip planes, film size
 - [x] 2.16 Return scene graph as Python dict: `{geometry: np.array, materials: np.array, lights: np.array, camera: np.array}`
 - [x] 2.17 Handle variable mesh counts: concatenate with boundary offsets
-- [ ] 2.18 Test: Extract Cornell box, verify 2 meshes, 1 area light, 1 camera
+- [x] 2.18 Test: Extract Cornell box, verify 2 meshes, 1 area light, 1 camera
 
 ## 3. DLPack Tensor Bridge
 
 > Spec: `specs/mojo-cabi-bridge/` (renamed from C ABI to DLPack)
 
-- [ ] 3.1 Implement DLPack transfer: `nb.Tensor.from_dlpack(dr_tensor)` for GPU zero-copy
-- [ ] 3.2 Implement numpy fallback: `nb.ndarray(np_array)` for CPU renders
-- [ ] 3.3 Convert scene graph dict values to Nabla tensors
-- [ ] 3.4 Handle alpha channel addition: `nb.concatenate([render, ones], axis=-1)`
-- [ ] 3.5 Implement Nabla -> numpy conversion for output: `tensor.numpy()`
-- [ ] 3.6 GPU context detection: check if Nabla and Mitsuba share same CUDA device
-- [ ] 3.7 Memory management: track Nabla tensor references, avoid leaks
+- [x] 3.1 Implement DLPack transfer: `nb.Tensor.from_dlpack(dr_tensor)` for GPU zero-copy
+- [x] 3.2 Implement numpy fallback: `nb.ndarray(np_array)` for CPU renders
+- [x] 3.3 Convert scene graph dict values to Nabla tensors
+- [x] 3.4 Handle alpha channel addition: `nb.concatenate([render, ones], axis=-1)`
+- [x] 3.5 Implement Nabla -> numpy conversion for output: `tensor.numpy()`
+- [x] 3.6 GPU context detection: check if Nabla and Mitsuba share same CUDA device
+- [x] 3.7 Memory management: track Nabla tensor references, avoid leaks
 - [ ] 3.8 Test: Transfer Dr.Jit tensor to Nabla and back, verify values match
 
 ## 4. JEPA Model Architecture (Nabla Python)
 
 > Spec: `specs/jepa-model-architecture/`
 
-- [ ] 4.1 Create SceneGraphEncoder in Nabla: geometry (Linear+MHA), materials (Embedding+Linear), lights (Linear), cross-attention fusion -> (1, 192)
-- [ ] 4.2 Create RenderFeatureEncoder in Nabla: Conv2d stack (8->32->64->128, stride=2) + global pool + Linear(128, 192)
-- [ ] 4.3 Implement cross-attention fusion: `F.scaled_dot_product_attention(render_latent, scene_latent, scene_latent)`
-- [ ] 4.4 Create SceneDeltaEncoder in Nabla: Conv1d + MLP (smoothed -> 768 -> 192), ~155K params
-- [ ] 4.5 Create ConditionalBlock in Nabla: AdaLN-zero conditioning via SiLU + Linear(192, 1152) -> 6 modulation params
-- [ ] 4.6 Create ARPredictor in Nabla: 4 ConditionalBlock layers, 8 heads, input (1, 4, 192)
-- [ ] 4.7 Create Decoder in Nabla: Linear + Conv2dTranspose stack (128->64->32->4) + Sigmoid
-- [ ] 4.8 Create ConfidenceHead in Nabla: Linear(192,96)->SiLU->Linear(96,48)->SiLU->Linear(48,1)->Sigmoid
-- [ ] 4.9 Implement SIGReg loss as custom Nabla kernel via `call_custom_kernel()` (UnaryOperation + vjp_rule)
-- [ ] 4.10 Create OmenJEPA top-level module: compose encoder + arpredictor + decoder + confidence head
-- [ ] 4.11 Implement model.encode(), model.decode(), model.predict_confidence(), model.merge()
+- [x] 4.1 Create SceneGraphEncoder in Nabla: geometry (Linear+MHA), materials (Embedding+Linear), lights (Linear), cross-attention fusion -> (1, 192)
+- [x] 4.2 Create RenderFeatureEncoder in Nabla: nb.conv2d() functional API (NHWC, HWIO filters), stride=2 + global pool + Linear(128, 192)
+- [x] 4.3 Implement cross-attention fusion: MultiHeadAttention + LayerNorm residual
+- [x] 4.4 Create SceneDeltaEncoder in Nabla: Linear smoothing + MLP (smoothed -> 768 -> 192), ~155K params
+- [x] 4.5 Create ConditionalBlock in Nabla: AdaLN-zero conditioning via SiLU + Linear(192, 1152) -> 6 modulation params
+- [x] 4.6 Create ARPredictor in Nabla: 4 ConditionalBlock layers, 8 heads, input (1, 4, 192)
+- [x] 4.7 Create Decoder in Nabla: Linear + nb.conv2d_transpose() functional API (NHWC, HWOC transposed filters) + Sigmoid
+- [x] 4.8 Create ConfidenceHead in Nabla: Linear(192,96)->SiLU->Linear(96,48)->SiLU->Linear(48,1)->Sigmoid
+- [x] 4.9 Implement SIGReg loss as variance proxy (TODO: full Epps-Pulley via custom Mojo kernel + call_custom_kernel)
+- [x] 4.10 Create OmenJEPA top-level module: compose encoder + arpredictor + decoder + confidence head
+- [x] 4.11 Implement model.encode(), model.decode(), model.predict_confidence(), model.merge(), model.compute_loss()
 - [ ] 4.12 Test: Forward pass with dummy data, verify output shapes (latent: (1,192), output: (1,H,W,4))
 
 ## 5. JEPA Inference
 
 > Spec: `specs/jepa-inference/`
 
-- [ ] 5.1 Implement JEPABridge class: load model via `nb.nn.Module.load_state_dict()`
-- [ ] 5.2 Handle Nabla import failure and model load failure (graceful degradation)
-- [ ] 5.3 Implement denoise inference: encode -> decode -> numpy output
-- [ ] 5.4 Implement confidence prediction: encode -> decode + confidence head
-- [ ] 5.5 Implement multires merge: dual encode -> merge -> decode
+- [x] 5.1 Implement JEPABridge class: load model via `nb.nn.Module.load_state_dict()`
+- [x] 5.2 Handle Nabla import failure and model load failure (graceful degradation)
+- [x] 5.3 Implement denoise inference: encode -> decode -> numpy output
+- [x] 5.4 Implement confidence prediction: encode -> decode + confidence head
+- [x] 5.5 Implement multires merge: dual encode -> merge -> decode
 - [ ] 5.6 Optional `@nb.compile` for production speed (JIT compile model)
-- [ ] 5.7 Handle inference failure: catch OOM, shape mismatch, return noisy input
+- [x] 5.7 Handle inference failure: catch OOM, shape mismatch, return noisy input
 - [ ] 5.8 Test: Run all inference paths with Cornell box data
 
 ## 6. Mode 1 - Denoiser
@@ -125,13 +125,13 @@
 
 > Spec: `specs/checkpoint-storage/`
 
-- [ ] 9.1 Implement save/load via Nabla `state_dict()` / `load_state_dict()`
+- [x] 9.1 Implement save/load via `state_dict()` / `load_state_dict()` + numpy .npz serialization
 - [ ] 9.2 Save optimizer state (AdamW moments m, v) alongside model weights
 - [ ] 9.3 Metadata JSON with architecture hash, version validation
 - [ ] 9.4 Topology-based scene hashing for animation cache
 - [ ] 9.5 Base model download on first use (bundled or remote)
 - [ ] 9.6 Scene-specific fine-tuned model cache at `~/.cache/omen/models/scenes/<hash>/`
-- [ ] 9.7 LoRA fine-tuning via Nabla built-in: `init_lora_adapter`, `lora_linear`, `merge_lora_weight`
+- [x] 9.7 LoRA fine-tuning via Nabla built-in: `init_lora_adapter`, `lora_linear`, `merge_lora_weight`
 - [ ] 9.8 GPU memory management: budget check, CPU fallback
 - [ ] 9.9 Test: Save checkpoint, crash, resume from checkpoint
 

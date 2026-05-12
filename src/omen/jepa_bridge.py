@@ -132,7 +132,7 @@ class JEPABridge:
         if isinstance(tensor, np.ndarray):
             return tensor
         try:
-            return tensor.numpy()
+            return tensor.to_numpy()
         except Exception:
             return np.array(tensor)
 
