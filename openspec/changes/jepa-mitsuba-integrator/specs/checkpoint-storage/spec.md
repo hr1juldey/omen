@@ -31,7 +31,7 @@ Omen SHALL store model architecture metadata alongside weights to prevent loadin
 
 - **WHEN** saving checkpoint file `checkpoint_iter_N.omen`
 - **THEN** create `checkpoint_iter_N.omen.meta.json` alongside with:
-  - `architecture_hash`: SHA256 of layer dimensions string (e.g., "ViT-Tiny-192-3-12_AR-6-16-64-2048")
+  - `architecture_hash`: SHA256 of layer dimensions string (e.g., "OmenUNet-C96-5lvl-Swin768-MoE_top2_MLA16_AR-4-16-64-2048")
   - `omen_version`: e.g., "0.1.0"
   - `nabla_version`: from Nabla library version string
   - `training_timestamp`: ISO 8601 datetime
@@ -147,8 +147,8 @@ Omen SHALL detect Mitsuba rendering backend and configure zero-copy buffer passi
 #### Scenario: Zero-copy on same GPU
 
 - **WHEN** both Mitsuba and JEPA are on GPU (same device)
-- **THEN** pass GPU pointer directly via C ABI: `ctypes.c_void_p(ptr_value)`
-- **AND** Mojo wraps as `DeviceBuffer(ctx, raw_ptr, count, owning=False)`
+- **THEN** pass GPU pointer via DLPack zero-copy: `nb.Tensor.from_dlpack(dr_tensor)` shares same GPU memory
+- **AND** Nabla wraps Dr.Jit tensor directly (same CUDA context)
 - **AND** NO memcpy — Mojo reads Mitsuba's GPU memory directly
 
 #### Scenario: CPU-to-GPU memcpy fallback
@@ -172,13 +172,13 @@ Omen SHALL monitor GPU memory and gracefully degrade when insufficient.
 #### Scenario: Inference memory estimate
 
 - **WHEN** loading model for inference
-- **THEN** estimate: model ~500MB + scene graph ~100MB + buffers ~50MB + workspace ~200MB ≈ 850MB
+- **THEN** estimate: model ~350MB (MLA 16× compression on skips) + scene graph ~100MB + buffers ~50MB + workspace ~200MB ≈ 700MB
 - **AND** if estimate > available: fall back to CPU inference or reduce resolution
 - **AND** if sufficient: allocate and proceed
 
 #### Scenario: Training memory management
 
 - **WHEN** starting training
-- **THEN** estimate: model ~500MB + optimizer ~1GB (Adam moments) + gradients ~500MB + batch ~200MB ≈ 2.2GB
+- **THEN** estimate: model ~350MB (MLA-compressed) + optimizer ~700MB (Adam moments, MLA reduces params) + gradients ~350MB + batch ~200MB ≈ 1.6GB
 - **AND** if insufficient: reduce batch size (8 → 4 → 2 → 1)
 - **AND** if still insufficient: fall back to CPU training

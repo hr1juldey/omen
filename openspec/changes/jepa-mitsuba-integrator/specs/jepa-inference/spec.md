@@ -78,7 +78,11 @@ Omen SHALL call JEPA model's forward method directly in Python with Nabla tensor
 
 - **WHEN** model is loaded and render data is transferred
 - **THEN** encode: `latent = model.encode(scene_graph, rgba_render)` -> shape `(1, 192)`
-- **AND** decode: `clean_rgba = model.decode(latent)` -> shape `(1, H, W, 4)`
+- **AND** decode with MLA-compressed skips and tile-based MoE routing:
+  - U-Net encoder: extract multi-scale features, compress skips via MLA (16× reduction)
+  - Bottleneck: Swin Transformer + MoE FFN routed per 8×8 tile using cryptomatte-style material/light/geo masks
+  - U-Net decoder: reconstruct MLA skips, produce clean pixels
+- **AND** `clean_rgba = model.decode(latent)` -> shape `(1, H, W, 4)`
 - **AND** convert back to numpy: `output = clean_rgba.numpy()` -> `(H, W, 4)`
 - **AND** return as numpy array
 - **AND** total inference time target: <100ms at 256x256 on GPU

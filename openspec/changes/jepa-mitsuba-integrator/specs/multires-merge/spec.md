@@ -116,7 +116,7 @@ Omen SHALL train merge model using triplets of (low-res clean, high-res noisy, f
 #### Scenario: Train merge model
 
 - **WHEN** training triplets are available
-- **THEN** pass to Mojo via `omen_train_step` C ABI
+- **THEN** run training loop via Nabla Python API: `optimizer = nb.nn.optim.AdamW(model.trainable_params(), lr=1e-3)`
 - **AND** loss: `L1(merge(low_res, high_res, scene_graph), ground_truth)`
 - **AND** train for 100 iterations on Cornell box
 - **AND** validate: PSNR > 30dB on held-out views

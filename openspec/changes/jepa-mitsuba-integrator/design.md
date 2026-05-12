@@ -84,14 +84,17 @@ Scene Graph Encoder        ~1M                scene_graph_encoder.py      nb.nn.
     O(n²) attention when scene has 100K+ vertices.
 
 U-Net Denoiser             ~13M               unet.py                     nb.conv2d, nb.conv2d_transpose
-  (encoder-decoder with skip connections + Swin Transformer bottleneck)
+  (encoder-decoder with MLA-compressed skip connections + Swin+MoE bottleneck)
   Input: cat([noisy_rgba(4), prev_clean(4), albedo(3), normal(3)]) = 14 ch
   Encoder: strided Conv2d → multi-scale features + skip connections
-  Bottleneck: Swin Transformer blocks (windowed 8×8 attention) with AdaLN
-    - Windowed attention at H/16×W/16 = trivial cost (~510 windows of 64 tokens)
-    - Better global context for caustics/indirect lighting than Mamba (validated: MambaVision CVPR 2025)
+  Skip: MLA-compressed (16× reduction, ~6GB → ~375MB at 4K)
+  Bottleneck: Swin Transformer blocks (windowed 8×8 attention) + MoE FFN
+    - Swin attention: global context (~510 windows of 64 tokens, trivial cost)
+    - MoE FFN: tile-based expert routing (8×8 windows with cryptomatte-style masks)
+    - Shared expert (always active) + routed material/light/geo experts
+    - Auxiliary-loss-free load balancing (DeepSeek-V3 bias adjustment)
     - Restormer-style transposed attention (channel-wise O(N)) as fallback for limited VRAM
-  Decoder: Conv2dTranspose + skip concat from encoder
+  Decoder: Conv2dTranspose + MLA-reconstructed skip concat from encoder
   Output: clean RGBA (H, W, 4) in linear HDR space
   Mamba usage: NOT at bottleneck (token count too small for O(n) to matter).
     Mamba is used in full-res encoder paths where 8.3M pixels make O(n²) impossible.
@@ -355,7 +358,219 @@ High (64M):   Swin Transformer, 4 blocks, window=8
 - Temporal: ARPredictor history from ALL cameras feeds into shared world model — more data = better predictions
 - Surprise: If Cam A detects surprise (new object), Cam B and C immediately benefit from updated scene_latent
 
-### Decision 6: Scene graph representation (was Decision 4)
+### Decision 6: MLA-inspired skip connection compression (from DeepSeek-V2/V3)
+
+**Choice:** Compress U-Net skip connections using MLA-style low-rank projections. Reduces 4K skip memory from ~6GB to ~375MB. Compresses temporal history for long rollouts using DeepSeek-V4 CSA/HCA-style tiered compression.
+
+**Rationale:**
+At 4K (3840×2160), skip connections dominate VRAM. DeepSeek-V2's MLA proved that projecting features into a low-rank latent space reduces cache by 93.3% with negligible quality loss. The same principle applies to U-Net skips:
+
+```
+Standard skip:  encoder(H,W,C) → store → decoder reads (H,W,C)
+MLA skip:       encoder(H,W,C) → W_down → latent(H,W,d_c) → store
+                decoder reads latent → W_up → reconstructed(H,W,C)
+                where d_c = C/16  →  16× compression
+```
+
+**Compression targets per level (High tier):**
+
+| Level | Resolution | Full C | Compressed d_c | Full | Compressed |
+|-------|-----------|--------|----------------|------|------------|
+| 0 | 3840×2160 | 192 | 12 | 3.17GB | ~200MB |
+| 1 | 1920×1080 | 384 | 24 | 1.59GB | ~100MB |
+| 2 | 960×540 | 768 | 48 | 0.80GB | ~50MB |
+| 3 | 480×270 | 1536 | 96 | 0.40GB | ~25MB |
+| **Total** | | | | **~6GB** | **~375MB** |
+
+**Implementation:**
+```python
+class MLASkipConnection(nb.nn.Module):
+    """MLA-inspired low-rank skip connection (from DeepSeek-V2)."""
+    def __init__(self, channels, ratio=16):
+        d_c = channels // ratio
+        self.compress = nb.nn.Linear(channels, d_c)     # W_down
+        self.reconstruct = nb.nn.Linear(d_c, channels)  # W_up
+
+    def encode(self, encoder_feature):
+        return self.compress(encoder_feature)    # (H, W, C/ratio) — store this
+
+    def decode(self, compressed):
+        return self.reconstruct(compressed)       # (H, W, C) — reconstruct at decoder
+```
+
+**DeepSeek-V4 CSA/HCA for temporal history compression:**
+ARPredictor maintains H=3 frame latents. For 4K 60fps 10min (36,000 frames), DeepSeek-V4's tiered compression applies:
+- **Recent frames** (last 4): full-resolution latents — CSA c4a style (4× compression)
+- **Older frames** (5-128): heavily compressed — HCA c128a style (128× compression)
+- At 1M-token equivalent (V4 achieves 2% KV cache), Omen can maintain long temporal context cheaply
+
+### Decision 7: Material/Light/Geometry-aware MoE — Tile-based Routing with Cryptomatte Masks
+
+**Choice:** MoE with experts specialized per material type, light type, and geometry type — NOT per scene type. Routing is TILE-BASED (8×8 Swin windows) using cryptomatte-style material/light/geo masks. A single pixel has no meaning — it needs spatial context. The same 8×8 window structure used by Swin attention is reused for MoE routing.
+
+**Rationale:**
+DeepSeekMoE proved fine-grained experts + shared expert isolation beats coarse experts. But two routing levels are WRONG:
+
+1. **Per-scene routing** (interior, exterior, product) is wrong because scenes are always mixed:
+   - Product shot = glass on metal table with diffuse walls → 3 material types in ONE frame
+   - Interior = emissive screens + wood + chrome fixtures → mixed everywhere
+
+2. **Per-pixel routing** is also wrong because 1 pixel has no meaning:
+   - A pixel at (127,45) with material_id=2 tells you nothing — is it edge of metal? center? reflection?
+   - No spatial context → expert sees a single value, not a pattern
+   - Real denoising needs to see edges, gradients, transitions WITHIN a neighborhood
+   - Production renderers already compute cryptomatte/object ID passes per-region
+
+**Correct: tile-based routing.** The 8×8 Swin window already groups 64 pixels. Compute a tile fingerprint (material histogram + normal variance + depth edge density) and route the ENTIRE TILE. Expert sees spatial structure, not a meaningless dot.
+
+**Expert taxonomy:**
+```
+MATERIAL EXPERTS (routed by tile material histogram from cryptomatte):
+  Expert 0: Diffuse/Lambertian      — walls, floors, flat surfaces
+  Expert 1: Glossy/Glass            — reflections, refraction, caustics
+  Expert 2: Metal/Chrome            — conductor BSDF, mirrors, specular
+  Expert 3: SSS/Skin                — subsurface scattering, wax, marble
+  Expert 4: Volume/Smoke            — participating media, fog, fire
+  Expert 5: Emissive                — area lights, LED panels, neon
+  Expert 6: Hair/Fur                — curve primitives, anisotropic
+  Expert 7: Cloth/Fabric            — microfiber, woven patterns
+
+LIGHT EXPERTS (routed by tile light contribution histogram):
+  Expert 0: Point/Spot light        — local, hard falloff
+  Expert 1: Area light              — soft shadows, rectangular/disk
+  Expert 2: Sun/Directional         — hard shadows, sky illumination
+  Expert 3: Environment/HDRI        — ambient, indirect dome
+  Expert 4: Emissive geometry       — mesh lights, emissive surfaces
+
+GEOMETRY EXPERTS (routed by tile normal/depth statistics):
+  Expert 0: Flat surfaces           — low normal variance, easy denoise
+  Expert 1: Curved/organic          — smooth normal changes, SSS-friendly
+  Expert 2: Edges/silhouettes       — high normal discontinuity, aliasing
+  Expert 3: Fine detail/hair        — sub-pixel geometry, anisotropic noise
+  Expert 4: Transparent/overlapping — depth discontinuity, refraction
+
+SHARED EXPERT (always active — from DeepSeekMoE shared expert isolation):
+  Base denoising — Gaussian noise removal, spatial filtering, universal patterns
+```
+
+**Tile-based routing with cryptomatte masks:**
+```python
+class TileMoERouter(nb.nn.Module):
+    """Tile-based MoE routing using 8×8 window fingerprints.
+
+    Routes ENTIRE 8×8 tiles (not individual pixels) to experts.
+    A tile fingerprint = histogram of material/light/geo signals within the window.
+    This preserves spatial context — experts see edges, gradients, transitions.
+    """
+    def __init__(self, n_material=8, n_light=5, n_geo=5, top_k=2, window_size=8):
+        self.top_k = top_k
+        self.window_size = window_size
+        # Tile fingerprint dim: material_hist(8) + light_hist(5) + geo_stats(5) = 18
+        fingerprint_dim = n_material + n_light + 5  # 5 = normal_var + depth_var + edge_density + mean_albedo + dominant_mat
+        self.mat_route = nb.nn.Linear(fingerprint_dim, n_material)
+        self.light_route = nb.nn.Linear(fingerprint_dim, n_light)
+        self.geo_route = nb.nn.Linear(fingerprint_dim, n_geo)
+        # Auxiliary-loss-free bias (DeepSeek-V3)
+        self.mat_bias = nb.zeros(n_material)
+        self.light_bias = nb.zeros(n_light)
+        self.geo_bias = nb.zeros(n_geo)
+
+    def compute_tile_fingerprint(self, aux_windows):
+        """Compute routing fingerprint for each 8×8 tile.
+
+        Args:
+            aux_windows: (B, n_tiles, 64, C) — C = albedo(3) + normal(3) + depth(1) + material_id(1)
+                         reshaped from (B, H, W, 8) into Swin windows
+
+        Returns:
+            fingerprint: (B, n_tiles, fingerprint_dim) — one routing vector per tile
+        """
+        material_ids = aux_windows[:, :, :, 7]           # (B, n_tiles, 64)
+        # Cryptomatte-style histogram: count pixels per material type in this tile
+        mat_hist = histogram(material_ids, bins=8) / 64.0  # (B, n_tiles, 8)
+        # Normal variance within tile = edge/curvature indicator
+        normals = aux_windows[:, :, :, 3:6]               # (B, n_tiles, 64, 3)
+        normal_var = nb.var(normals, axis=2)              # (B, n_tiles, 3)
+        # Depth variance = transparency/overlap indicator
+        depth = aux_windows[:, :, :, 6]                   # (B, n_tiles, 64)
+        depth_var = nb.var(depth, axis=2, keepdims=True)  # (B, n_tiles, 1)
+        # Edge density: fraction of pixels where normal discontinuity > threshold
+        edge_density = compute_edge_density(normals)       # (B, n_tiles, 1)
+        # Dominant material and mean albedo
+        dominant_mat = nb.argmax(mat_hist, axis=-1, keepdims=True)  # (B, n_tiles, 1)
+        mean_albedo = nb.mean(aux_windows[:, :, :, :3], axis=(2,)) # (B, n_tiles, 3)
+        return nb.concat([mat_hist, normal_var, depth_var, edge_density, dominant_mat, mean_albedo], axis=-1)
+
+    def forward(self, aux_windows):
+        # aux_windows: (B, n_tiles, 64, C) — reshaped from (B, H, W, 8) into Swin windows
+        fp = self.compute_tile_fingerprint(aux_windows)    # (B, n_tiles, fingerprint_dim)
+        mat_scores = self.mat_route(fp) + self.mat_bias
+        light_scores = self.light_route(fp) + self.light_bias
+        geo_scores = self.geo_route(fp) + self.geo_bias
+        # Top-K per category — route ENTIRE TILE (all 64 tokens) to selected experts
+        return route_topk(mat_scores, self.top_k), route_topk(light_scores, 1), route_topk(geo_scores, 1)
+```
+
+**Architecture integration (bottleneck MoE FFN replaces standard MLP):**
+```
+U-Net Bottleneck per Swin window:
+┌───────────────────────────────────────────────────────────────┐
+│  Swin Windowed Attention (8×8 = 64 tokens)                    │  ← spatial context
+│  + AdaLN conditioned by scene_latent                          │
+├───────────────────────────────────────────────────────────────┤
+│  Tile Fingerprint Computation:                                 │
+│  From 64 tokens, compute:                                     │
+│    material histogram (cryptomatte-style)                     │
+│    + normal variance (edge detector)                          │
+│    + depth variance (transparency indicator)                  │
+│    → one routing vector per 8×8 tile                          │
+├───────────────────────────────────────────────────────────────┤
+│  MoE FFN (replaces standard MLP):                             │
+│  ALL 64 tokens in tile routed together:                       │
+│                                                                │
+│  Tile (glass-dominant)   → Material Expert 1 + Shared Expert  │
+│  Tile (skin-dominant)    → Material Expert 3 + Shared Expert  │
+│  Tile (mixed glass/metal)→ Expert 1 + Expert 2 + Shared       │
+│  Tile (edge-heavy)       → Geo Expert 2 + Shared Expert       │
+│  ...per-TILE, not per-pixel, preserving spatial structure      │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**Why tile-based beats per-pixel:**
+```
+PER-PIXEL (wrong):
+  Pixel (127,45) material_id=2 → "metal expert"
+  Pixel (127,46) material_id=2 → "metal expert"
+  Pixel (127,47) material_id=1 → "glass expert" ← switched mid-edge!
+  → No context. Expert can't see the edge between metal and glass.
+  → Adjacent pixels may route to different experts → seam artifacts.
+
+TILE-BASED (correct):
+  8×8 tile around (127,45):
+    material histogram = {metal: 45px, glass: 19px}
+    normal variance = high (edge detected)
+    → Route to Metal Expert + Glass Expert + Edge Geo Expert
+    → Expert sees the FULL transition zone with spatial context
+    → Smooth blending across material boundaries
+```
+
+**Expert config per tier:**
+
+| Tier | Material | Light | Geo | Shared | Top-K | MoE? |
+|------|----------|-------|-----|--------|-------|------|
+| Fast (4M) | — | — | — | 1 | — | No MoE (too small) |
+| Medium (16M) | 8 | 5 | 5 | 1 | 2 | MoE in bottleneck only |
+| High (64M) | 8 | 5 | 5 | 1 | 3 | MoE in bottleneck + encoder |
+
+**Auxiliary-loss-free load balancing (DeepSeek-V3):**
+Per-expert bias adjusted dynamically — zero gradient interference with denoising quality:
+```
+if expert overloaded:  bias[expert] -= 0.001   (discourage)
+if expert underloaded: bias[expert] += 0.001   (encourage)
+Updated every training step, does NOT participate in backward pass
+```
+
+### Decision 8: Scene graph representation (was Decision 4, previously Decision 6)
 
 **Choice:** Python dicts/tensors, not C structs
 
@@ -413,7 +628,7 @@ def extract_scene_features(scene):
     }
 ```
 
-### Decision 7: Self-training on Cornell box (was Decision 5)
+### Decision 9: Self-training on Cornell box (was Decision 5, previously Decision 7)
 
 **Choice:** Render same scene at multiple spp levels for training pairs. All training in Python using Nabla.
 
@@ -425,7 +640,7 @@ def extract_scene_features(scene):
 5. Loss: `L_denoise + 0.1 * L_energy + 0.09 * L_sigreg` (energy conservation prevents photon creation)
 6. Repeat for 1000 iterations (different camera angles, light positions)
 
-### Decision 8: Training with Nabla PyTorch-style API (was Decision 6)
+### Decision 10: Training with Nabla PyTorch-style API (was Decision 6, previously Decision 8)
 
 **Choice:** Use Nabla's imperative (PyTorch-style) training API for development.
 
@@ -476,7 +691,7 @@ for iteration in range(500):
         save_checkpoint(model, optimizer, iteration)
 ```
 
-### Decision 9: Custom Mojo kernels for SIGReg and merge (was Decision 7)
+### Decision 11: Custom Mojo kernels for SIGReg and merge (was Decision 7, previously Decision 9)
 
 **Choice:** Write SIGReg loss and edge-aware merge as custom Mojo GPU kernels via Nabla's `call_custom_kernel()`.
 
@@ -551,7 +766,7 @@ class MergeOp(Operation):
         ...
 ```
 
-### Decision 10: JEPA world model for animation (simplified from LeWM) (was Decision 8)
+### Decision 12: JEPA world model for animation (simplified from LeWM) (was Decision 8, previously Decision 10)
 
 **Choice:** Autoregressive JEPA predictor using Nabla built-in TransformerEncoderLayer. Scene deltas replace robot actions.
 
@@ -598,7 +813,7 @@ class ConditionalBlock(nb.nn.Module):
         return x
 ```
 
-### Decision 11: Inference compilation for production (was Decision 9)
+### Decision 13: Inference compilation for production (was Decision 9, previously Decision 11)
 
 **Choice:** Use `@nb.compile` for JIT compilation of inference paths. Optionally export to MAX format for C API deployment.
 
@@ -631,10 +846,13 @@ Mitsuba Scene
     └─> model.denoise(features, noisy, prev_clean=None)
         ├─> SceneEncoder(features)              # 3D scene → scene_latent (1024)
         ├─> Input: cat([noisy(4), zeros(4), albedo(3), normal(3)]) = 14 ch
-        ├─> U-Net Encoder (strided Conv2d)      # multi-scale features + skips
-        ├─> U-Net Bottleneck (Swin Transformer + AdaLN, conditioned by scene_latent)
-        │   └─> Windowed 8×8 attention — trivial cost at H/16×W/16
-        ├─> U-Net Decoder (Conv2dTranspose + skip concat)
+        ├─> U-Net Encoder (strided Conv2d)      # multi-scale features
+        ├─> MLA Skip Compression (16×)          # ~6GB → ~375MB at 4K
+        ├─> U-Net Bottleneck (Swin Transformer + MoE FFN + AdaLN)
+        │   ├─> Windowed 8×8 attention — global context
+        │   └─> MoE FFN — tile-based material/light/geo expert routing (8×8 cryptomatte masks)
+        ├─> MLA Skip Reconstruction (at decoder)
+        ├─> U-Net Decoder (Conv2dTranspose + reconstructed skips)
         └─> output: clean RGBA (H, W, 4) linear HDR → numpy
 ```
 
@@ -675,6 +893,8 @@ src/omen/
 │   ├── jepa.py                    # Top-level OmenJEPA model (compose all components)
 │   ├── scene_encoder.py           # SceneGraphEncoder (~0.3-1M params depending on tier)
 │   ├── unet.py                    # UNetDenoiser (3-55M params depending on tier)
+│   ├── mla_skip.py                # MLASkipConnection — low-rank skip compression (DeepSeek-V2)
+│   ├── moe.py                     # TileMoERouter (8×8 tile fingerprint + cryptomatte masks) + expert FFNs
 │   ├── arpredictor.py             # ARPredictor + ConditionalBlock (0.5-6M depending on tier)
 │   ├── decoder.py                 # Conv2dTranspose decoder (used by UNet internally)
 │   ├── sigreg.py                  # SIGReg loss (custom kernel wrapper)
@@ -815,6 +1035,10 @@ save_finetune_checkpoint(scene_cache_path, lora_params=adapters, optimizer_state
 | Mamba SSM weaker at precise recall | Keep Swin Transformer at bottleneck for exact detail |
 | Swin windowed attention misses cross-window features | Window size 8×8 is proven; shift windows between layers (SwinIR pattern) |
 | Multicam scene changes invalidate shared latent | Surprise detection triggers re-encode; all cameras share updated latent |
+| MLA skip compression loses fine detail | Compression ratio 16× is aggressive; validate with PSNR on edges/caustics; reduce ratio if needed |
+| MoE tile routing misclassifies region | Tile fingerprint (cryptomatte histogram) relies on auxiliary buffers; validate with ground-truth material ID maps |
+| MoE load imbalance (some experts starved) | Auxiliary-loss-free bias adjustment from DeepSeek-V3; monitor expert utilization during training |
+| MLA reconstruction introduces artifacts at edges | Add edge-aware loss term; apply MLA only on smooth regions, keep full-res at discontinuities |
 
 ## Implementation Phases
 
@@ -827,6 +1051,8 @@ save_finetune_checkpoint(scene_cache_path, lora_params=adapters, optimizer_state
 
 ### Phase 2: Core Model + Training (Week 3-5)
 - [ ] `model/unet.py` (U-Net with Swin Transformer bottleneck + Mamba encoder blocks)
+- [ ] `model/mla_skip.py` (MLA low-rank skip compression — 16× reduction)
+- [ ] `model/moe.py` (TileMoERouter + tile fingerprint computation + per-type expert FFNs + shared expert)
 - [ ] `model/arpredictor.py` (ConditionalBlock + AdaLN-zero, hybrid SSM+Attention)
 - [ ] `model/decoder.py` (Conv2dTranspose upsample)
 - [ ] `kernels/sigreg_kernel.mojo` + `sigreg_op.py`

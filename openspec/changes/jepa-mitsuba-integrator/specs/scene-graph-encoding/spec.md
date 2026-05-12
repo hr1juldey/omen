@@ -26,7 +26,7 @@ Omen SHALL extract geometry, materials, and light data from Mitsuba scenes as Py
   ```python
   {
       'geometry': np.array,      # (N_total_verts, 6) — pos_xyz + normal_xyz
-      'face_material_ids': np.array,  # (N_total_faces,) — material type per face
+      'face_material_ids': np.array,  # (N_total_faces,) — material type per face (consumed by MoE tile router)
       'materials': np.array,     # (N_materials, 9) — type_id + 8 params
       'lights': np.array,        # (N_lights, 7) — type + pos + intensity + rgb
       'camera': np.array,        # (16,) — 4x4 transform flattened

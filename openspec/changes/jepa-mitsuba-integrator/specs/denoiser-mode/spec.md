@@ -2,7 +2,7 @@
 
 ### Requirement: Mode 1 denoiser pipeline
 
-Omen SHALL implement a single-pass denoiser that takes a low-spp Mitsuba render and produces a clean output using JEPA scene-aware inference. Pipeline: `mi.render(spp=4)` -> scene extraction -> DLPack transfer -> Nabla JEPA denoise -> clean RGBA.
+Omen SHALL implement a single-pass denoiser that takes a low-spp Mitsuba render and produces a clean output using JEPA scene-aware inference with tile-based MoE expert routing (8×8 cryptomatte masks). Pipeline: `mi.render(spp=4)` -> scene extraction -> DLPack transfer -> Nabla JEPA denoise (MoE tile-based routing by material/light/geometry type) -> clean RGBA.
 
 #### Scenario: Render and denoise in single pass
 

@@ -129,7 +129,7 @@ Omen SHALL train the confidence head using pixel-wise variance across multiple l
 #### Scenario: Train confidence head
 
 - **WHEN** training pairs (noisy renders + confidence labels) are available
-- **THEN** pass to Mojo via `omen_train_step` C ABI
+- **THEN** run training loop via Nabla Python API: `optimizer = nb.nn.optim.AdamW(model.trainable_params(), lr=1e-3)`
 - **AND** loss: `MSE(predicted_confidence, confidence_label)`
 - **AND** train for 100 iterations on Cornell box variance data
 - **AND** validate: predicted confidence correlates with actual variance (r > 0.7)

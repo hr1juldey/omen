@@ -63,17 +63,23 @@ Omen SHALL denoise noisy renders using a U-Net conditioned by JEPA scene latent 
 - **WHEN** noisy render (4-16 spp) and scene latent (1024-dim) are available
 - **THEN** input: concatenate `[noisy_rgba(4), prev_clean(4), albedo(3), normal(3)]` = 14 channels
 - **AND** encoder path: multi-scale Conv2d with strided downsampling, skip connections
-- **AND** bottleneck: Swin Transformer blocks (windowed 8×8 attention) with AdaLN conditioned by scene_latent
+- **AND** skip connections: MLA-compressed (low-rank projection, 16× reduction) — stored as latent, reconstructed at decoder
+- **AND** bottleneck: Swin Transformer blocks (windowed 8×8 attention) with AdaLN conditioned by scene_latent, plus MoE FFN
   - Windowed attention at H/16×W/16 = ~510 windows of 64 tokens = trivial cost even at 4K
-  - Fast tier: pure Swin (2 blocks, 4 heads)
-  - Medium tier: Swin + Restormer transposed-attention fallback for O(N) safety
-  - High tier: Swin + Restormer + AdaLN for 4K60 production workloads
-- **AND** decoder path: Conv2dTranspose + skip concatenation from encoder
+  - MoE FFN replaces standard MLP: tile-based routing (8×8 windows) using cryptomatte-style material/light/geo masks (not per-pixel, not per-scene)
+  - Tile fingerprint = material histogram + normal variance + depth edge density within each 8×8 window
+  - All 64 tokens in a tile routed together — expert sees spatial context, not a meaningless single pixel
+  - Shared expert (always active) + routed experts for specific material/light/geo types
+  - Auxiliary-loss-free load balancing via per-expert bias (DeepSeek-V3 pattern)
+  - Fast tier: pure Swin, no MoE (too small)
+  - Medium tier: Swin + MoE (top-2) + Restormer transposed-attention fallback
+  - High tier: Swin + MoE (top-3) + Restormer + AdaLN for 4K60 production
+- **AND** decoder path: Conv2dTranspose + MLA-reconstructed skip concatenation from encoder
 - **AND** output: clean RGBA `(H, W, 4)` in linear HDR space
 - **AND** model sizes by tier:
-  - Fast: C_base=48, 4 levels, bottleneck=384ch
-  - Medium: C_base=96, 5 levels, bottleneck=768ch
-  - High: C_base=192, 6 levels, bottleneck=1536ch
+  - Fast: C_base=48, 4 levels, bottleneck=384ch, no MoE
+  - Medium: C_base=96, 5 levels, bottleneck=768ch, MoE top-2
+  - High: C_base=192, 6 levels, bottleneck=1536ch, MoE top-3
 
 #### Scenario: Handle missing previous frame (first frame)
 
@@ -146,3 +152,59 @@ Omen SHALL implement SIGReg as a custom Mojo GPU kernel via Nabla's `call_custom
 - **THEN** pass embeddings to custom Mojo kernel
 - **AND** kernel computes Epps-Pulley statistic (17 knots, 1024 projections)
 - **AND** SIGReg has ZERO learnable parameters
+
+### Requirement: MLA skip connection compression (from DeepSeek-V2)
+
+Omen SHALL compress U-Net skip connections using MLA-style low-rank projections. Reduces 4K VRAM from ~6GB to ~375MB.
+
+#### Scenario: Compress encoder feature for skip storage
+
+- **WHEN** U-Net encoder produces feature map at level L
+- **THEN** compress via `W_down`: `latent = Linear(C, C/16)(feature)` — store `latent` instead of full feature
+- **AND** at decoder: reconstruct via `W_up`: `feature = Linear(C/16, C)(latent)` — use reconstructed feature for skip concat
+- **AND** compression ratio: 16× per level
+- **AND** memory at 4K (High tier): Level 0 = 200MB (was 3.17GB), Level 1 = 100MB (was 1.59GB), total ~375MB (was ~6GB)
+- **AND** learnable projections (W_down, W_up) trained end-to-end with the U-Net
+
+#### Scenario: Handle edge regions where compression may lose detail
+
+- **WHEN** normal buffer shows high discontinuity (edges, silhouettes)
+- **THEN** optionally store full-resolution features for edge-adjacent tiles
+- **AND** use compressed features only for smooth regions (flat surfaces, diffuse areas)
+
+### Requirement: Material/Light/Geometry-aware MoE — Tile-based Routing with Cryptomatte Masks
+
+Omen SHALL use tile-based Mixture-of-Experts routing based on material type, light type, and geometry type — NOT per scene type and NOT per individual pixel. A single pixel has no meaning; routing needs spatial context. Each 8×8 Swin window (64 tokens) is routed as a unit using a tile fingerprint computed from cryptomatte-style auxiliary buffer histograms.
+
+#### Scenario: Compute tile fingerprint and route to experts
+
+- **WHEN** U-Net bottleneck processes an 8×8 Swin window (64 tokens)
+- **THEN** compute tile fingerprint from the 64 tokens' auxiliary buffers:
+  - Material histogram: count of each material_id within the tile (cryptomatte-style) → 8-dim
+  - Normal variance across tile: measures edge/curvature density → 3-dim
+  - Depth variance across tile: measures transparency/overlap → 1-dim
+  - Edge density: fraction of pixels with high normal discontinuity → 1-dim
+  - Dominant material and mean albedo → 4-dim
+- **AND** route via learned projection on tile fingerprint (NOT per-pixel) to expert scores per category:
+  - 8 material experts: diffuse, glossy/glass, metal, SSS/skin, volume/smoke, emissive, hair/fur, cloth
+  - 5 light experts: point/spot, area, sun/directional, environment/HDRI, emissive geometry
+  - 5 geometry experts: flat, curved/organic, edges/silhouettes, fine detail/hair, transparent
+- **AND** route ALL 64 tokens in the tile together to the selected experts
+- **AND** activate top-K experts per category plus 1 shared expert (always active, base denoising)
+- **AND** combine: `output = shared_expert(x) + Σ(weight_i × expert_i(x))`
+
+#### Scenario: Handle mixed-material tiles at boundaries
+
+- **WHEN** an 8×8 tile contains multiple material types (e.g., metal-glass edge)
+- **THEN** tile fingerprint shows mixed histogram → multiple experts activated
+- **AND** both metal and glass experts process the full tile → expert sees spatial transition
+- **AND** output is weighted blend of all activated experts → smooth boundary, no seam artifacts
+- **AND** contrast with per-pixel routing: adjacent pixels could route to different experts causing visible seams
+
+#### Scenario: Auxiliary-loss-free load balancing
+
+- **WHEN** MoE experts are being trained
+- **THEN** maintain per-expert bias vector (NOT a loss term — no gradient)
+- **AND** after each training step: if expert overloaded → bias[expert] -= 0.001, if underloaded → bias[expert] += 0.001
+- **AND** bias added to routing scores: `scores = route_proj(tile_fingerprint) + bias`
+- **AND** zero interference with denoising quality — balancing is orthogonal to training loss
