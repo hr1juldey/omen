@@ -1,8 +1,51 @@
 ## ADDED Requirements
 
+### Background: Blender Shared Node System Architecture
+
+Omen reads the same `bNodeTree` (NTREE_SHADER) that both EEVEE and Cycles read. The Blender source code at `/home/riju279/Documents/Projects/MOJO/Cycles_mojo/blender/` reveals:
+
+```
+Material { nodetree: *bNodeTree }     ← DNA_material_types.h
+    ↓
+bNodeTree (NTREE_SHADER = 0)          ← DNA_node_types.h
+    ↓  nodes: List[bNode], links: List[bNodeLink]
+    ↓  bNodeType { gpu_fn, materialx_fn, exec_fn, ... }
+    ↓
+┌───────────────────┬───────────────────┬────────────────────┐
+│  CYCLES PATH      │  EEVEE PATH       │  OMEN PATH (NEW)   │
+│  shader.cpp:      │  gpu_material.cc: │  render_engine.py: │
+│  add_nodes()      │  GPU_material_    │  _extract_material │
+│  b_node.is_type() │  from_nodetree()  │  (mat.node_tree)   │
+│  ↓                │  ↓                │  ↓                 │
+│  Cycles internal  │  GLSL compile     │  Scene graph dict  │
+│  ShaderGraph      │  via gpu_fn       │  for conditioning  │
+└───────────────────┴───────────────────┴────────────────────┘
+```
+
+Key files in Blender source:
+- `source/blender/makesdna/DNA_node_types.h` — bNodeTree, bNode, bNodeSocket structures
+- `source/blender/makesdna/DNA_material_types.h` — Material { nodetree: *bNodeTree }
+- `intern/cycles/blender/shader.cpp` — Cycles node-by-node conversion (reference pattern)
+- `source/blender/gpu/intern/gpu_material.cc` — EEVEE GPU material compilation
+- `source/blender/render/RE_engine.h` — RenderEngineType callbacks for external renderers
+
+Output node targeting (from DNA_node_types.h):
+- `SHD_OUTPUT_ALL = 0` — used by all renderers
+- `SHD_OUTPUT_EEVEE = 1` — EEVEE-specific output
+- `SHD_OUTPUT_CYCLES = 2` — Cycles-specific output
+
+For Omen, we read the `SHD_OUTPUT_ALL` output node (same as Cycles does by default) and extract material type + parameters for scene graph conditioning.
+
 ### Background: Production Training Data
 
 Cornell box is for bootstrap validation only. Omen's base model MUST be trained on diverse production-level scenes to handle real-world complexity: glass caustics, subsurface scattering, volumetrics, hair, complex geometry, and multi-light setups. A native converter transforms `.blend` files into Mitsuba scene dicts for the training pipeline.
+
+Training data source: Blender demo files (https://www.blender.org/download/demo-files/)
+- 15 selected scenes across categories: interiors, exteriors, characters, hair, volumetrics, metals
+- Animated cameras per scene (30-50 frames): orbit, dolly, pan, flythrough
+- Target: 500-750 training pairs (1-4 spp noisy + 256-4096 spp ground truth)
+- AOV buffers per pair: albedo(3), normal(3), depth(1), motion_vectors(2), cryptomatte(4)
+- Tile fingerprints computed per pair: 23-dim per 8x8 tile via `compute_tile_fingerprint()`
 
 ### Requirement: Convert Blender scenes to Mitsuba format
 
