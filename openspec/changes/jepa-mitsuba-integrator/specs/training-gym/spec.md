@@ -6,7 +6,7 @@ Omen uses TWO separate autograd systems that do NOT interact:
 1. **Dr.Jit autodiff** (Python): Handles gradient flow through Mitsuba's path tracer. Used for generating training data and computing rendering losses.
 2. **Nabla autograd** (Mojo): Handles gradient flow through JEPA model weights. Used for training the neural network.
 
-The bridge between them: Dr.Jit renders training pairs (noisy + GT) then passes tensors to Mojo via C ABI where Nabla trains JEPA on those tensors. No gradient flows between the two systems.
+The bridge between them: Dr.Jit renders training pairs (noisy + GT) then passes tensors to Nabla via DLPack zero-copy where Nabla trains JEPA on those tensors. No gradient flows between the two systems.
 
 ### Requirement: Mitsuba differentiable rendering for training data
 
@@ -26,8 +26,8 @@ Omen SHALL use Mitsuba's `cuda_ad_rgb` (or `llvm_ad_rgb`) variant with Dr.Jit au
 - **THEN** render noisy input: `noisy = mi.render(scene, spp=4, seed=42)` then TensorXf becomes `(H, W, 3)`
 - **AND** render ground truth: `gt = mi.render(scene, spp=256, seed=42)` then TensorXf becomes `(H, W, 3)`
 - **AND** note: same seed ensures identical sample positions, only spp differs
-- **AND** pass both tensors to Mojo via C ABI: `omen_train_step(scene_graph, noisy, gt, ...)`
-- **AND** Mojo/Nabla computes loss and backward pass on JEPA weights
+- **AND** pass both tensors to Nabla via DLPack: `noisy_nb = nb.Tensor.from_dlpack(noisy)`, `gt_nb = nb.Tensor.from_dlpack(gt)`
+- **AND** Nabla computes loss and backward pass on JEPA weights
 - **AND** Dr.Jit is NOT involved in backward pass on JEPA weights — only renders the data
 
 #### Scenario: Generate training pair with scene parameter variation
@@ -42,7 +42,7 @@ Omen SHALL use Mitsuba's `cuda_ad_rgb` (or `llvm_ad_rgb`) variant with Dr.Jit au
   ```
 - **AND** render with modified scene: `noisy = mi.render(scene, spp=4)`
 - **AND** render GT: `gt = mi.render(scene, spp=256)`
-- **AND** pass pair to Mojo for JEPA training
+- **AND** pass pair to Nabla for JEPA training
 
 ### Requirement: Dr.Jit autodiff API for advanced training
 
@@ -77,20 +77,20 @@ Omen SHALL use Dr.Jit's autodiff primitives for advanced training scenarios. Key
 
 ### Requirement: Nabla autograd for JEPA weight updates
 
-Omen SHALL use Nabla's autograd (NOT Dr.Jit, NOT PyTorch) for all JEPA model weight updates during training. Training runs entirely in Mojo.
+Omen SHALL use Nabla's autograd (NOT Dr.Jit, NOT PyTorch) for all JEPA model weight updates during training. Training runs in Python via Nabla API with Mojo/MAX backend.
 
-#### Scenario: Forward and backward in Nabla (Mojo side)
+#### Scenario: Forward and backward in Nabla (Python side)
 
-- **WHEN** `omen_train_step` is called from Python via C ABI
-- **THEN** receive training pair: `(noisy_rgba, gt_rgba, scene_graph)` as GPU pointers
+- **WHEN** `model.train()` is called and training pair is available
+- **THEN** receive training pair: `(noisy_rgba, gt_rgba, scene_graph)` as Nabla tensors via DLPack
 - **AND** forward pass in Nabla:
-  - Encode noisy + scene graph into latent
-  - Decode latent to predicted clean RGBA
-  - Compute `pred_loss = nabla.mean(nabla.square(predicted - gt))`
+  - U-Net denoise: `denoised = model.denoise(scene_graph, noisy, prev_clean=None)`
+  - Compute `pred_loss = nb.mean(nb.square(denoised - gt))`
   - Compute `sigreg_loss = SIGReg(model.embeddings)`
-  - Total: `total_loss = pred_loss + 0.09 * sigreg_loss`
-- **AND** backward pass in Nabla: `nabla.backward(total_loss)`
-- **AND** optimizer step: `NablaAdamW.step(model.trainable_params())`
+  - Compute `energy_loss = nb.mean(nb.relu(nb.sum(denoised, axis=-1) - nb.sum(noisy, axis=-1) - 0.01))`
+  - Total: `total_loss = pred_loss + 0.1 * energy_loss + 0.09 * sigreg_loss`
+- **AND** backward pass in Nabla: `total_loss.backward()`
+- **AND** optimizer step: `model = optimizer.step()`
 - **AND** gradient clip: clip gradient norm to 1.0 before optimizer step
 - **AND** return loss value to Python: write total_loss to loss_out pointer
 
@@ -98,8 +98,8 @@ Omen SHALL use Nabla's autograd (NOT Dr.Jit, NOT PyTorch) for all JEPA model wei
 
 - **WHEN** training is running
 - **THEN** data generation happens in Python (Dr.Jit renders pairs)
-- **AND** model training happens in Mojo (Nabla autograd plus AdamW)
-- **AND** bridge: Python passes GPU tensor pointers to Mojo via C ABI
+- **AND** model training happens in Nabla Python (Nabla autograd plus AdamW, Mojo/MAX backend)
+- **AND** bridge: Python passes tensors via DLPack zero-copy between Dr.Jit and Nabla
 - **AND** optimization config from lewm.yaml:
   - Optimizer: NablaAdamW(lr=5e-5, weight_decay=1e-3)
   - Precision: BF16
@@ -115,7 +115,8 @@ Omen SHALL follow a 4-phase training protocol on Cornell box.
 
 - **WHEN** Phase 1 training starts
 - **THEN** render Cornell box at 4spp + 256spp (Python/Dr.Jit)
-- **AND** train denoiser: MSE between JEPA prediction and ground truth
+- **AND** train denoiser: MSE between U-Net denoised output and ground truth
+- **AND** energy conservation loss: `L_energy = mean(relu(E_out - E_in - 0.01))`
 - **AND** SIGReg regularization on embeddings
 - **AND** target: SSIM greater than 0.95 vs 256spp after 100 iterations
 
@@ -183,3 +184,23 @@ Omen MAY use the `dr.wrap` decorator if any PyTorch components are needed tempor
 - **AND** gradients flow through the bridge in both directions
 - **AND** this is a TEMPORARY measure during Mojo/Nabla migration
 - **AND** final version: all ML in Mojo/Nabla, no PyTorch dependency
+
+### Requirement: Multicam shared world model training
+
+Omen SHALL support training and inference with multiple simultaneous cameras sharing a single scene latent, enabling N-camera rendering at ~1.3× single-camera cost.
+
+#### Scenario: Generate multicam training pairs
+
+- **WHEN** pre-training with multicam scenes
+- **THEN** for each scene, place N cameras (N=2 to 4) at different viewpoints
+- **AND** render each camera view at 4spp and 256spp using the same scene
+- **AND** extract ONE shared scene graph (scene encoding is camera-independent)
+- **AND** store as: `(scene_latent, [(dirty_cam1, gt_cam1), (dirty_cam2, gt_cam2), ...])`
+- **AND** cost: 1 scene encode + N × render ≈ 1.3× single camera for 3 cameras
+
+#### Scenario: Train multicam consistency
+
+- **WHEN** multicam training pairs are available
+- **THEN** enforce cross-camera consistency loss: shared scene_latent must denoise all N views correctly
+- **AND** train U-Net to use scene_latent (not camera-specific features) for denoising
+- **AND** validate: denoised quality across cameras has SSIM variance < 0.02

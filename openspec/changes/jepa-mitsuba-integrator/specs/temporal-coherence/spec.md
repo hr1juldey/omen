@@ -22,13 +22,13 @@ Omen SHALL implement an autoregressive JEPA predictor that predicts clean frame 
 - **AND** scene graph extracted: `sg = extract_scene_graph(scene)` (geometry, materials, lights)
 - **AND** history buffer has H=3 previous frame latents: `history = [latent_{N-3}, latent_{N-2}, latent_{N-1}]`
 - **AND** scene delta computed: `delta = compute_delta(frame_{N-1}, frame_N)`
-- **THEN** encode dirty frame + scene graph: `current_latent = ViTEncoder.encode(dirty, sg)` → shape `(1, 192)`
-- **AND** encode scene delta: `delta_emb = SceneDeltaEncoder(delta)` → shape `(1, 192)`
-- **AND** predict: `predicted_latent = ARPredictor(history, current_latent, delta_emb)` → shape `(1, 192)`
-  - ARPredictor is 6-layer ConditionalBlock transformer with AdaLN-zero conditioning
-  - Input: concatenation `[history[-3:], current_latent]` → `(1, 4, 192)`
-  - Conditioning: `delta_emb` modulates each layer via SiLU + Linear(192, 1152) → 6 modulation params
-- **AND** decode: `clean_frame = Decoder(predicted_latent)` → `(H, W, 4)` RGBA
+- **THEN** encode scene graph: `scene_latent = SceneEncoder.encode(sg)` → shape `(1, 1024)`
+- **AND** encode scene delta: `delta_emb = SceneDeltaEncoder(delta)` → shape `(1, 1024)`
+- **AND** predict: `predicted_latent = ARPredictor(history, scene_latent, delta_emb)` → shape `(1, 1024)`
+  - ARPredictor: Fast=2 layers/4 heads (pure attention), Medium=4 layers (3 Mamba+1 Attn)/8 heads, High=8 layers (6 Mamba+2 Attn)/16 heads
+  - Input: concatenation `[history[-3:], scene_latent]` → `(1, 4, 1024)`
+  - Conditioning: `delta_emb` modulates each layer via SiLU + Linear(1024, 6144) → 6 modulation params
+- **AND** denoise: `clean_frame = UNet(scene_latent, dirty, prev_clean)` → `(H, W, 4)` RGBA
 - **AND** total pipeline: 1spp render (~30ms) + encode (~5ms) + predict (~5ms) + decode (~5ms) = <50ms target
 
 #### Scenario: History window management
@@ -45,7 +45,7 @@ Omen SHALL implement an autoregressive JEPA predictor that predicts clean frame 
 
 ### Requirement: SceneDeltaEncoder for animation changes
 
-Omen SHALL encode per-frame scene changes as structured "scene deltas" replacing LeWM's action encoder. Architecture: `Conv1d(delta_dim, smoothed, k=1)` → `MLP(smoothed → 4*192 → 192)` (155K params).
+Omen SHALL encode per-frame scene changes as structured "scene deltas" replacing LeWM's action encoder. Architecture: `Linear(delta_dim, smoothed)` → `MLP(smoothed → 4*1024 → 1024)`.
 
 #### Scenario: Encode camera movement delta
 
@@ -56,8 +56,8 @@ Omen SHALL encode per-frame scene changes as structured "scene deltas" replacing
   ```
   [camera(7), objects(N×8), lights(M×7), births(K×8), materials(P×5)]
   ```
-- **AND** pass through Conv1d (smoothing) then MLP: `Linear(smoothed, 768) → SiLU → Linear(768, 192)`
-- **AND** output: `delta_embedding` shape `(1, 192)`
+- **AND** pass through Linear smoothing then MLP: `Linear(smoothed, 768) → SiLU → Linear(768, 1024)`
+- **AND** output: `delta_embedding` shape `(1, 1024)`
 
 #### Scenario: Encode fluid/smoke introduction (birth event)
 
@@ -143,13 +143,13 @@ Omen SHALL implement animation pipeline that uses JEPA prediction for most frame
 
 - **WHEN** rendering frames 0 through N
 - **THEN** **Frame 0** (anchor):
-  - `mi.render(scene, spp=1)` → encode → JEPA denoise → `latent_0` → `history.push(latent_0)`
+  - `mi.render(scene, spp=4)` → extract scene graph → U-Net denoise → `scene_latent_0` → `history.push(scene_latent_0)`
 - **AND** **Frames 1..N**:
   - `mi.render(scene, spp=1)` → dirty frame (ALWAYS render 1spp for exact geometry/occlusion)
   - Extract scene graph + compute scene delta
-  - Encode dirty + scene graph → `current_latent`
-  - `predicted_latent = ARPredictor(history[-3:], current_latent, delta_emb)`
-  - Decode → clean frame output
+  - Encode scene graph → `scene_latent`
+  - `predicted_latent = ARPredictor(history[-3:], scene_latent, delta_emb)`
+  - U-Net denoise(scene_latent, dirty, prev_clean) → clean frame output
   - If surprise: re-render 4spp → denoise → update history anchor
   - Else: `history.push(predicted_latent)`
 
@@ -172,11 +172,11 @@ Omen SHALL generate temporal training pairs by rendering consecutive animation f
 
 - **WHEN** training mode for temporal prediction is enabled
 - **THEN** render consecutive frames:
-  - Frame T: `mi.render(scene, spp=4)` → denoise → `latent_T`
-  - Frame T+1: `mi.render(scene, spp=4)` → denoise → `latent_T1`
+  - Frame T: `mi.render(scene, spp=4)` → U-Net denoise → `scene_latent_T`
+  - Frame T+1: `mi.render(scene, spp=4)` → U-Net denoise → `scene_latent_T1`
   - Ground truth T+1: `mi.render(scene, spp=256)` → `gt_T1`
   - Scene delta T→T+1: extract from animation timeline
-- **AND** training sample: `(latent_T, delta_T→T+1) → latent_T1` with GT `gt_T1`
+- **AND** training sample: `(scene_latent_T, delta_T→T+1) → scene_latent_T1` with GT `gt_T1`
 - **AND** generate sequences with: smooth orbits (low surprise), jump cuts (high surprise), light ramps (medium), new lights (high), object motion (low)
 
 #### Scenario: Train temporal predictor

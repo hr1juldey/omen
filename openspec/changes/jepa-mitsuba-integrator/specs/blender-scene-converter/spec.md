@@ -126,4 +126,4 @@ Omen SHALL train the base JEPA model on the full production scene library, not j
 - **AND** compute SHA256 checksum
 - **AND** create metadata JSON: architecture hash, training config, per-category metrics
 - **AND** bundle with Omen distribution or host for download
-- **AND** size target: ~30MB (8M params in BF16)
+- **AND** size target: Fast ~16MB (4M BF16), Medium ~64MB (16M BF16), High ~256MB (64M BF16)

@@ -1,11 +1,17 @@
 ## Context
 
-Omen Mitsuba integrator skeleton exists (previous change). Current state:
-- `OmenIntegrator` registered with Mitsuba plugin system
-- Standard path tracing working via `mi.render()`
-- Placeholder parameters: `jepa_model`, `use_gpu`
+Omen is a **render engine turbocharger** — it sits above ANY path tracer and makes it faster, smarter, and scene-aware. Today: Mitsuba 3. Tomorrow: Cycles, EEVEE, any engine.
 
-**What's missing:** Actual JEPA implementation with scene conditioning.
+Omen fights on three fronts:
+1. **vs DLSS 4.0** (upscale + frame gen): NVIDIA-locked, pixel-level, scene-blind. Omen understands 3D scene data.
+2. **vs OIDN/OptiX** (denoising): Scene-blind pixel denoisers. OIDN balanced = 460K params. Omen sees exact materials, lights, geometry.
+3. **vs Diffusion models** (generation): Text-controlled, stochastic, non-reproducible. Omen takes EXACT 3D parameters — deterministic, artist-controlled.
+
+**Architecture paradigm:**
+```
+JEPA = the BRAIN  (scene understanding + temporal prediction, 1024-dim latent)
+U-Net = the HANDS (fast pixel-level denoising, conditioned by scene latent)
+```
 
 **Critical constraint:** Mitsuba's path tracer is C++. Python `mi.render()` is a binding — cannot inject into sampling loop. JEPA works via multi-pass rendering: render → extract → JEPA → render → merge.
 
@@ -27,10 +33,11 @@ Both Mitsuba and Nabla are Python-callable libraries. Nabla has NO Mojo API — 
 ## Goals / Non-Goals
 
 **Goals:**
-- Implement scene graph extraction from Mitsuba Python API
-- Build JEPA model using Nabla Python API (`nb.nn.Module`, `nb.nn.optim.AdamW`)
-- Implement 3 rendering modes (denoiser, adaptive, multires)
+- Implement scene graph extraction from Mitsuba Python API (portable to Cycles/EEVEE later)
+- Build 3-tier JEPA + U-Net model using Nabla Python API (4M / 16M / 64M params)
+- Implement 4 rendering modes (denoiser, adaptive, multires, temporal) — all tiers support all modes
 - Self-training protocol using Cornell box
+- Energy conservation loss (physics-based, no photon creation during denoising)
 - Zero-copy DLPack tensor passing between Mitsuba/Dr.Jit and Nabla
 - Custom Mojo GPU kernels for SIGReg loss and merge operations
 
@@ -43,62 +50,82 @@ Both Mitsuba and Nabla are Python-callable libraries. Nabla has NO Mojo API — 
 
 ## Decisions
 
-### Decision 1: 3D-Aware Scene Encoder (NOT ViT-Tiny)
+### Decision 1: Scene-Aware U-Net Denoiser with JEPA Conditioning (3 Tiers)
 
-**Choice:** Replace LeWM's 2D ViT-Tiny image encoder with a 3D-aware dual-encoder that leverages Mitsuba's exact scene data. Total model: ~8M params (down from ~20M).
+**Choice:** JEPA scene understanding system (1024-dim latent) + U-Net pixel denoiser conditioned via AdaLN modulation. NOT a latent-to-image generator — noisy pixels feed directly into U-Net, scene latent is conditioning.
+
+**Three model tiers — same architecture, same capabilities, different size/quality/speed:**
+
+| Tier | Params | Use Case | VRAM at 4K | U-Net Config |
+|------|--------|----------|------------|-------------|
+| Fast | 4M | Beat OIDN, simple scenes | ~1.2GB | C_base=48, 4 levels, bottleneck=384 |
+| Medium | 16M | Kill OptiX with scene awareness | ~2.5GB | C_base=96, 5 levels, bottleneck=768 |
+| High | 64M | Palace of mirrors, fog, 20K lights at 4K60 | ~4.5GB+ | C_base=192, 6 levels, bottleneck=1536 |
+
+**All tiers support all 4 modes** (denoiser, adaptive, multires, temporal). Bigger tier = better quality, slower inference.
 
 **Rationale:**
 - LeWM's ViT-Tiny treats renders as 2D images (patch embedding) — wastes Mitsuba's 3D data
 - Mitsuba gives us EXACT geometry, materials, and light positions — use them directly
-- A ViT-Tiny designed for ImageNet classification has no 3D understanding
-- Smaller model = faster training, less GPU memory, faster inference
+- U-Net is proven for denoising (OIDN uses similar architecture) — JEPA adds scene awareness
+- 3 tiers let artists trade quality vs speed based on scene complexity
 
-**New architecture: Scene-Aware Dual Encoder**
+**Component architecture:**
 
 ```
-Component                  Params    Implementation              Nabla Ops
+Component                  Params (Medium)    Implementation              Nabla Ops
 ────────────────────────────────────────────────────────────────────────────────
-Scene Graph Encoder        ~1M       scene_graph_encoder.py      nb.nn.Embedding
+Scene Graph Encoder        ~1M                scene_graph_encoder.py      nb.nn.Embedding
   (geometry/material/light embeddings, NOT image patches)    nb.nn.Linear, F.attention
   Encodes: vertices, face normals, material params, light positions/properties
+  Output: scene_latent (batch, 1024)
+  Mamba usage: SSM layers for aggregating many scene graph tokens (thousands of
+    vertices/faces in production scenes). O(n) scan over geometry tokens beats
+    O(n²) attention when scene has 100K+ vertices.
 
-Render Feature Encoder     ~1.5M     render_encoder.py           nb.nn.Conv2d
-  (noisy RGBA + aux buffers from Mitsuba)                     nb.nn.Linear
-  Input: noisy RGBA(H,W,4) + depth(H,W,1) + normal(H,W,3)
-  Conv2d layers → flatten → Linear → latent(192)
+U-Net Denoiser             ~13M               unet.py                     nb.conv2d, nb.conv2d_transpose
+  (encoder-decoder with skip connections + Swin Transformer bottleneck)
+  Input: cat([noisy_rgba(4), prev_clean(4), albedo(3), normal(3)]) = 14 ch
+  Encoder: strided Conv2d → multi-scale features + skip connections
+  Bottleneck: Swin Transformer blocks (windowed 8×8 attention) with AdaLN
+    - Windowed attention at H/16×W/16 = trivial cost (~510 windows of 64 tokens)
+    - Better global context for caustics/indirect lighting than Mamba (validated: MambaVision CVPR 2025)
+    - Restormer-style transposed attention (channel-wise O(N)) as fallback for limited VRAM
+  Decoder: Conv2dTranspose + skip concat from encoder
+  Output: clean RGBA (H, W, 4) in linear HDR space
+  Mamba usage: NOT at bottleneck (token count too small for O(n) to matter).
+    Mamba is used in full-res encoder paths where 8.3M pixels make O(n²) impossible.
 
-Cross-Attention Fusion     ~0.5M     fusion.py                   F.scaled_dot_product_attention
-  Scene features as keys/values, render features as queries
-  Output: scene-aware latent (1, 192)
+SceneDeltaEncoder          ~155K              scene_delta_encoder.py      nb.nn.Linear, nb.nn.Linear
+  (Linear smoothing + MLP for per-frame scene changes)
 
-SceneDeltaEncoder          ~155K     scene_delta_encoder.py      nb.nn.Conv1d, nb.nn.Linear
-  (from LeWM — Conv1d + MLP for per-frame scene changes)
+ARPredictor                ~1.5M              arpredictor.py              nb.nn.TransformerEncoderLayer
+  (ConditionalBlock layers with AdaLN-zero conditioning)
+  Fast: 2 layers, 4 heads | Medium: 4 layers, 8 heads | High: 8 layers, 16 heads
+  Mamba usage: Hybrid SSM+Attention for temporal sequences. At 4K 60fps 10min
+    (36,000 frames), history window H=3 → sequences grow long. Mamba's O(n) scan
+    over temporal tokens prevents quadratic blowup in autoregressive rollout.
 
-ARPredictor                ~4M       arpredictor.py              nb.nn.TransformerEncoderLayer
-  (simplified from LeWM's 10.8M — 4 layers instead of 6, dim=192, heads=8)
-  Uses ConditionalBlock with AdaLN-zero conditioning
+ConfidenceHead             ~0.5M              confidence_head.py          nb.nn.Linear, F.sigmoid
+  Linear(1024,512) → SiLU → Linear(512,256) → SiLU → Linear(256,1) → Sigmoid
 
-ConfidenceHead             ~30K      confidence_head.py          nb.nn.Linear, F.sigmoid
-  Linear(192,96) → SiLU → Linear(96,48) → SiLU → Linear(48,1) → Sigmoid
-
-Decoder                    ~1M       decoder.py                  nb.nn.Linear, nb.conv2d_transpose
-  Latent(192) → upsample → RGBA(H,W,4)
-
-SIGReg                     0         sigreg_kernel/              Custom Mojo GPU kernel
+SIGReg                     0                  sigreg_kernel/              Custom Mojo GPU kernel
   knots=17, num_proj=1024, Epps-Pulley statistic                via call_custom_kernel()
 ────────────────────────────────────────────────────────────────────────────────
-TOTAL                      ~8M
+TOTAL                      ~16M (Medium tier)
 ```
 
 **Why this is better than ViT-Tiny:**
 
-| Aspect | ViT-Tiny (LeWM) | Scene-Aware Encoder (Omen) |
+| Aspect | ViT-Tiny (LeWM) | Scene-Aware U-Net + JEPA (Omen) |
 |--------|-----------------|---------------------------|
 | Input | 2D image patches | 3D scene graph + noisy render + aux buffers |
 | 3D understanding | None ( learns from pixels) | Explicit (geometry, materials, lights) |
-| Parameters | 5.5M (encoder alone) | ~3M (both encoders + fusion) |
+| Parameters | 5.5M (encoder alone) | 4M/16M/64M (full model, 3 tiers) |
 | Scene changes | Must re-encode entire image | Only re-encode delta |
 | Generalization | Scene-specific pixels | 3D structure transfers |
+| Denoising | Not designed for it | U-Net with scene-aware AdaLN conditioning |
+| Temporal | No | ARPredictor with scene delta encoding |
 
 **Scene Graph Encoder detail:**
 ```python
@@ -107,7 +134,7 @@ class SceneGraphEncoder(nb.nn.Module):
 
     NOT a ViT — uses structured embeddings for known scene elements.
     """
-    def __init__(self, latent_dim=192):
+    def __init__(self, latent_dim=1024):
         # Geometry: vertex positions + face normals → aggregate via attention
         self.geo_embed = nb.nn.Linear(6, 64)   # (pos_xyz, normal_xyz)
         self.geo_attn = nb.nn.MultiHeadAttention(64, num_heads=4)
@@ -144,7 +171,7 @@ class RenderFeatureEncoder(nb.nn.Module):
 
     Uses Conv2d (not ViT patches) — designed for pixel data with spatial structure.
     """
-    def __init__(self, latent_dim=192):
+    def __init__(self, latent_dim=1024):
         # Input channels: RGBA(4) + depth(1) + normal(3) = 8 channels
         self.conv1 = ...  # Conv2d(8, 32, 3x3, stride=2)  → H/2, W/2
         self.conv2 = ...  # Conv2d(32, 64, 3x3, stride=2) → H/4, W/4
@@ -239,7 +266,96 @@ high_nb = nb.Tensor.from_dlpack(np.array(high_spp)).cuda()
 output = confidence * clean_preview + (1 - confidence) * high_nb
 ```
 
-### Decision 4: Scene graph representation
+### Decision 4: Hybrid Mamba-Swin architecture (Swin at bottleneck, Mamba where it matters)
+
+**Choice:** Swin Transformer (windowed 8×8 attention) at the U-Net bottleneck. Mamba SSM in three areas where O(n²) attention is infeasible at production resolution.
+
+**Rationale (from research survey, May 2026):**
+- At H/16×W/16 bottleneck: 240×135 = 32,400 tokens. Windowed Swin = ~510 windows × 64 tokens = trivial cost. Mamba's O(n) advantage is negligible here.
+- MambaVision (CVPR 2025) validates: Mamba in early stages (full res), Transformer in final stage (bottleneck) for global reasoning.
+- MambaIRv2 (CVPR 2025) matches transformer quality but is "weaker at precise recall" — keep 1 transformer for exact detail.
+
+**Three Mamba zones:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ZONE 1: Full-resolution U-Net encoder path                      │
+│ WHERE: Before downsampling, processing 8.3M pixels at 4K        │
+│ WHY: Global attention O(n²) = 69 trillion ops at 3840×2160      │
+│ WHAT: MambaIRv2-style Attentive SSM blocks for long-range       │
+│       feature modeling at full resolution                        │
+│ TIER: Medium and High only (Fast tier is too small)              │
+├─────────────────────────────────────────────────────────────────┤
+│ ZONE 2: Scene Graph Encoder                                      │
+│ WHERE: Aggregating geometry/material/light tokens                │
+│ WHY: Production scenes have 100K+ vertices, 50K+ faces,         │
+│      20K lights. Attention over all tokens = O(n²) = billions.  │
+│ WHAT: Mamba SSM scan over scene tokens → fixed-size latent       │
+│ BENEFIT: O(n) regardless of scene complexity                    │
+├─────────────────────────────────────────────────────────────────┤
+│ ZONE 3: ARPredictor (temporal sequences)                         │
+│ WHERE: Autoregressive rollout over frame history                 │
+│ WHY: 4K 60fps 10min = 36,000 frames. History H=3 is short,     │
+│      but prediction rollout can extend to hundreds of frames.    │
+│ WHAT: Hybrid SSM + attention. SSM for sequence scan,             │
+│      attention for precise frame-to-frame alignment.             │
+│      Follows DriveMamba pattern (SSM + attention hybrid).       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Bottleneck architecture per tier:**
+```
+Fast (4M):    Pure Swin Transformer, 2 blocks, window=8
+              (bottleneck tiny ~16×16, Mamba adds nothing)
+
+Medium (16M):  Swin Transformer, 4 blocks, window=8
+              + Restormer transposed attention (channel-wise) for
+                limited-VRAM fallback
+
+High (64M):   Swin Transformer, 4 blocks, window=8
+              + Restormer transposed attention
+              + AdaLN conditioned by scene_latent (1024-dim)
+              (windowed attention handles 240×135 bottleneck easily)
+```
+
+### Decision 5: Production scenarios — 4K film and multicam
+
+**4K 60fps 10-minute render (Blender Studio / Disney / Pixar scale):**
+- 3840×2160 × 60fps × 600s = 36,000 frames
+- Full path trace: ~2s/frame × 36,000 = 20 hours (single GPU)
+- Omen Mode 4 (temporal): ~10% frames path-traced = 3,600 at 2s + 32,400 predicted at <5ms
+- Target: **36,000 frames in ~2.5 hours** (8× speedup)
+- VRAM: High tier (64M) at 4K = ~4.5GB inference. Tiled processing for >4K.
+- Training: Self-training on the actual production scene (LoRA fine-tune, 50 iterations)
+- Key insight: The world model accumulates scene knowledge across all 36,000 frames — by frame 1000, it knows the scene better than by frame 3
+
+**Multicam scene encoding (3+ cameras, shared world model):**
+- Traditional: render 3 cameras × full path trace = 3× cost
+- Omen: ONE shared scene_latent per scene, 3 cameras share the world model
+- Architecture:
+  ```
+  Shared across all cameras:
+  ┌──────────────────────────┐
+  │ Scene Graph Encoder      │  ← Encodes scene ONCE (geometry, materials, lights)
+  │ → scene_latent (1024)    │
+  └──────────────────────────┘
+            │
+  ┌─────────┼─────────┐
+  ▼         ▼         ▼
+  Cam A    Cam B    Cam C           ← Per-camera: 1spp dirty render + camera transform
+  U-Net    U-Net    U-Net           ← Same scene_latent, different noisy input
+  denoise  denoise  denoise
+  │         │         │
+  ▼         ▼         ▼
+  clean A  clean B  clean C        ← 3 clean outputs from 1 scene encoding
+  ```
+- Cost: 1 scene encode + 3 × 1spp render + 3 × U-Net denoise ≈ 1.3× single camera cost
+- Savings: **3 cameras for 1.3× price instead of 3×** (2.3× free)
+- Cross-camera consistency: Shared scene_latent ensures coherent lighting/materials across all angles
+- Temporal: ARPredictor history from ALL cameras feeds into shared world model — more data = better predictions
+- Surprise: If Cam A detects surprise (new object), Cam B and C immediately benefit from updated scene_latent
+
+### Decision 6: Scene graph representation (was Decision 4)
 
 **Choice:** Python dicts/tensors, not C structs
 
@@ -297,18 +413,19 @@ def extract_scene_features(scene):
     }
 ```
 
-### Decision 5: Self-training on Cornell box
+### Decision 7: Self-training on Cornell box (was Decision 5)
 
 **Choice:** Render same scene at multiple spp levels for training pairs. All training in Python using Nabla.
 
 **Protocol:**
-1. Render Cornell box at 4 spp → noisy input
-2. Render Cornell box at 256 spp → ground truth
-3. Extract scene features (geometry, materials, lights)
+1. Render Cornell box at 4 spp → noisy input (via `mi.render(scene, spp=4)`)
+2. Render Cornell box at 256 spp → ground truth (via `mi.render(scene, spp=256)`)
+3. Extract scene features (geometry from `scene.shapes()`, materials from `shape.bsdf()`, lights from `scene.emitters()`)
 4. Train in Nabla: `model.train()` → `loss.backward()` → `optimizer.step()`
-5. Repeat for 1000 iterations (different camera angles, light positions)
+5. Loss: `L_denoise + 0.1 * L_energy + 0.09 * L_sigreg` (energy conservation prevents photon creation)
+6. Repeat for 1000 iterations (different camera angles, light positions)
 
-### Decision 6: Training with Nabla PyTorch-style API
+### Decision 8: Training with Nabla PyTorch-style API (was Decision 6)
 
 **Choice:** Use Nabla's imperative (PyTorch-style) training API for development.
 
@@ -323,7 +440,7 @@ def extract_scene_features(scene):
 import nabla as nb
 import nabla.nn.functional as F
 
-model = OmenJEPA(latent_dim=192)
+model = OmenJEPA(tier='medium')  # latent_dim=1024
 model.train()
 optimizer = nb.nn.optim.AdamW(model, lr=5e-5, weight_decay=1e-3)
 
@@ -339,13 +456,16 @@ for iteration in range(500):
     noisy_nb = nb.Tensor.from_dlpack(np.array(noisy)).cuda()
     gt_nb = nb.Tensor.from_dlpack(np.array(gt)).cuda()
 
-    # Forward pass
-    predicted = model(noisy_nb, scene_features)
+    # Forward pass: U-Net denoiser conditioned by scene latent
+    denoised = model.denoise(scene_features, noisy_nb, prev_clean=None)
 
-    # Loss: prediction + SIGReg
-    pred_loss = nb.mean(nb.square(predicted - gt_nb))
+    # Loss: denoising + energy conservation + SIGReg collapse prevention
+    E_in = nb.sum(noisy_nb, axis=-1)
+    E_out = nb.sum(denoised, axis=-1)
+    pred_loss = nb.mean(nb.square(denoised - gt_nb))
+    energy_loss = nb.mean(nb.relu(E_out - E_in - 0.01))  # no photon creation
     sigreg_loss = sigreg(model.get_embeddings())  # Custom Mojo kernel
-    total_loss = pred_loss + 0.09 * sigreg_loss
+    total_loss = pred_loss + 0.1 * energy_loss + 0.09 * sigreg_loss
 
     # Backward + step
     total_loss.backward()
@@ -356,7 +476,7 @@ for iteration in range(500):
         save_checkpoint(model, optimizer, iteration)
 ```
 
-### Decision 7: Custom Mojo kernels for SIGReg and merge
+### Decision 9: Custom Mojo kernels for SIGReg and merge (was Decision 7)
 
 **Choice:** Write SIGReg loss and edge-aware merge as custom Mojo GPU kernels via Nabla's `call_custom_kernel()`.
 
@@ -431,14 +551,14 @@ class MergeOp(Operation):
         ...
 ```
 
-### Decision 8: JEPA world model for animation (simplified from LeWM)
+### Decision 10: JEPA world model for animation (simplified from LeWM) (was Decision 8)
 
 **Choice:** Autoregressive JEPA predictor using Nabla built-in TransformerEncoderLayer. Scene deltas replace robot actions.
 
 **ARPredictor (using Nabla built-in layers):**
 ```python
 class ARPredictor(nb.nn.Module):
-    def __init__(self, dim=192, depth=4, heads=8, dim_head=64, mlp_dim=1024):
+    def __init__(self, dim=1024, depth=4, heads=8, dim_head=64, mlp_dim=1024):
         # Use Nabla's built-in TransformerEncoderLayer for attention/FFN
         self.layers = [
             ConditionalBlock(dim, heads, dim_head, mlp_dim)
@@ -478,7 +598,7 @@ class ConditionalBlock(nb.nn.Module):
         return x
 ```
 
-### Decision 9: Inference compilation for production
+### Decision 11: Inference compilation for production (was Decision 9)
 
 **Choice:** Use `@nb.compile` for JIT compilation of inference paths. Optionally export to MAX format for C API deployment.
 
@@ -506,15 +626,16 @@ Mitsuba Scene
     │   └─> {geometry, materials, lights, camera}
     │
     ├─> mi.render(spp=4)
-    │   └─> noisy_rgba [H, W, 4] (Dr.Jit tensor)
+    │   └─> noisy_rgba [H, W, 4] + albedo [H,W,3] + normal [H,W,3]
     │
-    └─> model.denoise(features, noisy)
-        ├─> nb.Tensor.from_dlpack(noisy)  # zero-copy to Nabla
-        ├─> SceneEncoder(features)         # 3D scene → latent
-        ├─> RenderEncoder(noisy)           # noisy image → latent
-        ├─> CrossAttention(scene_latent, render_latent)
-        ├─> Decoder(combined_latent)       # latent → clean RGBA
-        └─> output.cpu().to_numpy()        # back to numpy
+    └─> model.denoise(features, noisy, prev_clean=None)
+        ├─> SceneEncoder(features)              # 3D scene → scene_latent (1024)
+        ├─> Input: cat([noisy(4), zeros(4), albedo(3), normal(3)]) = 14 ch
+        ├─> U-Net Encoder (strided Conv2d)      # multi-scale features + skips
+        ├─> U-Net Bottleneck (Swin Transformer + AdaLN, conditioned by scene_latent)
+        │   └─> Windowed 8×8 attention — trivial cost at H/16×W/16
+        ├─> U-Net Decoder (Conv2dTranspose + skip concat)
+        └─> output: clean RGBA (H, W, 4) linear HDR → numpy
 ```
 
 ### Mode 2: Adaptive
@@ -551,14 +672,12 @@ src/omen/
 ├── __init__.py
 ├── model/
 │   ├── __init__.py
-│   ├── omen_jepa.py              # Top-level OmenJEPA model (nb.nn.Module)
-│   ├── scene_encoder.py           # SceneGraphEncoder (~1M params)
-│   ├── render_encoder.py          # RenderFeatureEncoder (~1.5M params, Conv2d)
-│   ├── fusion.py                  # Cross-attention fusion (~0.5M params)
-│   ├── arpredictor.py             # ARPredictor + ConditionalBlock (~4M params)
-│   ├── scene_delta_encoder.py     # SceneDeltaEncoder (~155K params)
-│   ├── confidence_head.py         # ConfidenceHead (~30K params)
-│   ├── decoder.py                 # Image decoder (~1M params, Conv2dTranspose)
+│   ├── jepa.py                    # Top-level OmenJEPA model (compose all components)
+│   ├── scene_encoder.py           # SceneGraphEncoder (~0.3-1M params depending on tier)
+│   ├── unet.py                    # UNetDenoiser (3-55M params depending on tier)
+│   ├── arpredictor.py             # ARPredictor + ConditionalBlock (0.5-6M depending on tier)
+│   ├── decoder.py                 # Conv2dTranspose decoder (used by UNet internally)
+│   ├── sigreg.py                  # SIGReg loss (custom kernel wrapper)
 │   └── layers.py                  # AdaLNModulation, modulate(), FeedForward helpers
 │
 ├── kernels/                       # Custom Mojo GPU kernels
@@ -569,25 +688,26 @@ src/omen/
 │
 ├── scene/
 │   ├── __init__.py
-│   ├── extractor.py               # extract_scene_features(mi.Scene) → dict
+│   ├── extractor.py               # extract_scene_features(mi.Scene) → dict (Mitsuba today, portable)
 │   └── delta.py                   # compute_delta(frame_A, frame_B) → SceneDelta
 │
 ├── training/
 │   ├── __init__.py
-│   ├── trainer.py                 # Training loop (Nabla AdamW + checkpoints)
-│   ├── gym.py                     # Training data generation (Mitsuba renders)
+│   ├── trainer.py                 # Training loop (Nabla AdamW + energy loss + checkpoints)
+│   ├── data_gen.py                # Training data generation (Dr.Jit renders)
 │   └── cornell_schedule.py        # 4-phase Cornell box training schedule
 │
 ├── modes/
 │   ├── __init__.py
-│   ├── denoiser.py                # Mode 1: 4spp → denoise → clean
+│   ├── denoiser.py                # Mode 1: 4spp → U-Net denoise → clean
 │   ├── adaptive.py                # Mode 2: preview + confidence + high-spp → merge
 │   ├── multires.py                # Mode 3: low-res clean + high-res noisy → merge
 │   └── animation.py               # Mode 4: temporal prediction + surprise detection
 │
-├── checkpoint.py                  # Save/load model state_dict, LoRA adapters
-├── inference.py                   # @nb.compile inference functions
-└── config.py                      # Model config, hyperparameters from lewm.yaml
+├── jepa_bridge.py                 # Load model, DLPack transfer, inference wrapper
+├── checkpoint.py                  # Save/load state_dict, LoRA adapters
+├── config.py                      # Tier configs (Fast/Medium/High), hyperparameters
+└── inference.py                   # @nb.compile inference functions
 ```
 
 ### No Mojo `.so` compilation needed
@@ -614,7 +734,9 @@ for i in range(100):
 
     pred_loss = nb.mean(nb.square(predicted - gt_nb))
     sigreg_loss = sigreg_op(model.get_embeddings())
-    total = pred_loss + 0.09 * sigreg_loss
+    energy_violation = nb.relu(nb.sum(predicted, axis=-1) - nb.sum(noisy_nb, axis=-1) - 0.01)
+    energy_loss = nb.mean(energy_violation)
+    total = pred_loss + 0.1 * energy_loss + 0.09 * sigreg_loss
 
     total.backward()
     model = optimizer.step()
@@ -663,8 +785,10 @@ save_finetune_checkpoint(scene_cache_path, lora_params=adapters, optimizer_state
 
 ```
 ~/.cache/omen/models/
-├── base_v0.omen                    # Pre-trained on Cornell box variants
-├── base_v0.omen.meta.json          # Architecture hash, version, metrics
+├── base_fast_v0.omen               # Pre-trained Fast tier (~16MB)
+├── base_medium_v0.omen             # Pre-trained Medium tier (~64MB)
+├── base_high_v0.omen               # Pre-trained High tier (~256MB)
+├── *.meta.json                     # Architecture hash, version, metrics
 └── scenes/
     └── <topology_hash>/            # Face connectivity + material types + light types
         ├── lora_adapter.omen       # Scene-specific LoRA weights
@@ -687,29 +811,35 @@ save_finetune_checkpoint(scene_cache_path, lora_params=adapters, optimizer_state
 | Training too slow | Use `@nb.compile` for training loop, LoRA for fine-tuning |
 | Multi-pass is slow (3x renders) | JEPA speedup >3x makes it worth it |
 | Scene extraction incomplete | Support Mitsuba primitives first, extend to custom BSDFs |
+| U-Net VRAM at 4K | Fast tier fits 1.2GB; High tier needs 8GB+ for 4K; tiled processing |
+| Mamba SSM weaker at precise recall | Keep Swin Transformer at bottleneck for exact detail |
+| Swin windowed attention misses cross-window features | Window size 8×8 is proven; shift windows between layers (SwinIR pattern) |
+| Multicam scene changes invalidate shared latent | Surprise detection triggers re-encode; all cameras share updated latent |
 
 ## Implementation Phases
 
 ### Phase 1: Scene Extraction + Model Skeleton (Week 1-2)
 - [ ] `scene/extractor.py` from Mitsuba API
-- [ ] `model/scene_encoder.py` (SceneGraphEncoder)
+- [ ] `model/scene_encoder.py` (SceneGraphEncoder with Mamba SSM for scene tokens)
 - [ ] `model/render_encoder.py` (RenderFeatureEncoder, Conv2d)
 - [ ] `model/fusion.py` (Cross-attention)
 - [ ] Test: extract Cornell box features, encode to latent
 
 ### Phase 2: Core Model + Training (Week 3-5)
-- [ ] `model/arpredictor.py` (ConditionalBlock + AdaLN-zero)
+- [ ] `model/unet.py` (U-Net with Swin Transformer bottleneck + Mamba encoder blocks)
+- [ ] `model/arpredictor.py` (ConditionalBlock + AdaLN-zero, hybrid SSM+Attention)
 - [ ] `model/decoder.py` (Conv2dTranspose upsample)
 - [ ] `kernels/sigreg_kernel.mojo` + `sigreg_op.py`
 - [ ] `training/trainer.py` (Nabla training loop)
 - [ ] Test: train Phase 1 on Cornell box, verify SSIM > 0.95
 
-### Phase 3: Modes (Week 6-8)
+### Phase 3: Modes + Multicam (Week 6-8)
 - [ ] `modes/denoiser.py` (Mode 1)
 - [ ] `modes/adaptive.py` (Mode 2 + ConfidenceHead)
 - [ ] `modes/multires.py` (Mode 3 + merge kernel)
+- [ ] `modes/multicam.py` (shared scene_latent, multiple cameras)
 - [ ] `checkpoint.py` (save/load state_dict)
-- [ ] Test: all 3 modes on Cornell box
+- [ ] Test: all modes on Cornell box, test multicam with 3 angles
 
 ### Phase 4: Temporal + Animation (Week 9-12)
 - [ ] `model/scene_delta_encoder.py`

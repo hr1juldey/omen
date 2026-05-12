@@ -1,155 +1,148 @@
 ## ADDED Requirements
 
-### Background: 3D-Aware Architecture (NOT ViT-Tiny)
+### Background: Omen as Render Engine Turbocharger
 
-LeWM uses ViT-Tiny (5.5M params) designed for 2D image classification (ImageNet). Omen works in 3D — Mitsuba provides exact geometry, materials, and light positions. A 2D patch encoder wastes this information.
+Omen is NOT just a denoiser. It is a scene-aware rendering turbocharger that fights on three fronts:
+1. **Denoising** (vs OIDN/OptiX) — scene-blind pixel denoisers, 460K-57M params
+2. **Upscaling + Frame Generation** (vs DLSS 4.0) — pixel-level interpolation, NVIDIA-locked
+3. **Deterministic Generation** (vs Diffusion models) — text-controlled, stochastic, non-reproducible
 
-New architecture: **Scene-Aware Dual Encoder** (~8M total, down from ~20M)
-- Scene Graph Encoder (~1M): structured embeddings for known 3D elements
-- Render Feature Encoder (~1.5M): Conv2d on noisy RGBA + aux buffers
-- Cross-Attention Fusion (~0.5M): scene features guide render features
-- ARPredictor (~4M): simplified from 10.8M (4 layers instead of 6)
-- All using Nabla Python API (`nb.nn.Module`, `F.scaled_dot_product_attention`)
+JEPA is the ONLY architecture that unifies all three. The core insight: Omen is NOT a latent-to-image generator. It is a **guided restoration network** — a U-Net denoiser conditioned by a JEPA scene understanding system.
 
-### Requirement: Scene Graph Encoder (~1M params)
+Architecture paradigm:
+```
+JEPA = the BRAIN  (scene understanding + temporal prediction, 1024-dim latent)
+U-Net = the HANDS (fast pixel-level denoising, proven like OIDN)
+```
 
-Omen SHALL encode Mitsuba scene data as structured embeddings — NOT as image patches.
+### Three Model Tiers
+
+| Tier | Params | Use Case | VRAM at 4K |
+|------|--------|----------|------------|
+| Fast | 4M | Test the waters, beat OIDN | ~1.2GB |
+| Medium | 16M | Kill OptiX with scene awareness | ~2.5GB |
+| High | 64M | Palace of mirrors, fog, 20K lights at 4K60 | ~4.5GB+ |
+
+### Requirement: Scene Graph Encoder (0.3M-1M params depending on tier)
+
+Omen SHALL encode render engine scene data as structured embeddings into a 1024-dim latent — NOT as image patches.
 
 #### Scenario: Encode geometry features
 
-- **WHEN** scene geometry is available from Mitsuba
-- **THEN** extract vertex positions and face normals: `np.array(params['vertex_positions']).reshape(-1, 3)`
-- **AND** project: `geo_latent = Linear(6, 64)(concat(positions, normals))` — 6 input dims (pos_xyz + normal_xyz)
-- **AND** aggregate: `geo_attn = MultiHeadAttention(64, num_heads=4)` — self-attention over geometry
-- **AND** output: mean-pooled geometry embedding shape `(1, 64)`
+- **WHEN** scene geometry is available from render engine
+- **THEN** extract vertex positions and face normals
+- **AND** project via Linear(6, C_base)
+- **AND** aggregate via Mamba SSM (MaIR-style NSS scanning) when vertex count > 10K, else MultiHeadAttention(C_base, num_heads=4)
+- **AND** reason: production scenes can have 100K+ vertices making O(n²) attention infeasible; Mamba's O(n) handles this
+- **AND** output: geometry embedding
 
 #### Scenario: Encode material features
 
 - **WHEN** shape BSDF parameters are available
-- **THEN** map material type to embedding: `mat_type_emb = Embedding(num_types, 64)(type_ids)`
-- **AND** project BSDF parameters: `mat_proj = Linear(64 + 8, 64)(concat(type_emb, bsdf_params))`
-- **AND** output: mean-pooled material embedding shape `(1, 64)`
+- **THEN** project material type + BSDF params via Linear
+- **AND** output: material embedding
 
 #### Scenario: Encode light features
 
 - **WHEN** scene emitters are available
-- **THEN** extract per-light: `[type_id, pos_xyz, intensity, color_rgb]` = 7 floats
-- **AND** project: `light_latent = Linear(7, 64)(light_params)`
-- **AND** output: mean-pooled light embedding shape `(1, 64)`
+- **THEN** extract per-light: type, position, intensity, color
+- **AND** project via Linear(7, C_base)
 
-#### Scenario: Aggregate scene features into latent
+#### Scenario: Aggregate into 1024-dim scene latent
 
 - **WHEN** geometry, material, and light embeddings are available
-- **THEN** concatenate: `all_features = concat([geo_emb, mat_emb, light_emb])` shape `(3, 64)`
-- **AND** cross-attention: `aggregated = MultiHeadAttention(64, num_heads=4)(all_features)`
-- **AND** project to latent: `scene_latent = Linear(64, 192)(aggregated.mean(axis=1))` shape `(1, 192)`
+- **THEN** aggregate: Mamba SSM for large scenes (100K+ tokens), MultiHeadAttention for small scenes (<10K tokens)
+- **AND** project to scene_latent shape `(batch, 1024)`
 
-### Requirement: Render Feature Encoder (~1.5M params)
+### Requirement: U-Net Denoiser with Scene Conditioning (3M-55M params depending on tier)
 
-Omen SHALL encode noisy renders + auxiliary buffers using Conv2d (NOT ViT patches).
+Omen SHALL denoise noisy renders using a U-Net conditioned by JEPA scene latent via AdaLN modulation. The U-Net takes noisy pixels + previous clean frame as input — NOT generated from latent.
 
-#### Scenario: Encode noisy RGBA with auxiliary buffers
+#### Scenario: Denoise noisy 4K render
 
-- **WHEN** a noisy render is available from Mitsuba
-- **THEN** input: noisy RGBA `(H, W, 4)` + depth `(H, W, 1)` + normal `(H, W, 3)` = 8 channels
-- **AND** Conv2d stack:
-  - `conv1 = Conv2d(8, 32, 3x3, stride=2)` → `(H/2, W/2, 32)` + ReLU
-  - `conv2 = Conv2d(32, 64, 3x3, stride=2)` → `(H/4, W/4, 64)` + ReLU
-  - `conv3 = Conv2d(64, 128, 3x3, stride=2)` → `(H/8, W/8, 128)` + ReLU
-- **AND** global average pool: `(H/8 * W/8, 128)` → `(128,)`
-- **AND** project: `render_latent = Linear(128, 192)(pooled)` shape `(1, 192)`
+- **WHEN** noisy render (4-16 spp) and scene latent (1024-dim) are available
+- **THEN** input: concatenate `[noisy_rgba(4), prev_clean(4), albedo(3), normal(3)]` = 14 channels
+- **AND** encoder path: multi-scale Conv2d with strided downsampling, skip connections
+- **AND** bottleneck: Swin Transformer blocks (windowed 8×8 attention) with AdaLN conditioned by scene_latent
+  - Windowed attention at H/16×W/16 = ~510 windows of 64 tokens = trivial cost even at 4K
+  - Fast tier: pure Swin (2 blocks, 4 heads)
+  - Medium tier: Swin + Restormer transposed-attention fallback for O(N) safety
+  - High tier: Swin + Restormer + AdaLN for 4K60 production workloads
+- **AND** decoder path: Conv2dTranspose + skip concatenation from encoder
+- **AND** output: clean RGBA `(H, W, 4)` in linear HDR space
+- **AND** model sizes by tier:
+  - Fast: C_base=48, 4 levels, bottleneck=384ch
+  - Medium: C_base=96, 5 levels, bottleneck=768ch
+  - High: C_base=192, 6 levels, bottleneck=1536ch
+
+#### Scenario: Handle missing previous frame (first frame)
+
+- **WHEN** no previous clean frame is available (first frame of sequence)
+- **THEN** fill with zeros: `prev_clean = zeros(B, H, W, 4)`
+- **AND** U-Net operates in single-frame mode (graceful degradation)
 
 #### Scenario: Handle missing auxiliary buffers
 
-- **WHEN** depth or normal buffers are not available
-- **THEN** fill with zeros: `depth = zeros(H, W, 1)`, `normal = zeros(H, W, 3)`
-- **AND** proceed with 8 channels total (RGBA + zero-filled aux)
+- **WHEN** albedo or normal buffers are not available
+- **THEN** fill with zeros for missing channels
+- **AND** proceed with available inputs
 
-### Requirement: Cross-Attention Fusion (~0.5M params)
+### Requirement: Energy Conservation Loss (0 learnable params)
 
-Omen SHALL fuse scene and render features using cross-attention.
+Omen SHALL enforce physics-based energy conservation during training. The denoiser can redistribute light but cannot create photons.
 
-#### Scenario: Fuse scene and render latents
+#### Scenario: Prevent energy gain during denoising
 
-- **WHEN** both scene_latent `(1, 192)` and render_latent `(1, 192)` are available
-- **THEN** cross-attention: render queries scene
-  - query = render_latent (what does the render show?)
-  - key = scene_latent (what does the scene contain?)
-  - value = scene_latent (scene information to inject)
-- **AND** `fused = F.scaled_dot_product_attention(render_latent, scene_latent, scene_latent)`
-- **AND** output: `combined_latent` shape `(1, 192)`
+- **WHEN** training on (noisy, ground_truth) pairs
+- **THEN** compute per-pixel energy: `E_in = sum(noisy, axis=-1)`, `E_out = sum(denoised, axis=-1)`
+- **AND** energy violation: `violation = relu(E_out - E_in - 0.01)` where 0.01 is tolerance
+- **AND** loss: `L_energy = mean(violation)`
+- **AND** total training loss: `L_total = L_denoise + 0.1 * L_energy + 0.09 * L_sigreg`
 
-### Requirement: ARPredictor with AdaLN-zero (~4M params)
+### Requirement: ARPredictor with AdaLN-zero (0.5M-6M params depending on tier)
 
-Omen SHALL implement an autoregressive predictor using ConditionalBlock transformer layers. Simplified from LeWM's 10.8M (4 layers instead of 6, heads=8 instead of 16).
+Omen SHALL implement an autoregressive predictor for temporal coherence and frame generation.
 
-#### Scenario: Predict next frame latent
+#### Scenario: Predict next frame for temporal coherence
 
 - **WHEN** history buffer has H=3 previous latents and current latent is available
-- **THEN** concatenate: `input = concat([history[-3:], current_latent])` shape `(1, 4, 192)`
-- **AND** encode scene delta: `delta_emb = SceneDeltaEncoder(delta)` shape `(1, 192)`
-- **AND** process through 4 ConditionalBlock layers:
-  - Each layer: AdaLN-zero modulation via delta_emb
-  - `adaLN = Sequential(SiLU, Linear(192, 1152))` → 6 modulation params
-  - `modulate(x, shift, scale) = x * (1 + scale) + shift`
-  - Gate starts at 0 (identity at init)
-- **AND** output: `predicted_latent = norm(x[:, -1])` shape `(1, 192)`
+- **THEN** concatenate history + current
+- **AND** encode scene delta via SceneDeltaEncoder
+- **AND** process through hybrid SSM+Attention ConditionalBlock layers with AdaLN-zero modulation
+  - Hybrid: Mamba SSM for efficient temporal sequence processing + 1 attention layer for precise recall
+  - Reason: MambaIRv2 notes Mamba is "weaker at precise recall/copying" — one attention layer provides exact token access
+- **AND** output: predicted latent for next frame
+- **AND** model sizes by tier:
+  - Fast: 2 layers, 4 heads (pure attention — short sequences)
+  - Medium: 4 layers (3 Mamba + 1 Attention), 8 heads
+  - High: 8 layers (6 Mamba + 2 Attention), 16 heads
 
-#### Scenario: SceneDeltaEncoder (155K params, from LeWM)
+#### Scenario: SceneDeltaEncoder
 
 - **WHEN** per-frame scene changes are available
-- **THEN** flatten deltas: `[camera(7), objects(N×8), lights(M×7), births(K×8), materials(P×5)]`
-- **AND** Conv1d smoothing: `Conv1d(delta_dim, smoothed_dim, kernel_size=1)`
-- **AND** MLP: `Linear(smoothed, 768) → SiLU → Linear(768, 192)`
-- **AND** output: `delta_embedding` shape `(1, 192)`
+- **THEN** flatten deltas: camera, objects, lights, births, materials
+- **AND** Linear smoothing + MLP
+- **AND** output: delta_embedding shape `(1, 1024)`
 
-### Requirement: SIGReg loss — Custom Mojo GPU kernel (0 learnable params)
+### Requirement: ConfidenceHead (0.1M-1M params depending on tier)
 
-Omen SHALL implement SIGReg from LeWM as a custom Mojo GPU kernel via Nabla's `call_custom_kernel()`. Lambda=0.09 from lewm.yaml.
-
-#### Scenario: Compute SIGReg loss
-
-- **WHEN** model embeddings are available during training
-- **THEN** pass embeddings to custom Mojo kernel via `UnaryOperation` subclass
-- **AND** kernel computes Epps-Pulley statistic:
-  - 17 knots on [0, 3]
-  - 1024 random projections (sampled once, cached)
-  - Gaussian characteristic function: `phi = exp(-t²/2)`
-  - Trapezoidal weights
-- **AND** total loss: `L = L_pred + 0.09 * L_sigreg` (lambda from lewm.yaml)
-- **AND** SIGReg has ZERO learnable parameters
-
-#### Scenario: SIGReg Python wrapper
-
-- **WHEN** SIGRegOp is called in Nabla training loop
-- **THEN** class `SIGRegOp(UnaryOperation)` with:
-  - `name = "sigreg_kernel"`
-  - `kernel()` calls `call_custom_kernel("sigreg_kernel", kernel_dir, embeddings, ...)`
-  - `vjp_rule()` provides gradient for autograd integration
-- **AND** composes with `nb.grad`, `nb.vmap`, `@nb.compile`
-
-### Requirement: ConfidenceHead (~30K params)
-
-Omen SHALL produce per-pixel confidence from the latent representation.
+Omen SHALL produce per-pixel confidence from the scene latent.
 
 #### Scenario: Predict per-pixel confidence
 
-- **WHEN** `bridge.predict_confidence()` is called
-- **THEN** architecture: `Linear(192, 96) → SiLU → Linear(96, 48) → SiLU → Linear(48, 1) → Sigmoid`
+- **WHEN** scene_latent is available
+- **THEN** MLP: `Linear(1024, 512) → SiLU → Linear(512, 256) → SiLU → Linear(256, 1) → Sigmoid`
 - **AND** output: confidence map shape `(H, W, 1)` with values in [0.0, 1.0]
 - **AND** high-confidence (>0.8): flat surfaces, diffuse regions
 - **AND** low-confidence (<=0.5): caustics, specular highlights, geometric edges
 
-### Requirement: Decoder (~1M params)
+### Requirement: SIGReg loss — Custom Mojo GPU kernel (0 learnable params)
 
-Omen SHALL decode latent representations back to RGBA images.
+Omen SHALL implement SIGReg as a custom Mojo GPU kernel via Nabla's `call_custom_kernel()`. Lambda=0.09.
 
-#### Scenario: Decode latent to RGBA
+#### Scenario: Compute SIGReg loss
 
-- **WHEN** predicted_latent `(1, 192)` is available
-- **THEN** project: `Linear(192, 128 * (H/8) * (W/8))` → reshape to `(H/8, W/8, 128)`
-- **AND** upsample via Conv2dTranspose:
-  - `conv_t1 = Conv2dTranspose(128, 64, 3x3, stride=2)` → `(H/4, W/4, 64)` + ReLU
-  - `conv_t2 = Conv2dTranspose(64, 32, 3x3, stride=2)` → `(H/2, W/2, 32)` + ReLU
-  - `conv_t3 = Conv2dTranspose(32, 4, 3x3, stride=2)` → `(H, W, 4)` + Sigmoid
-- **AND** output: RGBA `(H, W, 4)` with values in [0.0, 1.0]
+- **WHEN** model embeddings are available during training
+- **THEN** pass embeddings to custom Mojo kernel
+- **AND** kernel computes Epps-Pulley statistic (17 knots, 1024 projections)
+- **AND** SIGReg has ZERO learnable parameters
