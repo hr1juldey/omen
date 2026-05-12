@@ -1,0 +1,17 @@
+[project]
+name = "omen"
+version = "0.1.0"
+description = "JEPA-accelerated path tracing render engine for Mitsuba 3"
+authors = ["Omen Contributors"]
+channels = ["https://prefix.dev/conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.14.*"
+
+# Development tools
+ruff = "*"
+pytest = "*"
+
+# Mitsuba 3 installed via: pixi run pip install mitsuba drjit
+# (Mitsuba is not in conda-forge, see docs/BPY_MITSUBA_FINDINGS.md)
