@@ -1,12 +1,38 @@
-"""Python bridge for Nabla custom Mojo GPU tile fingerprint kernel.
+"""Python bridge for Nabla custom Mojo GPU kernels.
 
-Uses Nabla's call_custom_kernel API:
-  1. Mojo kernel: @compiler.register("tile_fingerprint") struct
-  2. Python: UnaryOperation subclass wrapping call_custom_kernel
-  3. Tensor transfer: nb.Tensor.from_dlpack(numpy_array)
+Mojo GPU kernels (hardware-level):
+  - tile_fingerprint: 23-dim tile stats from aux buffer
+  - aov_pack: Pack Mitsuba AOV channels into (H,W,10)
+  - moe_dispatch: Fused expert routing + weighted combination
+  - mla_compress / mla_reconstruct: 16x skip projection + SiLU
+  - ssim_compute: Per-pixel SSIM with 7x7 window
 
-Falls back to pure numpy if Mojo GPU unavailable.
+Uses Nabla's call_custom_kernel API with numpy fallbacks.
 """
+
+from omen.kernels.aov_pack import compute_aov_pack_gpu, compute_aov_pack_numpy
+from omen.kernels.mla_compress import (
+    compute_mla_compress_gpu,
+    compute_mla_reconstruct_gpu,
+)
+from omen.kernels.moe_dispatch import (
+    compute_moe_dispatch_gpu,
+    compute_moe_dispatch_numpy,
+)
+from omen.kernels.ssim_kernel import compute_ssim_gpu, compute_ssim_map_gpu
+
+__all__ = [
+    "compute_aov_pack_gpu",
+    "compute_aov_pack_numpy",
+    "compute_mla_compress_gpu",
+    "compute_mla_reconstruct_gpu",
+    "compute_moe_dispatch_gpu",
+    "compute_moe_dispatch_numpy",
+    "compute_ssim_gpu",
+    "compute_ssim_map_gpu",
+    "compute_tile_fingerprint_gpu",
+    "compute_tile_fingerprint_numpy",
+]
 
 import logging
 from pathlib import Path

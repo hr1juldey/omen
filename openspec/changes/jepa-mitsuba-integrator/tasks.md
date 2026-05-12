@@ -187,15 +187,15 @@
 
 > Spec: `specs/denoiser-mode/`
 
-- [ ] 10.1 Implement render_denoiser(scene, spp=4) in modes/denoiser.py
-- [ ] 10.2 Render 4spp, configure Mitsuba AOV integrator for albedo/normal/depth passes
-- [ ] 10.3 Extract scene graph, DLPack transfer render + aux buffers, run tile fingerprint computation
-- [ ] 10.4 Model denoise with tile-based MoE routing (8×8 cryptomatte masks), return clean RGBA
-- [ ] 10.5 Handle model unavailable: return raw render
-- [ ] 10.6 Handle missing AOVs: zero-fill missing channels, log degradation, proceed with shared-expert-only routing
-- [ ] 10.7 Quality validation: SSIM, PSNR, artifact detection
-- [ ] 10.8 Test: Cornell box at 4spp, SSIM > 0.90 vs 256spp
-- [ ] 10.9 Test: Cornell box at 4spp with NO auxiliary passes, verify degraded quality still beats raw 4spp
+- [x] 10.1 Implement render_denoiser(scene, spp=4) in modes/denoiser.py
+- [x] 10.2 Render 4spp, configure Mitsuba AOV integrator for albedo/normal/depth passes
+- [x] 10.3 Extract scene graph, DLPack transfer render + aux buffers, run tile fingerprint computation
+- [x] 10.4 Model denoise with tile-based MoE routing (8×8 cryptomatte masks), return clean RGBA
+- [x] 10.5 Handle model unavailable: return raw render
+- [x] 10.6 Handle missing AOVs: zero-fill missing channels, log degradation, proceed with shared-expert-only routing
+- [x] 10.7 Quality validation: SSIM, PSNR, artifact detection
+- [x] 10.8 Test: Cornell box at 4spp, SSIM > 0.90 vs 256spp
+- [x] 10.9 Test: Cornell box at 4spp with NO auxiliary passes, verify degraded quality still beats raw 4spp
 
 ## 11. Mode 2 - Adaptive
 

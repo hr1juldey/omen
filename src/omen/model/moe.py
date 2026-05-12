@@ -1,14 +1,7 @@
-"""Tile-based Mixture of Experts with cryptomatte routing.
+"""Tile-based Mixture of Experts with cryptomatte routing (DeepSeek-V3 style).
 
-Implements DeepSeek-V3 style MoE with:
-- 8 material experts: diffuse, glossy/glass, metal, SSS/skin,
-  volume/smoke, emissive, hair/fur, cloth
-- 5 light experts: point/spot, area, sun/directional, env/HDRI, emissive geo
-- 5 geometry experts: flat, curved, edges/silhouette, detail/hair, transparent
-- 4 motion experts: static, linear, fast/blur, occlusion boundary
-- 1 shared expert: always active (base denoising)
-
-Total: 23 experts. Auxiliary-loss-free load balancing via bias vectors.
+8 material + 5 light + 5 geometry + 4 motion + 1 shared = 23 experts.
+Auxiliary-loss-free load balancing via bias vectors.
 """
 
 import logging
