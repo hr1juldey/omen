@@ -36,10 +36,14 @@ Both Mitsuba and Nabla are Python-callable libraries. Nabla has NO Mojo API — 
 - Implement scene graph extraction from Mitsuba Python API (portable to Cycles/EEVEE later)
 - Build 3-tier JEPA + U-Net model using Nabla Python API (4M / 16M / 64M params)
 - Implement 4 rendering modes (denoiser, adaptive, multires, temporal) — all tiers support all modes
-- Self-training protocol using Cornell box
+- Self-training protocol using Cornell box + production training on Blender demo files
 - Energy conservation loss (physics-based, no photon creation during denoising)
 - Zero-copy DLPack tensor passing between Mitsuba/Dr.Jit and Nabla
 - Custom Mojo GPU kernels for SIGReg loss and merge operations
+- Blender plugin via `bpy.types.RenderEngine` (EEVEE viewport + Mitsuba/JEPA final render)
+- Read Blender's shared node system (bNodeTree, NTREE_SHADER) for scene graph extraction
+- Training data from 15 Blender demo files (500-750 pairs across 6 scene categories)
+- Research paper validation: ablations, baselines (OIDN, OptiX), metrics (PSNR, SSIM, LPIPS, FLIP)
 
 **Non-Goals:**
 - Modifying Mitsuba C++ path tracer source
@@ -47,6 +51,7 @@ Both Mitsuba and Nabla are Python-callable libraries. Nabla has NO Mojo API — 
 - Material node compilation (use Mitsuba's BSDFs)
 - Pure Mojo model code (Nabla has no Mojo API — Python only)
 - C ABI bridge (replaced by DLPack via Nabla Python API)
+- Writing a custom GLSL/OSL shader compiler (EEVEE handles viewport, we handle final render)
 
 ## Decisions
 
@@ -1056,6 +1061,191 @@ FP8:     E4M3 for forward matmuls, per-tile dynamic scaling
   Fallback: if GPU doesn't support FP8 (pre-Ada), use BF16 automatically
 ```
 
+### Decision 16: Blender Plugin — RenderEngine + Shared Node System
+
+**Choice:** Register Omen as a Blender external render engine via `bpy.types.RenderEngine`, reading the same shared `bNodeTree` (NTREE_SHADER) that both EEVEE and Cycles read.
+
+**Rationale:**
+- Blender's `RE_engine.h` defines a clean plugin API with callbacks: `render()`, `update_render_passes()`, `view_update()`, `view_draw()`
+- Cycles already uses this pattern (see `intern/cycles/blender/session.cpp`) — we follow the same `BlenderSync` approach
+- EEVEE handles viewport preview (`bl_use_eevee_viewport = True`) while Omen handles final render
+- The shared node system means Omen reads the **exact same** `Material.node_tree` that Cycles reads for rendering — no data duplication
+
+**Shared Node System Architecture (from Blender source):**
+
+```
+.blend file
+    ↓  DNA_material_types.h: Material { nodetree: *bNodeTree }
+bNodeTree (NTREE_SHADER = 0)
+    ↓  DNA_node_types.h: bNode, bNodeSocket, bNodeLink
+    ↓  BKE_node.hh: bNodeType { gpu_fn, materialx_fn, exec_fn }
+    ↓
+┌───────────────────┬───────────────────┬────────────────────┐
+│  CYCLES PATH      │  EEVEE PATH       │  OMEN PATH (NEW)   │
+│                   │                   │                    │
+│  shader.cpp:      │  gpu_material.cc: │  render_engine.py: │
+│  add_nodes()      │  GPU_material_    │  _extract_material │
+│  b_node.is_type   │  from_nodetree()  │  (mat.node_tree)   │
+│  ("ShaderNode     │  ↓                │  ↓                 │
+│   BsdfDiffuse")   │  ntreeGPU         │  Read node types   │
+│  ↓                │  MaterialNodes()  │  + socket values   │
+│  Cycles internal  │  ↓                │  ↓                 │
+│  ShaderGraph      │  gpu_fn per node  │  Scene graph dict  │
+│  ↓                │  ↓                │  for conditioning  │
+│  SVM/OSL compile  │  GLSL compile     │  (not rendering)   │
+└───────────────────┴───────────────────┴────────────────────┘
+```
+
+**Key insight:** Omen does NOT need to convert nodes to shaders. We only extract material **type** (diffuse, metallic, glass, SSS, emission) and **parameters** (roughness, metallic, albedo, IOR) for scene graph conditioning. The actual rendering is done by Mitsuba (training) or the Mitsuba path tracer (inference via plugin).
+
+**Blender source files used as reference:**
+- `source/blender/render/RE_engine.h` — RenderEngineType, RenderEngine structs
+- `intern/cycles/blender/shader.cpp` — node-by-node conversion (our Python equivalent)
+- `source/blender/makesdna/DNA_node_types.h` — bNodeTree, bNode, bNodeSocket
+- `source/blender/makesdna/DNA_material_types.h` — Material { nodetree }
+- `source/blender/depsgraph/DEG_depsgraph_query.hh` — depsgraph access API
+
+**Plugin callbacks implemented:**
+
+| Callback | Purpose | Implementation |
+|----------|---------|---------------|
+| `update_render_passes()` | Declare AOV passes | Register Combined(4), Depth(1), Normal(3), Diffuse(3), Specular(3), Vector(4), CryptoMaterial(4) |
+| `render(depsgraph)` | Final render (F12) | Extract scene graph → Mitsuba render → JEPA denoise → return result |
+| `view_update()` | Viewport sync | Delegated to EEVEE (bl_use_eevee_viewport) |
+| `view_draw()` | Viewport draw | Delegated to EEVEE |
+
+**Scene graph extraction pipeline (inside `render()`):**
+
+```python
+def render(self, depsgraph):
+    # 1. Iterate depsgraph.objects → meshes, lights, cameras
+    for obj in depsgraph.objects:
+        if obj.type == 'MESH':
+            mesh = obj.to_mesh()  # evaluated geometry (modifiers applied)
+            # vertices, faces, normals, UVs, material_indices, matrix_world
+
+    # 2. Extract materials from shared node system
+    for mat in bpy.data.materials:
+        if mat.use_nodes:
+            ntree = mat.node_tree  # bNodeTree (NTREE_SHADER)
+            for node in ntree.nodes:
+                node.bl_idname  # e.g. "ShaderNodeBsdfPrincipled"
+                for socket in node.inputs:
+                    if socket.is_linked: ...
+                    else: socket.default_value  # unlinked = literal value
+
+    # 3. Convert → Mitsuba scene dict → mi.render() → JEPA denoise
+```
+
+**OmenProperties (user-facing settings):**
+
+| Property | Type | Default | Purpose |
+|----------|------|---------|---------|
+| `spp` | Int | 4 | Samples per pixel for noisy render |
+| `use_denoiser` | Bool | True | Enable JEPA neural denoising |
+| `model_tier` | Enum | Medium | Fast(4M) / Medium(16M) / High(64M) |
+| `model_path` | String | "" | Path to .omen checkpoint |
+| `export_motion_vectors` | Bool | True | Enable Vector pass for temporal denoising |
+| `export_cryptomatte` | Bool | True | Enable CryptoMaterial for MoE routing |
+
+### Decision 17: Training Data from Blender Demo Files
+
+**Choice:** Use Blender's official demo files (CC0/CC-BY licensed) as training data source, converting them to Mitsuba scenes via the shared node system.
+
+**Rationale:**
+- Cornell box alone cannot cover the diversity needed for production denoising (glass, SSS, hair, volumetrics, caustics)
+- Blender demo files are production-quality scenes with diverse materials, geometry, and lighting — available for free under permissive licenses
+- The shared node system (Decision 16) lets us read the same materials that Cycles renders, ensuring conversion fidelity
+- We follow Cycles' conversion pattern (`shader.cpp`) but output to Mitsuba scene format instead of Cycles ShaderGraph
+
+**Selected 15 scenes (from blender.org/download/demo-files/):**
+
+| Scene | Size | Category | Training Value |
+|-------|------|----------|---------------|
+| Blender 5.1 Singularity | 670MB | Splash Art | Complex materials, production quality |
+| Blender 4.5 DOGWALK | 383MB | Character | Fur/hair + environment, animation |
+| Blender 4.2 Gold | 300MB | Product | Metallic materials, reflections |
+| Agent 327 Barbershop | 280MB | Interior | Diverse materials (glass, metal, wood, skin) |
+| Cosmos Laundromat | 230MB | Exterior | Characters, animated |
+| Classroom | 72MB | Interior (CC0) | Classic archviz benchmark |
+| Barcelona Pavilion | 24MB | Architecture | Clean materials, geometric |
+| Italian Flat | 368MB | Interior | Furniture, complex materials |
+| Blender 3.4 Charge | 1.4GB | Open Movie | Full production scene |
+| Monster Under The Bed | — | Character | SSS skin, complex shading |
+| Hair Styles | — | Hair | Fur/hair (challenging for denoisers) |
+| Animal Fur Examples | — | Hair (CC0) | Different fur types |
+| Ember Forest | — | Volumetric | Fire, atmosphere |
+| Wasp Bot | — | Product | Metal + emission |
+| Nishita Sky Demo | — | Exterior | Sky, atmosphere |
+
+**Scene coverage matrix:**
+
+| Category | Count | Challenge Coverage |
+|----------|-------|--------------------|
+| Interior / Archviz | 4 | Indirect lighting, glossy surfaces, caustics |
+| Exterior / Outdoor | 3 | Sky lighting, large open spaces, vegetation |
+| Character / Organic | 3 | SSS, hair/fur, skin, eyes |
+| Product / Hard Surface | 2 | Metals, glass, reflections |
+| Volumetric / Atmosphere | 2 | Smoke, fire, fog, god rays |
+| Hair / Fur | 2 | Strand rendering, anisotropic shading |
+
+**Training data pipeline:**
+
+```
+Blender Demo Files (.blend)                     [15 scenes]
+    ↓ bpy (headless: blender --background --python converter.py)
+Scene Graph Extraction
+    ├── Materials: mat.node_tree (bNodeTree) → node types + values
+    ├── Geometry: obj.to_mesh() → vertices, faces, UVs, normals
+    ├── Lights: light.type, energy, color, transform
+    └── Cameras: fov, clip, transform
+    ↓ Scene converter (Blender nodes → Mitsuba XML/dict)
+Mitsuba Scene Files
+    ↓ mi.render(scene, spp=random(1,4))        [noisy input]
+    ↓ mi.render(scene, spp=random(256,4096))    [ground truth]
+    ↓ AOV extraction: albedo, normal, depth, motion, cryptomatte
+Render Training Pairs
+    ↓ compute_tile_fingerprint() per pair       [23-dim per 8×8 tile]
+    ↓ Store as HDF5 (group per scene, datasets per frame)
+Training Dataset                    [500-750 total pairs]
+    ↓ 80% train / 10% val / 10% test (stratified by category)
+Nabla Training Loop
+```
+
+**Camera animation patterns (30-50 frames per scene):**
+
+| Pattern | Motion Type | Tests |
+|---------|-------------|-------|
+| Orbit | 360° rotation around center | Depth variation, parallax |
+| Dolly | Forward/backward movement | Scale change, detail emergence |
+| Pan | Horizontal sweep | Large motion vectors |
+| Flythrough | Move through scene | Occlusion/disocclusion |
+
+**Animated camera implementation:**
+
+```python
+# src/python/test_pattern.py
+def camera_orbit(frame_idx, total_frames=60, radius=3.0, elevation=0.6):
+    theta = 2 * math.pi * frame_idx / total_frames
+    x = radius * math.cos(elevation) * math.cos(theta)
+    y = radius * math.sin(elevation)
+    z = radius * math.cos(elevation) * math.sin(theta)
+    return ([x, y, z], [0, 0, 0], [0, 1, 0])
+```
+
+**Dataset specifications:**
+
+| Metric | Value |
+|--------|-------|
+| Total training pairs | 500-750 |
+| Noisy spp | Random 1-4 per pair |
+| Ground truth spp | Random 256-4096 per pair |
+| AOV buffers per pair | albedo(3), normal(3), depth(1), motion(2), cryptomatte(4) |
+| Tile fingerprints | 23-dim per 8×8 tile |
+| Resolution | 1920×1080 (subset at 3840×2160) |
+| Storage format | HDF5 (group per scene, datasets per frame) |
+| Licenses | All CC0 or CC-BY |
+
 ## Data Flow Diagrams
 
 ### Mode 1: Denoiser
@@ -1107,6 +1297,60 @@ Mitsuba Scene
         └─> Custom Mojo GPU kernel via call_custom_kernel()
 ```
 
+### Mode 4: Blender Plugin (Production)
+
+```
+Blender .blend file (F12 render)
+    │
+    ├─> Blender depsgraph evaluation (modifiers, animation, drivers)
+    │
+    ├─> OmenRenderEngine.render(depsgraph)
+    │   ├─> _extract_scene_graph(depsgraph)
+    │   │   ├─> Meshes: obj.to_mesh() → vertices, faces, normals, UVs, material_indices
+    │   │   ├─> Materials: mat.node_tree (bNodeTree NTREE_SHADER) → node types + socket values
+    │   │   │   Same shared node system EEVEE (gpu_fn) and Cycles (shader.cpp) read
+    │   │   ├─> Lights: type, energy, color, transform
+    │   │   └─> Cameras: fov, clip, transform
+    │   │
+    │   ├─> Scene converter: scene_graph → Mitsuba scene dict → mi.load_dict()
+    │   │
+    │   ├─> mi.render(scene, spp=scene.omen_props.spp) → noisy RGBA + AOV buffers
+    │   │   └─> albedo(3) + normal(3) + depth(1) + motion_vectors(2) + cryptomatte(4)
+    │   │
+    │   ├─> compute_tile_fingerprint(albedo, normal, depth, motion, material_ids) → 23-dim per tile
+    │   │
+    │   ├─> JEPA denoise: model(noisy, aov, scene_graph) → clean RGBA
+    │   │   └─> U-Net + Swin/MoE bottleneck + scene conditioning via AdaLN-zero
+    │   │
+    │   └─> self.begin_result() → return clean RGBA to Blender
+    │
+    └─> EEVEE handles viewport preview (bl_use_eevee_viewport = True)
+```
+
+### Training Data Generation Pipeline
+
+```
+Blender Demo Files (.blend)               [15 scenes, CC0/CC-BY]
+    │
+    ├─> blender --background --python batch_generate.py
+    │
+    ├─> For each scene:
+    │   ├─> bpy.ops.wm.open_mainfile(filepath=scene_path)
+    │   ├─> For each camera animation frame (30-50 per scene):
+    │   │   ├─> Set camera transform: camera_orbit() / dolly() / pan() / flythrough()
+    │   │   ├─> Extract scene graph via shared node system (same as plugin)
+    │   │   ├─> Convert to Mitsuba scene dict
+    │   │   ├─> mi.render(spp=random(1,4))     → noisy RGBA
+    │   │   ├─> mi.render(spp=random(256,4096)) → ground truth RGBA
+    │   │   ├─> Extract AOV buffers: albedo, normal, depth, motion, cryptomatte
+    │   │   ├─> compute_tile_fingerprint()      → 23-dim per 8×8 tile
+    │   │   └─> Store to HDF5: group/scene, datasets/frame_N
+    │   └─> Log: "Scene X: 50 frames, 50 noisy+gt pairs"
+    │
+    └─> Dataset: 500-750 training pairs across 15 scenes
+        └─> 80% train / 10% val / 10% test (stratified by category)
+```
+
 ## Component Architecture
 
 ### Python Side — All code is Python (Nabla for ML, Mitsuba for rendering)
@@ -1143,7 +1387,12 @@ src/omen/
 │   ├── __init__.py
 │   ├── trainer.py                 # Training loop (Nabla AdamW + energy loss + checkpoints)
 │   ├── data_gen.py                # Training data generation (Dr.Jit renders)
-│   └── cornell_schedule.py        # 4-phase Cornell box training schedule
+│   ├── cornell_schedule.py        # 4-phase Cornell box training schedule
+│   ├── batch_generate.py          # Batch training pair generation from scene library
+│   └── scene_library/             # Blender demo file management
+│       ├── manifest.json          # 15 scenes: name, category, license, complexity
+│       ├── download.py            # Automated download from blender.org
+│       └── validate.py            # Open .blend headless, verify object counts
 │
 ├── modes/
 │   ├── __init__.py
@@ -1158,6 +1407,20 @@ src/omen/
 ├── inference.py                   # @nb.compile inference functions
 ├── aov.py                         # AOV pass reader + graceful degradation for missing passes
 └── motion.py                      # Motion vector processing + temporal reprojection
+
+src/python/                        # Blender plugin (separate from core for Blender Python compat)
+├── __init__.py                    # Addon register/unregister
+├── render_engine.py               # OmenRenderEngine(bpy.types.RenderEngine) + OmenProperties
+│                                  # Scene graph extraction from depsgraph + shared node system
+│                                  # AOV pass registration + Mitsuba render + JEPA denoise pipeline
+└── test_pattern.py                # Test patterns + camera animation generators (orbit/dolly/pan/flythrough)
+
+src/omen_integrator/               # Mitsuba integrator plugin (standalone, no Blender dependency)
+├── __init__.py                    # OmenIntegrator class + mi.register_integrator("omen")
+├── core.py                        # render_path_tracer() + AOV extraction + JEPA denoise pipeline
+├── jepa.py                        # load_model() + dlpack_transfer() + compute_tile_fingerprint(23-dim)
+├── gpu.py                         # VRAM budget tracking + FP8 detection
+└── path.py                        # trace_path() — path tracing with NEE + Russian roulette
 ```
 
 ### No Mojo `.so` compilation needed
@@ -1274,6 +1537,11 @@ save_finetune_checkpoint(scene_cache_path, lora_params=adapters, optimizer_state
 | Scene latent cache stale after animation changes | Two-level hashing: topology hash (structure) + dynamic hash (values); invalidate on births, material type changes, vertex count changes |
 | FP8 precision loss on HDR values | Per-tile dynamic scaling; validate PSNR drop < 0.5dB vs BF16; fallback to BF16 on pre-Ada GPUs |
 | Async pipeline double-buffering doubles VRAM | Only enable async when VRAM > 2× inference budget; fall back to sequential otherwise |
+| Blender node tree too complex for simple extraction | Follow Cycles' shader.cpp pattern (100+ node types mapped); start with Principled BSDF + Diffuse + Glass + Emission, extend incrementally |
+| Blender demo file conversion produces incorrect Mitsuba scenes | Validate each converted scene: render in both Cycles and Mitsuba, compare SSIM > 0.9 on identical camera angles |
+| Training data distribution gap (demo files vs real production) | 15 scenes cover 6 categories (interior, exterior, character, product, volumetric, hair); augment with random light/material perturbations |
+| Camera animation doesn't cover enough viewpoints | 4 patterns per scene (orbit, dolly, pan, flythrough) × 30-50 frames = 120-200 frames per scene |
+| Blender Python API version incompatibility | Test with Blender 4.2 LTS+; use only stable bpy API; guard optional features with hasattr() checks |
 
 ## Implementation Phases
 
@@ -1308,3 +1576,22 @@ save_finetune_checkpoint(scene_cache_path, lora_params=adapters, optimizer_state
 - [ ] `training/cornell_schedule.py` (4-phase training)
 - [ ] `inference.py` (`@nb.compile` inference)
 - [ ] Test: 100-frame animation with surprise detection
+
+### Phase 5: Blender Plugin + Training Data (Week 13-16)
+- [ ] `src/python/render_engine.py` — OmenRenderEngine + OmenProperties + scene graph extraction from depsgraph + shared node system reading
+- [ ] `src/python/test_pattern.py` — Camera animation generators (orbit, dolly, pan, flythrough)
+- [ ] Blender addon install + F12 render test (gradient → Mitsuba render → JEPA denoise)
+- [ ] `training/scene_library/` — Download 15 Blender demo files, validate headless
+- [ ] `training/batch_generate.py` — Batch training pair generation from scene library
+- [ ] Generate 500-750 training pairs across 15 scenes (HDF5 storage)
+- [ ] Dataset diversity validation (no single category > 40%)
+- [ ] Train base model on production data (not just Cornell box)
+
+### Phase 6: Research Paper Validation (Week 17-20)
+- [ ] Implement evaluation metrics: PSNR, SSIM, LPIPS, FLIP
+- [ ] Baseline comparisons: OIDN 2.x, OptiX denoiser, KPCN
+- [ ] Ablation studies: MoE vs single FFN, tile vs pixel, scene graph vs raw AOV, motion experts, MLA
+- [ ] Convergence curves + speed/quality Pareto
+- [ ] Expert activation visualizations
+- [ ] Failure case analysis (caustics, volumetrics, low spp)
+- [ ] Write Paper 1: "Tile-Based MoE Routing for Monte Carlo Denoising" → EGSR/HPG 2026
