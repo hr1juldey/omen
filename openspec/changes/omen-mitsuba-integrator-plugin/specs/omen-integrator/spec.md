@@ -66,6 +66,93 @@ Omen SHALL accept `jepa_model` string parameter specifying path to JEPA model fi
 - **THEN** integrator stores the path
 - **AND** parameter is accessible via traverse mechanism
 
+### Requirement: Rendering mode selection
+
+Omen SHALL accept `mode` integer parameter (default: 0) to select rendering strategy:
+- 0: Standard path tracing (uses Mitsuba's C++ path tracer)
+- 1: JEPA denoiser (post-process)
+- 2: Confidence-guided adaptive (multi-pass)
+- 3: Multi-resolution merge (spatial upsampling)
+
+#### Scenario: Select standard mode
+
+- **WHEN** user sets mode=0
+- **THEN** Omen delegates to Mitsuba's path integrator
+- **AND** renders using standard path tracing
+
+#### Scenario: Select denoiser mode
+
+- **WHEN** user sets mode=1
+- **THEN** Omen renders at low spp (4-16)
+- **AND** applies JEPA denoising
+- **AND** returns denoised output
+
+#### Scenario: Select adaptive mode
+
+- **WHEN** user sets mode=2
+- **THEN** Omen renders preview pass (4 spp)
+- **AND** predicts confidence map via JEPA
+- **AND** renders targeted pass (128 spp)
+- **AND** merges based on confidence
+
+#### Scenario: Select multi-resolution mode
+
+- **WHEN** user sets mode=3
+- **THEN** Omen renders low-res high-quality (25%, 256 spp)
+- **AND** renders high-res noisy (100%, 4 spp)
+- **AND** merges via JEPA scene-guided upsampling
+
+### Requirement: Scene graph extraction
+
+Omen SHALL extract structured scene data from Mitsuba Scene object for JEPA conditioning. Extraction SHALL include geometry (vertices, faces, material indices), materials (BSDF parameters), lights (emitter properties), and camera (transform and properties).
+
+#### Scenario: Extract geometry from scene
+
+- **WHEN** scene contains mesh shapes
+- **THEN** extractor reads vertex_positions and faces
+- **AND** returns structured Geometry objects
+
+#### Scenario: Extract materials from scene
+
+- **WHEN** shapes have BSDF assignments
+- **THEN** extractor reads BSDF parameters (diffuse, roughness, metallic)
+- **AND** returns structured Material objects
+
+#### Scenario: Extract lights from scene
+
+- **WHEN** scene contains emitters
+- **THEN** extractor reads emitter properties (position, intensity, type)
+- **AND** returns structured Light objects
+
+### Requirement: JEPA bridge interface
+
+Omen SHALL provide ctypes bridge to load and call Mojo JEPA kernels via C ABI. Bridge SHALL support denoise, predict_confidence, and merge_multires functions.
+
+#### Scenario: Load JEPA library
+
+- **WHEN** Omen initializes with mode > 0
+- **THEN** bridge attempts to load omen.so/omen.dll/omen.dylib
+- **AND** logs error if load fails
+- **AND** falls back to standard path tracing
+
+#### Scenario: Call denoise function
+
+- **WHEN** mode=1 and JEPA library loaded
+- **THEN** bridge calls omen_denoise() with scene graph and noisy render
+- **AND** returns denoised RGBA buffer
+
+#### Scenario: Call confidence function
+
+- **WHEN** mode=2 and JEPA library loaded
+- **THEN** bridge calls omen_predict_confidence() with scene graph and preview
+- **AND** returns confidence map [H, W, 1]
+
+#### Scenario: Call multires merge function
+
+- **WHEN** mode=3 and JEPA library loaded
+- **THEN** bridge calls omen_merge_multires() with scene graph and both renders
+- **AND** returns merged high-resolution buffer
+
 ### Requirement: GPU enable parameter
 
 Omen SHALL accept `use_gpu` boolean parameter (default: true) to enable/disable GPU acceleration. Initial implementation SHALL store this parameter for future Mojo kernel integration.
