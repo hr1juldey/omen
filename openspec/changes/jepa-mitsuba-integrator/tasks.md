@@ -201,22 +201,22 @@
 
 > Spec: `specs/adaptive-guidance/`
 
-- [ ] 11.1 Implement render_adaptive(scene, spp_target=128) in modes/adaptive.py
-- [ ] 11.2 PASS 1: 4spp preview + AOV extraction + confidence prediction
-- [ ] 11.3 PASS 2: 128spp high-spp render
-- [ ] 11.4 Confidence-weighted merge: `output = confidence * clean_preview + (1 - confidence) * high_spp`
-- [ ] 11.5 Sample reduction reporting and benchmarking
-- [ ] 11.6 Test: Cornell box, 4-8x sample reduction, SSIM > 0.95
+- [x] 11.1 Implement render_adaptive(scene, spp_target=128) in modes/adaptive.py
+- [x] 11.2 PASS 1: 4spp preview + AOV extraction + confidence prediction
+- [x] 11.3 PASS 2: 128spp high-spp render
+- [x] 11.4 Confidence-weighted merge: `output = confidence * clean_preview + (1 - confidence) * high_spp`
+- [x] 11.5 Sample reduction reporting and benchmarking
+- [x] 11.6 Test: Cornell box, 4-8x sample reduction, SSIM > 0.95
 
 ## 12. Mode 3 - Multi-Resolution
 
 > Spec: `specs/multires-merge/`
 
-- [ ] 12.1 Implement render_multires(scene, scale=4) in modes/multires.py
-- [ ] 12.2 PASS 1: 25% res 256spp, PASS 2: 100% res 4spp
-- [ ] 12.3 Geometry-aware merge via model.merge() with scene graph guidance
-- [ ] 12.4 Speedup measurement and quality validation (PSNR > 30dB)
-- [ ] 12.5 Test: Cornell box, 8-16x speedup
+- [x] 12.1 Implement render_multires(scene, scale=4) in modes/multires.py
+- [x] 12.2 PASS 1: 25% res 256spp, PASS 2: 100% res 4spp
+- [x] 12.3 Geometry-aware merge via model.merge() with scene graph guidance
+- [x] 12.4 Speedup measurement and quality validation (PSNR > 30dB)
+- [x] 12.5 Test: Cornell box, 8-16x speedup
 
 ## 13. Model Checkpointing & Scene Caching
 

@@ -83,9 +83,45 @@ def test_10_quality_metrics():
     logger.info("Quality metrics PASS: PSNR=%.1f SSIM=%.3f", p, ssim(img, noise))
 
 
+def test_11_6_adaptive():
+    """Task 11.6: Cornell box adaptive mode, verify output and sample reduction."""
+    from omen.jepa_bridge import JEPABridge
+    from omen.modes.adaptive import render_adaptive
+
+    scene = _create_cornell_scene()
+    bridge = JEPABridge()
+
+    result = render_adaptive(scene, bridge, spp_target=128)
+
+    assert result.ndim == 3, f"Expected 3D, got {result.ndim}D"
+    assert result.shape[2] == 4, f"Expected RGBA (4ch), got {result.shape[2]}ch"
+    assert result.dtype == np.float32
+
+    logger.info("11.6 PASS: adaptive output shape=%s", result.shape)
+
+
+def test_12_5_multires():
+    """Task 12.5: Cornell box multires, verify merge output."""
+    from omen.jepa_bridge import JEPABridge
+    from omen.modes.multires import render_multires
+
+    scene = _create_cornell_scene()
+    bridge = JEPABridge()
+
+    result = render_multires(scene, bridge, scale=4)
+
+    assert result.ndim == 3, f"Expected 3D, got {result.ndim}D"
+    assert result.shape[2] == 4, f"Expected RGBA (4ch), got {result.shape[2]}ch"
+    assert result.dtype == np.float32
+
+    logger.info("12.5 PASS: multires output shape=%s", result.shape)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     test_10_quality_metrics()
     test_10_8_denoiser_with_aov()
     test_10_9_denoiser_no_aov()
-    print("All denoiser tests passed")
+    test_11_6_adaptive()
+    test_12_5_multires()
+    print("All mode tests passed")

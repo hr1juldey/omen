@@ -1,13 +1,14 @@
 """Mode 3 - Multi-resolution render pipeline.
 
-Pipeline:
-PASS 1: Low-res (25%) at 256spp -> clean but small
-PASS 2: High-res (100%) at 4spp -> noisy but full detail
-MERGE: JEPA geometry-aware merge with scene graph
+PASS 1: Low-res (25%) at 256spp + AOV -> clean but small
+PASS 2: High-res (100%) at 4spp + AOV -> noisy but full detail
+MERGE: JEPA geometry-aware merge with scene graph + fingerprints
 Target: 8-16x speedup, PSNR > 30dB
 """
 
 import logging
+import time
+
 import numpy as np
 
 logger = logging.getLogger("omen.modes.multires")
@@ -26,48 +27,81 @@ def render_multires(scene, bridge, scale: int = 4) -> np.ndarray:
     """
     import mitsuba as mi
 
+    from omen.modes.denoiser import (
+        _add_alpha,
+        _compute_fingerprints,
+        _extract_render_and_aux,
+        _render_with_aov,
+    )
+
     sensor = scene.sensors()[0]
     params = mi.traverse(sensor)
-
-    # Get original film size
-    original_size = list(params['film.size'])
+    original_size = list(params["film.size"])
     height, width = int(original_size[1]), int(original_size[0])
 
     # PASS 1: Low-res high-quality
-    params['film.size'] = [width // scale, height // scale]
+    t0 = time.perf_counter()
+    params["film.size"] = [width // scale, height // scale]
     params.update()
     low_res = mi.render(scene, spp=256)
     low_res_np = np.array(low_res)
     lr_h, lr_w = low_res_np.shape[0], low_res_np.shape[1]
+    low_res_rgba = _add_alpha(low_res_np, lr_h, lr_w)
+    t_pass1 = time.perf_counter() - t0
 
-    # Add alpha to low-res
-    alpha = np.ones((lr_h, lr_w, 1), dtype=low_res_np.dtype)
-    low_res_rgba = np.concatenate([low_res_np, alpha], axis=-1)
-
-    # PASS 2: High-res noisy
-    params['film.size'] = [width, height]
+    # PASS 2: High-res noisy with AOV for merge guidance
+    t1 = time.perf_counter()
+    params["film.size"] = [width, height]
     params.update()
-    high_res = mi.render(scene, spp=4)
-    high_res_np = np.array(high_res)
 
-    # Add alpha to high-res
-    alpha = np.ones((height, width, 1), dtype=high_res_np.dtype)
-    high_res_rgba = np.concatenate([high_res_np, alpha], axis=-1)
+    try:
+        high_res = _render_with_aov(scene, spp=4)
+    except Exception:
+        high_res = mi.render(scene, spp=4)
+
+    high_res_np = np.array(high_res)
+    high_res_rgba = _add_alpha(high_res_np, height, width)
+    t_pass2 = time.perf_counter() - t1
 
     if not bridge.available:
-        logger.info("JEPA unavailable, returning high-res noisy")
+        logger.info("JEPA unavailable — returning high-res noisy")
         return high_res_rgba
 
-    # Extract scene graph
+    # Extract scene graph with AOV for merge guidance
     from omen.scene_extractor import extract_scene_graph
+
     scene_graph = extract_scene_graph(scene)
 
-    # JEPA merge
-    merged = bridge.merge_multires(scene_graph, low_res_rgba, high_res_rgba, scale)
+    # Compute high-res aux + fingerprints from AOV render
+    try:
+        _, aux, aov_dict = _extract_render_and_aux(high_res, height, width)
+        fingerprints = _compute_fingerprints(aux)
+        scene_graph["aux"] = aux
+        scene_graph["aov"] = aov_dict
+        scene_graph["fingerprints"] = fingerprints
+    except Exception:
+        logger.warning("AOV extraction failed — merging without fingerprints")
 
+    # JEPA merge: low-res clean + high-res noisy -> merged
+    t2 = time.perf_counter()
+    merged = bridge.merge_multires(scene_graph, low_res_rgba, high_res_rgba, scale)
+    t_merge = time.perf_counter() - t2
+
+    # Speedup measurement
+    baseline_time = t_pass2 * (256 / 4)  # estimate full 256spp time
+    total_time = t_pass1 + t_pass2 + t_merge
+    speedup = baseline_time / max(total_time, 1e-6)
     logger.info(
-        "Multires: %dx%d@256spp + %dx%d@4spp -> %dx%d merged",
-        lr_w, lr_h, width, height, width, height
+        "Multires: %dx%d@256spp(%.0fms) + %dx%d@4spp(%.0fms) "
+        "+ merge(%.0fms) = %.1fx speedup",
+        lr_w,
+        lr_h,
+        t_pass1 * 1000,
+        width,
+        height,
+        t_pass2 * 1000,
+        t_merge * 1000,
+        speedup,
     )
 
     return merged
