@@ -30,9 +30,9 @@
 
 ## 5. Verify and test
 
-- [ ] 5.1 Verify `jepa_bridge.py` imports cleanly with and without Nabla installed
-- [ ] 5.2 Test model bootstrap: delete checkpoint, render, verify fresh model created and checkpoint saved
-- [ ] 5.3 Test training loop: render same scene twice, verify loss decreases between renders
-- [ ] 5.4 Test LoRA trigger: render same scene 3 times, verify LoRA adapters initialized
-- [ ] 5.5 Test fallback: run with Nabla uninstalled, verify raw Mitsuba render returned without error
-- [ ] 5.6 Run ruff check on all modified files
+- [x] 5.1 Verify `jepa_bridge.py` imports cleanly with and without Nabla installed
+- [x] 5.2 Test model bootstrap: delete checkpoint, render, verify fresh model created and checkpoint saved
+- [x] 5.3 Test training loop: render same scene twice, verify loss decreases between renders
+- [x] 5.4 Test LoRA trigger: render same scene 3 times, verify LoRA adapters initialized
+- [x] 5.5 Test fallback: run with Nabla uninstalled, verify raw Mitsuba render returned without error
+- [x] 5.6 Run ruff check on all modified files

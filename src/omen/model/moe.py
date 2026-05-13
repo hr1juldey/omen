@@ -64,10 +64,11 @@ class ExpertGroup(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.experts = nn.ModuleList([ExpertFFN(channels) for _ in range(num_experts)])
+        # Plain list — Nabla has no ModuleList; modules self-register params
+        self.experts = [ExpertFFN(channels) for _ in range(num_experts)]
         # Auxiliary-loss-free load balancing (DeepSeek-V3)
         # Bias adjusted +-0.001 per training step, NO gradient
-        self.bias = nb.zeros(num_experts)
+        self.bias = nb.zeros((num_experts,))
 
     def forward(self, x, routing_logits):
         """Route tokens to top-k experts in this group.
@@ -101,7 +102,7 @@ class ExpertGroup(nn.Module):
 
     def update_bias(self, step_bias: float = 0.001):
         """Adjust bias per training step (auxiliary-loss-free balancing)."""
-        counts = nb.zeros(self.num_experts)
+        counts = nb.zeros((self.num_experts,))
         # Bias towards underloaded experts
         self.bias = self.bias + step_bias * (counts.mean() - counts)
 

@@ -43,15 +43,15 @@ class Decoder(nn.Module):
         # Transposed conv filters: layout is (K_h, K_w, C_out, C_in)
         self.deconv1_filter = F.he_normal((3, 3, 64, 128))
         self.deconv1_filter.requires_grad = True
-        self.deconv1_bias = nb.zeros(64)
+        self.deconv1_bias = nb.zeros((64,))
         self.deconv1_bias.requires_grad = True
         self.deconv2_filter = F.he_normal((3, 3, 32, 64))
         self.deconv2_filter.requires_grad = True
-        self.deconv2_bias = nb.zeros(32)
+        self.deconv2_bias = nb.zeros((32,))
         self.deconv2_bias.requires_grad = True
         self.deconv3_filter = F.he_normal((3, 3, 4, 32))
         self.deconv3_filter.requires_grad = True
-        self.deconv3_bias = nb.zeros(4)
+        self.deconv3_bias = nb.zeros((4,))
         self.deconv3_bias.requires_grad = True
 
     def forward(self, latent, height, width):

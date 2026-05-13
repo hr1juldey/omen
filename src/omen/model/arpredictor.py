@@ -142,9 +142,10 @@ class ARPredictor(nn.Module):
         self.pos_embed = nn.Embedding(history_size + 1, dim)
 
         # Conditional transformer blocks
-        self.blocks = nn.ModuleList([
+        # Plain list — Nabla has no ModuleList; modules self-register params
+        self.blocks = [
             ConditionalBlock(dim, num_heads) for _ in range(num_layers)
-        ])
+        ]
 
         # Final norm and projection
         self.norm = nn.LayerNorm(dim)

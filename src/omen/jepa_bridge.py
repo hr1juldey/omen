@@ -9,7 +9,7 @@ import os
 import numpy as np
 
 from omen.jepa_inference import JEPAInference
-from omen.jepa_tensor import NABLA_AVAILABLE, to_nabla
+from omen.jepa_tensor import CHECKPOINT_DIR, CHECKPOINT_PATH, NABLA_AVAILABLE, to_nabla
 
 logger = logging.getLogger("omen.jepa_bridge")
 
@@ -21,8 +21,6 @@ except ImportError:
     mi = None
     MITSUBA_AVAILABLE = False
 
-CHECKPOINT_DIR = os.path.expanduser("~/.omen/checkpoints")
-CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "latest.omen")
 CHECKPOINT_SAVE_INTERVAL = 10
 
 
@@ -41,15 +39,15 @@ class JEPABridge(JEPAInference):
             return
 
         self._detect_gpu()
-        self._init_model(model_path)
+        try:
+            self._init_model(model_path)
+        except Exception as exc:
+            logger.error("Model init failed: %s", exc)
+            self.available = False
 
     def _detect_gpu(self):
-        self._is_gpu = (
-            mi is not None
-            and hasattr(mi, "variant")
-            and "_ad_" in mi.variant()
-            and "cuda" in mi.variant()
-        )
+        variant = mi.variant() if mi is not None and hasattr(mi, "variant") else None
+        self._is_gpu = variant is not None and "cuda" in variant
 
     def _init_model(self, model_path: str | None):
         try:

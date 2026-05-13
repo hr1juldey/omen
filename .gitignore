@@ -13,3 +13,4 @@ wheels/
 !.pixi/config.toml
 *.png
 *.exr
+.playwright-mcp

@@ -130,17 +130,17 @@ class RenderFeatureEncoder(nn.Module):
         # conv1: (3, 3, 4, 32) - 4 input channels, 32 output
         self.conv1_filter = F.he_normal((3, 3, 4, 32))
         self.conv1_filter.requires_grad = True
-        self.conv1_bias = nb.zeros(32)
+        self.conv1_bias = nb.zeros((32,))
         self.conv1_bias.requires_grad = True
         # conv2: (3, 3, 32, 64)
         self.conv2_filter = F.he_normal((3, 3, 32, 64))
         self.conv2_filter.requires_grad = True
-        self.conv2_bias = nb.zeros(64)
+        self.conv2_bias = nb.zeros((64,))
         self.conv2_bias.requires_grad = True
         # conv3: (3, 3, 64, 128)
         self.conv3_filter = F.he_normal((3, 3, 64, 128))
         self.conv3_filter.requires_grad = True
-        self.conv3_bias = nb.zeros(128)
+        self.conv3_bias = nb.zeros((128,))
         self.conv3_bias.requires_grad = True
         self.proj = nn.Linear(128, latent_dim)
 

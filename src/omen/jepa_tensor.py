@@ -4,10 +4,14 @@ DLPack zero-copy when both on GPU, numpy fallback for CPU.
 """
 
 import logging
+import os
 
 import numpy as np
 
 logger = logging.getLogger("omen.jepa_tensor")
+
+CHECKPOINT_DIR = os.path.expanduser("~/.omen/checkpoints")
+CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "latest.omen")
 
 try:
     import nabla as nb
