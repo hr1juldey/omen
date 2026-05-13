@@ -477,6 +477,8 @@ def main():
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--gpu", action="store_true", help="Use CUDA GPU (cuda_ad_rgb)")
+    parser.add_argument("--batch-spp", type=int, default=0,
+                        help="SPP per batch (auto for GPU, avoids OOM)")
     args = parser.parse_args()
 
     variant = "cuda_ad_rgb" if args.gpu else "llvm_ad_rgb"
@@ -497,10 +499,33 @@ def main():
         "max_depth": args.max_depth,
     })
 
+    # Auto-batch for GPU: keep each batch under VRAM limit
+    batch_spp = args.batch_spp
+    if batch_spp == 0:
+        batch_spp = 256 if args.gpu else args.spp
+
+    n_batches = max(1, (args.spp + batch_spp - 1) // batch_spp)
     print(f"Rendering {args.width}x{args.height} @ {args.spp} spp "
-          f"({integrator_type}, max_depth={args.max_depth})...")
+          f"({integrator_type}, max_depth={args.max_depth})")
+    if n_batches > 1:
+        print(f"  Batched: {n_batches} x {batch_spp} spp "
+              f"(to avoid VRAM OOM)")
+
     t0 = time.time()
-    image = mi.render(scene, spp=args.spp, integrator=integrator)
+    image = None
+    for i in range(n_batches):
+        spp_this = min(batch_spp, args.spp - i * batch_spp)
+        seed = i * 1000 + 42
+        batch = mi.render(
+            scene, spp=spp_this, integrator=integrator, seed=seed,
+        )
+        if image is None:
+            image = batch
+        else:
+            image = image.array + batch.array
+    # Average accumulated batches
+    if n_batches > 1:
+        image.array = image.array / n_batches
     dt = time.time() - t0
     print(f"Done in {dt:.1f}s ({args.spp / dt:.0f} spp/s)")
 
