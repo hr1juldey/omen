@@ -44,6 +44,7 @@ class OmenSession:
         max_depth: int = 8,
         tier: str = "medium",
         mode: str = "denoise",
+        train: bool = True,
     ) -> NDArray[np.float32]:
         """Full pipeline: sync → build scene → render_denoiser → clean RGBA.
 
@@ -68,7 +69,7 @@ class OmenSession:
             if mode == "denoise":
                 from omen.modes.denoiser import render_denoiser
                 bridge = self._get_bridge()
-                result = render_denoiser(mi_scene, bridge, spp=spp, tier=tier)
+                result = render_denoiser(mi_scene, bridge, spp=spp, tier=tier, train=train)
             elif mode == "adaptive":
                 from omen.modes.adaptive import render_adaptive
                 bridge = self._get_bridge()
@@ -110,3 +111,12 @@ class OmenSession:
         rgba[:, :, :3] = raw[:, :, :3]
         rgba[:, :, 3] = 1.0
         return rgba
+
+    def close(self) -> None:
+        """Save checkpoint before session ends."""
+        if self._bridge is not None and self._bridge.available:
+            self._bridge.save_checkpoint()
+            logger.info("Session checkpoint saved")
+
+    def __del__(self) -> None:
+        self.close()

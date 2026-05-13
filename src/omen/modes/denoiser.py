@@ -58,23 +58,27 @@ def _compute_fingerprints(aux: np.ndarray):
     return compute_tile_fingerprint_gpu(aux)
 
 
-def render_denoiser(scene, bridge, spp: int = 4, tier: str = "medium") -> np.ndarray:
-    """Render and denoise: noisy -> AOV -> fingerprints -> MoE -> clean RGBA.
+def _ssim_gate(denoised: np.ndarray, noisy: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """Return raw noisy if denoised quality degraded below SSIM threshold."""
+    from omen.kernels.ssim_kernel import compute_ssim_gpu
 
-    Args:
-        scene: Mitsuba mi.Scene object
-        bridge: JEPABridge instance
-        spp: samples per pixel (default 4)
-        tier: model tier (fast/medium/high)
+    d_lum = (0.299 * denoised[:, :, 0] + 0.587 * denoised[:, :, 1]
+             + 0.114 * denoised[:, :, 2]).astype(np.float32)
+    n_lum = (0.299 * noisy[:, :, 0] + 0.587 * noisy[:, :, 1]
+             + 0.114 * noisy[:, :, 2]).astype(np.float32)
+    score = compute_ssim_gpu(d_lum, n_lum)
+    if score < threshold:
+        logger.warning("Denoising degraded quality (SSIM=%.3f), returning raw render", score)
+        return noisy
+    return denoised
 
-    Returns:
-        numpy array (H, W, 4) clean RGBA
-    """
+
+def render_denoiser(scene, bridge, spp: int = 4, tier: str = "medium", train: bool = True) -> np.ndarray:
+    """Render noisy -> AOV -> fingerprints -> MoE -> JEPA denoise -> clean RGBA."""
     from omen.model.tier_config import log_tier_config
 
     log_tier_config(tier)
 
-    # Step 1: Render noisy + AOV (fallback to basic render)
     try:
         render_result = _render_with_aov(scene, spp)
     except Exception as exc:
@@ -84,7 +88,6 @@ def render_denoiser(scene, bridge, spp: int = 4, tier: str = "medium") -> np.nda
     raw = np.array(render_result, copy=False)
     height, width = raw.shape[0], raw.shape[1]
 
-    # Step 2: Extract RGB + AOV buffers
     try:
         rgb, aux, aov_dict = _extract_render_and_aux(render_result, height, width)
     except Exception as exc:
@@ -94,12 +97,10 @@ def render_denoiser(scene, bridge, spp: int = 4, tier: str = "medium") -> np.nda
         aux = np.zeros((height, width, 10), dtype=np.float32)
         aov_dict = {}
 
-    # Step 3: Model unavailable -> return raw with alpha
     if not bridge.available:
         logger.info("JEPA unavailable — returning raw %dspp render", spp)
         return _add_alpha(rgb, height, width)
 
-    # Step 4: Compute tile fingerprints for MoE routing
     try:
         fingerprints = _compute_fingerprints(aux)
     except Exception as exc:
@@ -107,7 +108,6 @@ def render_denoiser(scene, bridge, spp: int = 4, tier: str = "medium") -> np.nda
         ny, nx = height // 8, width // 8
         fingerprints = np.zeros((ny, nx, 23), dtype=np.float32)
 
-    # Step 5: Build scene graph with aux + fingerprints
     from omen.scene_extractor import extract_scene_graph
 
     try:
@@ -120,10 +120,14 @@ def render_denoiser(scene, bridge, spp: int = 4, tier: str = "medium") -> np.nda
     scene_graph["aov"] = aov_dict
     scene_graph["fingerprints"] = fingerprints
 
-    # Step 6: Run JEPA denoise
+    if train and bridge.available:
+        from omen.modes.lora_manager import train_on_scene
+
+        train_on_scene(bridge, scene, scene_graph)
+
     rgba = _add_alpha(rgb, height, width)
     clean_rgba = bridge.denoise(scene_graph, rgba, width, height)
-    return clean_rgba
+    return _ssim_gate(clean_rgba, rgba)
 
 
 def _add_alpha(rgb: np.ndarray, height: int, width: int) -> np.ndarray:
