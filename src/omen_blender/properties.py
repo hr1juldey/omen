@@ -1,11 +1,11 @@
 """Omen render engine properties and UI panels.
 
-Defines scene-level settings for Omen: render mode, tier,
-spp, and path to the Omen pixi environment.
+Scene-level settings for Omen: render mode, tier, SPP, tile size.
+No pixi path — engine is loaded in-process via omen_engine package.
 """
 
 import bpy
-from bpy.props import EnumProperty, IntProperty, StringProperty, BoolProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty
 from bpy.types import Panel, PropertyGroup
 
 
@@ -48,11 +48,12 @@ class OmenSettings(PropertyGroup):
         max=64,
     )
 
-    omen_path: StringProperty(
-        name="Omen Project Path",
-        description="Root path of the Omen project (contains pixi.toml)",
-        subtype="DIR_PATH",
-        default="",
+    tile_size: IntProperty(
+        name="Tile Size",
+        description="Render tile size in pixels (0 = no tiling)",
+        default=0,
+        min=0,
+        max=512,
     )
 
     use_gpu: BoolProperty(
@@ -83,7 +84,7 @@ class OMEN_RENDER_PT_settings(Panel):
         layout.prop(omen, "tier")
         layout.prop(omen, "spp")
         layout.prop(omen, "max_depth")
-        layout.prop(omen, "omen_path")
+        layout.prop(omen, "tile_size")
 
 
 class OMEN_RENDER_PT_performance(Panel):
