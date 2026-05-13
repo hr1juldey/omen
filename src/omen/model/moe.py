@@ -64,8 +64,10 @@ class ExpertGroup(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        # Plain list — Nabla has no ModuleList; modules self-register params
-        self.experts = [ExpertFFN(channels) for _ in range(num_experts)]
+        # Nabla has no ModuleList; register each expert as named attribute
+        for i in range(num_experts):
+            setattr(self, f"expert_{i}", ExpertFFN(channels))
+        self.experts = [getattr(self, f"expert_{i}") for i in range(num_experts)]
         # Auxiliary-loss-free load balancing (DeepSeek-V3)
         # Bias adjusted +-0.001 per training step, NO gradient
         self.bias = nb.zeros((num_experts,))
