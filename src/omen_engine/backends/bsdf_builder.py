@@ -1,7 +1,7 @@
 """Material-to-Mitsuba BSDF converter.
 
 Converts material dicts (from depsgraph sync) into Mitsuba BSDF
-objects: roughdiffuse, roughconductor, or emitter.
+objects. Uses Mitsuba 3 plugin names: diffuse, conductor, twosided.
 """
 
 from typing import Any
@@ -14,10 +14,6 @@ def material_to_bsdf(mat: dict[str, Any]) -> Any:
     """
     import mitsuba as mi
 
-    emission = mat.get("emission", [0, 0, 0])
-    if max(emission) > 0.01:
-        return _emitter_bsdf(emission, mi)
-
     metallic = mat.get("metallic", 0.0)
     if metallic > 0.5:
         return _conductor_bsdf(mat, mi)
@@ -25,36 +21,39 @@ def material_to_bsdf(mat: dict[str, Any]) -> Any:
     return _diffuse_bsdf(mat, mi)
 
 
-def _emitter_bsdf(emission: list[float], mi: Any) -> Any:
+def material_is_emissive(mat: dict[str, Any]) -> bool:
+    """Check if material has significant emission."""
+    emission = mat.get("emission", [0, 0, 0])
+    return max(emission) > 0.01
+
+
+def build_emitter(mat: dict[str, Any]) -> Any:
+    """Build an area emitter for emissive materials."""
+    import mitsuba as mi
+    emission = mat.get("emission", [0, 0, 0])
     return mi.load_dict({
-        "type": "two-sided",
-        "material": {
-            "type": "emitter",
-            "radiance": {
-                "type": "srgb",
-                "color": mi.ScalarColor3f(*emission),
-            },
+        "type": "area",
+        "radiance": {
+            "type": "uniform",
+            "value": mi.ScalarColor3f(*emission),
         },
-    })
-
-
-def _conductor_bsdf(mat: dict[str, Any], mi: Any) -> Any:
-    roughness = max(mat.get("roughness", 0.5), 0.01)
-    return mi.load_dict({
-        "type": "roughconductor",
-        "alpha": roughness,
-        "material": "Al",
     })
 
 
 def _diffuse_bsdf(mat: dict[str, Any], mi: Any) -> Any:
     color = mat.get("base_color", [0.8, 0.8, 0.8])
-    roughness = max(mat.get("roughness", 0.5), 0.01)
     return mi.load_dict({
-        "type": "roughdiffuse",
+        "type": "diffuse",
         "reflectance": {
             "type": "srgb",
             "color": mi.ScalarColor3f(*color),
         },
-        "alpha": roughness,
+    })
+
+
+def _conductor_bsdf(mat: dict[str, Any], mi: Any) -> Any:
+    return mi.load_dict({
+        "type": "roughconductor",
+        "alpha": max(mat.get("roughness", 0.5), 0.01),
+        "material": "Al",
     })

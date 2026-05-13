@@ -10,7 +10,11 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from omen_engine.backends.bsdf_builder import material_to_bsdf
+from omen_engine.backends.bsdf_builder import (
+    build_emitter,
+    material_is_emissive,
+    material_to_bsdf,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +83,16 @@ def _build_mesh(
         has_vertex_normals=False,
         has_vertex_texcoords=False,
     )
-    mesh.vertex_positions_buffer()[:] = vertices.ravel()
-    mesh.faces_buffer()[:] = faces.ravel()
-    mi.traverse(mesh).update()
+    params = mi.traverse(mesh)
+    params["vertex_positions"] = mi.Float(vertices.ravel())
+    params["faces"] = mi.UInt(faces.ravel())
+    params.update()
 
     if materials:
-        mesh.set_bsdf(material_to_bsdf(materials[0]))
+        mat = materials[0]
+        mesh.set_bsdf(material_to_bsdf(mat))
+        if material_is_emissive(mat):
+            mesh.add_emitter(build_emitter(mat))
     return mesh
 
 
@@ -111,7 +119,8 @@ def _fallback_quad() -> Any:
     faces = np.array([[0,1,2],[0,2,3]], dtype=np.int32)
     mesh = mi.Mesh("fallback", vertex_count=4, face_count=2,
                    has_vertex_normals=False, has_vertex_texcoords=False)
-    mesh.vertex_positions_buffer()[:] = verts.ravel()
-    mesh.faces_buffer()[:] = faces.ravel()
-    mi.traverse(mesh).update()
+    params = mi.traverse(mesh)
+    params["vertex_positions"] = mi.Float(verts.ravel())
+    params["faces"] = mi.UInt(faces.ravel())
+    params.update()
     return mesh
