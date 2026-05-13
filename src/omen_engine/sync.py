@@ -1,7 +1,7 @@
 """OmenSync — Extract scene data from Blender's depsgraph.
 
-Reads the evaluated depsgraph (handles geometry nodes) and
-produces numpy arrays suitable for any Backend implementation.
+Orchestrates sync of mesh geometry, camera, lights, and materials.
+Lights and materials are delegated to dedicated modules.
 """
 
 import logging
@@ -10,27 +10,29 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from omen_engine.light_sync import extract_lights
+from omen_engine.material_sync import extract_materials
+
 logger = logging.getLogger(__name__)
 
 
 class OmenSync:
     """Synchronises Blender depsgraph to backend-friendly numpy arrays."""
 
-    def sync(
-        self,
-        depsgraph: Any,
-    ) -> dict[str, Any]:
+    def sync(self, depsgraph: Any) -> dict[str, Any]:
         """Full scene sync. Returns dict with vertices, faces,
-        camera, and lights arrays."""
+        camera, lights, and materials."""
         vertices, faces = self._sync_meshes(depsgraph)
         camera = self._sync_camera(depsgraph)
-        lights = self._sync_lights(depsgraph)
+        lights = extract_lights(depsgraph)
+        materials = extract_materials(depsgraph)
 
         return {
             "vertices": vertices,
             "faces": faces,
             **camera,
             "lights": lights,
+            "materials": materials,
         }
 
     def _sync_meshes(
@@ -49,8 +51,10 @@ class OmenSync:
                 continue
 
             mat = np.array(obj.matrix_world, dtype=np.float32)
-            verts = np.array([mat[:3, :3] @ v.co + mat[:3, 3]
-                              for v in mesh.vertices], dtype=np.float32)
+            verts = np.array(
+                [mat[:3, :3] @ v.co + mat[:3, 3] for v in mesh.vertices],
+                dtype=np.float32,
+            )
             face_indices: list[list[int]] = []
             for poly in mesh.polygons:
                 if len(poly.vertices) >= 3:
@@ -68,7 +72,9 @@ class OmenSync:
                 offset += len(verts)
 
         if not all_verts:
-            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32)
+            empty_v = np.zeros((0, 3), dtype=np.float32)
+            empty_f = np.zeros((0, 3), dtype=np.int32)
+            return empty_v, empty_f
 
         return np.concatenate(all_verts), np.concatenate(all_faces)
 
@@ -88,7 +94,9 @@ class OmenSync:
         aspect = scene.render.resolution_x / max(scene.render.resolution_y, 1)
         fov = cam.angle * (180.0 / 3.14159265)
         if aspect > 1.0:
-            fov = 2.0 * np.arctan(np.tan(cam.angle / 2.0) * aspect) * (180.0 / np.pi)
+            fov = 2.0 * np.arctan(
+                np.tan(cam.angle / 2.0) * aspect
+            ) * (180.0 / np.pi)
 
         return {
             "camera_matrix": mat,
@@ -96,46 +104,3 @@ class OmenSync:
             "width": scene.render.resolution_x,
             "height": scene.render.resolution_y,
         }
-
-    def _sync_lights(self, depsgraph: Any) -> list[dict[str, Any]]:
-        lights: list[dict[str, Any]] = []
-        for obj in depsgraph.objects:
-            if obj.type != "LIGHT":
-                continue
-            light = obj.data
-            mat = np.array(obj.matrix_world, dtype=np.float32)
-            pos = mat[:3, 3].tolist()
-            color = list(light.color)
-            energy = light.energy
-
-            if light.type == "POINT":
-                lights.append({
-                    "type": "point", "position": pos,
-                    "color": [c * energy for c in color],
-                })
-            elif light.type == "SUN":
-                direction = (mat[:3, :3] @ np.array([0, 0, -1], dtype=np.float32))
-                lights.append({
-                    "type": "distant",
-                    "direction": direction.tolist(),
-                    "color": [c * energy for c in color],
-                })
-            elif light.type == "AREA":
-                lights.append({
-                    "type": "point", "position": pos,
-                    "color": [c * energy for c in color],
-                })
-            elif light.type == "SPOT":
-                lights.append({
-                    "type": "point", "position": pos,
-                    "color": [c * energy for c in color],
-                })
-
-        if not lights:
-            lights.append({
-                "type": "point", "position": [5, 5, 5],
-                "color": [100, 100, 100],
-            })
-            logger.warning("No lights found, added fallback point light")
-
-        return lights

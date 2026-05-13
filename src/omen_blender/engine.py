@@ -32,48 +32,22 @@ class OmenRenderEngine(bpy.types.RenderEngine):
         width = int(scene.render.resolution_x * scale)
         height = int(scene.render.resolution_y * scale)
 
-        spp = omen.spp
-        max_depth = omen.max_depth
-        tile_size = omen.tile_size
+        pixels = session.render_scene(
+            depsgraph,
+            spp=omen.spp,
+            max_depth=omen.max_depth,
+            tier=omen.tier,
+            mode=omen.mode,
+        )
 
-        if tile_size > 0:
-            self._render_tiled(session, depsgraph, width, height,
-                               spp, max_depth, tile_size)
-        else:
-            self._render_full(session, depsgraph, width, height,
-                              spp, max_depth)
-
-    def _render_full(self, session, depsgraph, w, h, spp, max_depth):
-        pixels = session.render_scene(depsgraph, spp=spp, max_depth=max_depth)
-        result = self.begin_result(0, 0, w, h)
+        result = self.begin_result(0, 0, width, height)
         layer = result.layers[0].passes["Combined"]
-        flat = self._to_rgba(pixels, w, h)
-        layer.rect = flat
+        layer.rect = self._to_rgba(pixels, width, height)
         self.end_result(result)
-
-    def _render_tiled(self, session, depsgraph, w, h, spp, max_depth, ts):
-        y = 0
-        while y < h:
-            x = 0
-            while x < w:
-                tw = min(ts, w - x)
-                th = min(ts, h - y)
-                pixels = session.render_tile(
-                    depsgraph, spp=spp, max_depth=max_depth,
-                    tile_x=x, tile_y=y, tile_w=tw, tile_h=th,
-                )
-                result = self.begin_result(x, y, tw, th)
-                layer = result.layers[0].passes["Combined"]
-                layer.rect = self._to_rgba(pixels, tw, th)
-                self.end_result(result)
-                x += ts
-            y += ts
-            pct = min(100, int(100.0 * y / h))
-            self.update_progress(pct / 100.0)
 
     @staticmethod
     def _to_rgba(pixels, w, h):
-        """Convert (H,W,3) float32 to Blender's (H*W, 4) list-of-tuples."""
+        """Convert (H,W,4) float32 to Blender's (H*W, 4) list-of-tuples."""
         import numpy as np
         arr = np.zeros((h, w, 4), dtype=np.float32)
         arr[:, :, :3] = pixels[:h, :w, :3]
