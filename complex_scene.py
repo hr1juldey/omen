@@ -25,8 +25,6 @@ import time
 
 import mitsuba as mi
 
-mi.set_variant("llvm_ad_rgb")
-
 
 def _tf(translate=None, scale=None, rotate=None):
     """Build a ScalarTransform4f from translate/scale/rotate."""
@@ -478,7 +476,12 @@ def main():
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--no-render", action="store_true")
+    parser.add_argument("--gpu", action="store_true", help="Use CUDA GPU (cuda_ad_rgb)")
     args = parser.parse_args()
+
+    variant = "cuda_ad_rgb" if args.gpu else "llvm_ad_rgb"
+    mi.set_variant(variant)
+    print(f"Variant: {variant}")
 
     fog = args.mode == "volpath"
     print(f"Building scene (fog={fog})...")
