@@ -22,7 +22,7 @@ Usage:
 
 import argparse
 import time
-
+import numpy as np
 import mitsuba as mi
 
 
@@ -43,6 +43,7 @@ def _tf(translate=None, scale=None, rotate=None):
 # Materials
 # ---------------------------------------------------------------------------
 
+
 def _bsdf_diffuse(color=(0.8, 0.8, 0.8)):
     """Lambertian diffuse."""
     return {
@@ -57,8 +58,10 @@ def _bsdf_glass(ior=1.509, roughness=0.0):
         return {"type": "dielectric", "int_ior": ior, "ext_ior": 1.0}
     return {
         "type": "roughdielectric",
-        "int_ior": ior, "ext_ior": 1.0,
-        "alpha": roughness, "distribution": "beckmann",
+        "int_ior": ior,
+        "ext_ior": 1.0,
+        "alpha": roughness,
+        "distribution": "beckmann",
     }
 
 
@@ -68,7 +71,8 @@ def _bsdf_mirror(roughness=0.0):
         return {"type": "conductor", "material": "none"}
     return {
         "type": "roughconductor",
-        "material": "none", "alpha": roughness,
+        "material": "none",
+        "alpha": roughness,
     }
 
 
@@ -76,7 +80,8 @@ def _bsdf_metal(material="Cu", roughness=0.15):
     """Rough conductor — copper, aluminium, gold, etc."""
     return {
         "type": "roughconductor",
-        "material": material, "alpha": roughness,
+        "material": material,
+        "alpha": roughness,
         "distribution": "beckmann",
     }
 
@@ -95,7 +100,9 @@ def _bsdf_roughplastic(color=(0.7, 0.2, 0.15), roughness=0.2, ior=1.5):
     return {
         "type": "roughplastic",
         "diffuse_reflectance": {"type": "rgb", "value": color},
-        "int_ior": ior, "alpha": roughness, "distribution": "beckmann",
+        "int_ior": ior,
+        "alpha": roughness,
+        "distribution": "beckmann",
     }
 
 
@@ -118,7 +125,9 @@ def _bsdf_tile_floor():
             "color0": {"type": "rgb", "value": (0.90, 0.87, 0.80)},
             "color1": {"type": "rgb", "value": (0.70, 0.67, 0.62)},
         },
-        "int_ior": 1.5, "alpha": 0.25, "distribution": "beckmann",
+        "int_ior": 1.5,
+        "alpha": 0.25,
+        "distribution": "beckmann",
     }
 
 
@@ -135,6 +144,7 @@ def _bsdf_null():
 # ---------------------------------------------------------------------------
 # Room geometry (C-shaped interior)
 # ---------------------------------------------------------------------------
+
 
 def _build_room(s):
     """Build a C-shaped room: floor, ceiling, 3 walls + 2 divider walls."""
@@ -209,6 +219,7 @@ def _build_room(s):
 # ---------------------------------------------------------------------------
 # Furniture / objects
 # ---------------------------------------------------------------------------
+
 
 def _build_objects(s):
     """Place furniture and test objects."""
@@ -309,9 +320,7 @@ def _build_objects(s):
         "bsdf": _bsdf_coated_wood(),
     }
     # Desk legs
-    for i, (dx, dy) in enumerate(
-        [(-1.6, -0.6), (-1.6, 0.6), (1.6, -0.6), (1.6, 0.6)]
-    ):
+    for i, (dx, dy) in enumerate([(-1.6, -0.6), (-1.6, 0.6), (1.6, -0.6), (1.6, 0.6)]):
         s[f"desk_leg_{i}"] = {
             "type": "cylinder",
             "p0": mi.ScalarPoint3f(-3.5 + dx, -2 + dy, 0),
@@ -363,6 +372,7 @@ def _build_objects(s):
 # Lights
 # ---------------------------------------------------------------------------
 
+
 def _build_lights(s):
     """Window area light, spot, point, constant env."""
 
@@ -411,6 +421,7 @@ def _build_lights(s):
 # Fog volume
 # ---------------------------------------------------------------------------
 
+
 def _build_fog(s):
     """Thin homogeneous fog filling the room (volpath only)."""
     s["fog_box"] = {
@@ -430,6 +441,7 @@ def _build_fog(s):
 # Camera / sensor
 # ---------------------------------------------------------------------------
 
+
 def _build_sensor(s, w=1280, h=720):
     """Perspective camera looking into the room."""
     s["sensor"] = {
@@ -442,7 +454,8 @@ def _build_sensor(s, w=1280, h=720):
         ),
         "film": {
             "type": "hdrfilm",
-            "width": w, "height": h,
+            "width": w,
+            "height": h,
             "pixel_format": "RGB",
             "component_format": "float32",
         },
@@ -453,6 +466,7 @@ def _build_sensor(s, w=1280, h=720):
 # ---------------------------------------------------------------------------
 # Assemble scene
 # ---------------------------------------------------------------------------
+
 
 def build_scene(w=1280, h=720, fog=False):
     """Build the full scene dict and load it."""
@@ -477,8 +491,12 @@ def main():
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--gpu", action="store_true", help="Use CUDA GPU (cuda_ad_rgb)")
-    parser.add_argument("--batch-spp", type=int, default=0,
-                        help="SPP per batch (auto for GPU, avoids OOM)")
+    parser.add_argument(
+        "--batch-spp",
+        type=int,
+        default=0,
+        help="SPP per batch (auto for GPU, avoids OOM)",
+    )
     args = parser.parse_args()
 
     variant = "cuda_ad_rgb" if args.gpu else "llvm_ad_rgb"
@@ -494,10 +512,12 @@ def main():
         return
 
     integrator_type = "volpath" if fog else "path"
-    integrator = mi.load_dict({
-        "type": integrator_type,
-        "max_depth": args.max_depth,
-    })
+    integrator = mi.load_dict(
+        {
+            "type": integrator_type,
+            "max_depth": args.max_depth,
+        }
+    )
 
     # Auto-batch for GPU: keep each batch under VRAM limit
     batch_spp = args.batch_spp
@@ -505,29 +525,36 @@ def main():
         batch_spp = 256 if args.gpu else args.spp
 
     n_batches = max(1, (args.spp + batch_spp - 1) // batch_spp)
-    print(f"Rendering {args.width}x{args.height} @ {args.spp} spp "
-          f"({integrator_type}, max_depth={args.max_depth})")
+    print(
+        f"Rendering {args.width}x{args.height} @ {args.spp} spp "
+        f"({integrator_type}, max_depth={args.max_depth})"
+    )
     if n_batches > 1:
-        print(f"  Batched: {n_batches} x {batch_spp} spp "
-              f"(to avoid VRAM OOM)")
+        print(f"  Batched: {n_batches} x {batch_spp} spp (to avoid VRAM OOM)")
 
     t0 = time.time()
-    image = None
+    accum = None
     for i in range(n_batches):
         spp_this = min(batch_spp, args.spp - i * batch_spp)
         seed = i * 1000 + 42
         batch = mi.render(
-            scene, spp=spp_this, integrator=integrator, seed=seed,
+            scene,
+            spp=spp_this,
+            integrator=integrator,
+            seed=seed,
         )
-        if image is None:
-            image = batch
+        buf = np.array(batch, copy=False)
+        if accum is None:
+            accum = buf.astype(np.float64)
         else:
-            image = image.array + batch.array
-    # Average accumulated batches
-    if n_batches > 1:
-        image.array = image.array / n_batches
+            accum += buf
+        print(f"  Batch {i + 1}/{n_batches} ({spp_this} spp) done")
+    accum /= n_batches
     dt = time.time() - t0
     print(f"Done in {dt:.1f}s ({args.spp / dt:.0f} spp/s)")
+
+    # Build Bitmap from accumulated numpy array
+    image = mi.Bitmap(accum.astype(np.float32))
 
     out = "complex_scene_output.exr"
     mi.util.write_bitmap(out, image)
