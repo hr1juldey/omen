@@ -8,19 +8,40 @@ Users install from ZIP. Zero terminal. Zero pip. Zero code.
 
 ---
 
-## Proven Viability (2026-05-13)
+## Proven Viability (2026-05-13, verified in isolated uv venvs)
+
+### Mojo .so compilation
 
 | Test | Result |
 |------|--------|
 | `mojo build --emit shared-lib` | Produces 16KB .so (EXIT=0) |
-| Load in Python 3.13 (system) via ctypes | SUCCESS |
-| Load in Python 3.14 (pixi) via ctypes | SUCCESS |
-| Load with `LD_LIBRARY_PATH` set to `modular/lib/` | SUCCESS |
-| Runtime deps | 5 .so files (~58MB) bundled in `modular` pip package |
-| `nabla-ml` requires | `modular` + `numpy` (that's it) |
-| `pip install mojo` / `pip install max` | Works with standard pip (no pixi needed) |
+| Load via ctypes with `LD_LIBRARY_PATH` | SUCCESS |
 
-## Runtime Dependencies (all inside `modular` pip package)
+### Full stack (modular + mojo + nabla + ctypes) — tested one Python version at a time in clean uv venvs
+
+| Python | modular | mojo.importer | nabla | ctypes .so | Status |
+|--------|---------|---------------|-------|------------|--------|
+| 3.11.13 | 26.4.0.dev2026051206 | OK | OK | OK | PASS |
+| 3.12.0  | 26.4.0.dev2026051206 | OK | OK | OK | PASS |
+| 3.13.5  | 26.4.0.dev2026051206 | OK | OK | OK | PASS |
+| 3.14.0b4| 26.4.0.dev2026051206 | OK | OK | OK | PASS |
+
+### System Python: UNTOUCHED (verified after all tests)
+
+### Verified setup recipe (no pixi, no pip, uv only)
+
+```bash
+uv init --python 3.12  # or 3.11/3.13/3.14
+uv add --pre modular --index https://whl.modular.com/nightly/simple/ --prerelease allow
+uv add nabla-ml
+```
+
+### Key finding: nabla requires modular NIGHTLY
+
+Nabla checks for `.dev` in `metadata.version("modular")`. Stable modular (26.2.0) fails.
+Must use `--pre` flag with nightly index. This is why pixi was always used — it defaults to nightly.
+
+## Runtime Dependencies (all inside `modular` nightly pip package)
 
 ```
 libKGENCompilerRTShared.so  628K   Mojo compiler runtime
@@ -28,7 +49,73 @@ libMSupportGlobals.so        46K   Mojo support globals
 libAsyncRTRuntimeGlobals.so 621K   Async runtime
 libAsyncRTMojoBindings.so   1.1M   Async-Mojo bridge
 libNVPTX.so                  56M   GPU kernel support (NVIDIA PTX)
+libMojoLLDB.so                -    Mojo debugger
+libMGPRT.so                   -    GPU runtime
+libmax.so                     -    MAX engine
 ```
+
+All .so files live in `site-packages/modular/lib/`. Set `LD_LIBRARY_PATH` at addon startup.
+
+## Addon vs Engine Split (dev ergonomics)
+
+The addon and engine are SEPARATED so the engine can be iterated without
+reinstalling/restarting the Blender addon.
+
+```
+┌─────────────────────────────────────────────────┐
+│  BLENDER ADDON (installed once, stays put)       │
+│  src/omen_blender/                               │
+│    ├─ __init__.py   ← bl_info, register, LD_PATH │
+│    ├─ engine.py     ← OmenRenderEngine (bpy)     │
+│    ├─ properties.py ← settings UI                │
+│    ├─ panel.py      ← panels                     │
+│    └─ bridge.py     ← talks to engine via import │
+│                                                   │
+│  The addon is THIN. It only:                      │
+│  1. Registers as a Blender render engine          │
+│  2. Syncs depsgraph → numpy arrays                │
+│  3. Calls engine.render() and displays pixels     │
+└─────────────────────────────────────────────────┘
+         │ import omen_engine (reloadable)
+         ↓
+┌─────────────────────────────────────────────────┐
+│  OMEN ENGINE (iterated freely, no addon reinstall)│
+│  src/omen_engine/                                │
+│    ├─ session.py    ← render pipeline orchestrator│
+│    ├─ sync.py       ← depsgraph data extraction  │
+│    ├─ display.py    ← viewport GPU display       │
+│    ├─ backends/     ← pluggable path tracers     │
+│    │   ├─ mitsuba_backend.py                      │
+│    │   └─ ...                                     │
+│    └─ kernels/      ← Mojo .so loading (ctypes)  │
+│                                                   │
+│  Dev workflow: edit engine code → F3 reload script│
+│  No addon reinstall. No Blender restart.          │
+└─────────────────────────────────────────────────┘
+         │ ctypes / nabla
+         ↓
+┌─────────────────────────────────────────────────┐
+│  MOJO/NABLA LAYER (compiled ahead of time)        │
+│  src/omen/kernels/*.mojo → mojo build → .so       │
+│  + modular nightly (runtime .so files)            │
+│  + nabla-ml (@compiler.register GPU kernels)      │
+│                                                   │
+│  This layer is Mojo, not C/C++, by choice.        │
+│  Mojo = GPU-speed + memory-safe + Python-friendly │
+│  If bindings needed, use mojo-python-interop.      │
+└─────────────────────────────────────────────────┘
+```
+
+### Why this split matters
+
+- **Addon** (`src/omen_blender/`): Installed via ZIP into Blender. Rarely changes.
+  Restarting Blender to reload = 30 seconds of pain. Minimize changes here.
+
+- **Engine** (`src/omen_engine/`): The actual rendering logic. Changes constantly during dev.
+  Reloaded via `importlib.reload()` or Blender's F3 "Reload Scripts". No restart needed.
+
+- **Mojo kernels** (`src/omen/kernels/`): Compiled ahead of time with `mojo build`.
+  Changes require recompilation but NOT addon reinstall. Just rebuild the .so and reload.
 
 ## Pluggable Path Tracer Backend
 
@@ -130,15 +217,19 @@ Blender depsgraph
 ## Module Layout
 
 ```
-src/omen_blender/          ← BLENDER ADDON (the product users install)
+src/omen_blender/          ← BLENDER ADDON (thin wrapper, installed once)
   __init__.py               ← bl_info, register/unregister, LD_LIBRARY_PATH
   engine.py                 ← OmenRenderEngine(bpy.types.RenderEngine)
-  sync.py                   ← OmenSync: depsgraph → scene data
-  session.py                ← OmenSession: render pipeline orchestrator
-  display.py                ← Viewport GPU display
+  bridge.py                 ← imports omen_engine, handles reload
   properties.py             ← OmenSettings PropertyGroup
   panel.py                  ← UI panels for render settings
   installer.py              ← Auto-installs bundled wheels on first enable
+
+src/omen_engine/           ← ENGINE (iterated freely, no addon reinstall)
+  __init__.py
+  session.py                ← OmenSession: render pipeline orchestrator
+  sync.py                   ← OmenSync: depsgraph → scene data extraction
+  display.py                ← Viewport GPU display
   backends/                 ← Pluggable path tracer backends
     __init__.py              ← Backend ABC (render, load_scene, etc.)
     mitsuba_backend.py       ← Mitsuba integration (today)
