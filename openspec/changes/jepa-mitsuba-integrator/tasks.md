@@ -223,57 +223,57 @@
 > Spec: `specs/checkpoint-storage/`
 
 - [x] 13.1 Implement save/load via `state_dict()` / `load_state_dict()` + numpy .npz serialization
-- [ ] 13.2 Save optimizer state (AdamW moments m, v) alongside model weights
-- [ ] 13.3 Metadata JSON with architecture hash (e.g., "OmenUNet-C96-5lvl-Swin768-MoE_top2_MLA16_AR-4-16-64-2048"), version validation
-- [ ] 13.4 Topology-based scene hashing for animation cache
-- [ ] 13.5 Base model download on first use (bundled or remote)
-- [ ] 13.6 Scene-specific fine-tuned model cache at `~/.cache/omen/models/scenes/<hash>/`
+- [x] 13.2 Save optimizer state (AdamW moments m, v) alongside model weights
+- [x] 13.3 Metadata JSON with architecture hash (e.g., "OmenUNet-C96-5lvl-Swin768-MoE_top2_MLA16_AR-4-16-64-2048"), version validation
+- [x] 13.4 Topology-based scene hashing for animation cache
+- [x] 13.5 Base model download on first use (bundled or remote)
+- [x] 13.6 Scene-specific fine-tuned model cache at `~/.cache/omen/models/scenes/<hash>/`
 - [x] 13.7 LoRA fine-tuning via Nabla built-in: `init_lora_adapter`, `lora_linear`, `merge_lora_weight`
-- [ ] 13.8 GPU memory management: budget check (700MB inference with MLA, 1.6GB training), CPU fallback
-- [ ] 13.9 Test: Save checkpoint, crash, resume from checkpoint
+- [x] 13.8 GPU memory management: budget check (700MB inference with MLA, 1.6GB training), CPU fallback
+- [x] 13.9 Test: Save checkpoint, crash, resume from checkpoint
 
 ## 14. Temporal Coherence & JEPA World Model
 
 > Spec: `specs/temporal-coherence/`
 
-- [ ] 14.1 Create SceneDeltaEncoder for animation deltas (camera, objects, lights, births, materials)
-- [ ] 14.2 Implement scene delta computation from frame-to-frame scene graph diff
-- [ ] 14.3 Implement surprise detection: MSE z-score > 2 sigma on latent comparison
-- [ ] 14.4 Implement auto-surprise for new scene elements (structural changes in graph)
-- [ ] 14.5 Implement jump cut detection: translation > 1 unit or rotation > 45 deg
-- [ ] 14.6 Implement modes/animation.py: frame 0 anchor, frames 1..N predict from 1spp dirty + history
-- [ ] 14.7 History buffer management: CircularBuffer of size 3, clear on jump cut
-- [ ] 14.8 Total loss: `L_pred + 0.1 * L_energy + 0.09 * L_sigreg` (energy conservation added)
-- [ ] 14.9 Periodic validation: every 5 predicted frames, render 1spp for surprise check
-- [ ] 14.10 Test: Cornell box camera orbit 100 frames, surprise detection, jump cut recovery
+- [x] 14.1 Create SceneDeltaEncoder for animation deltas (camera, objects, lights, births, materials)
+- [x] 14.2 Implement scene delta computation from frame-to-frame scene graph diff
+- [x] 14.3 Implement surprise detection: MSE z-score > 2 sigma on latent comparison
+- [x] 14.4 Implement auto-surprise for new scene elements (structural changes in graph)
+- [x] 14.5 Implement jump cut detection: translation > 1 unit or rotation > 45 deg
+- [x] 14.6 Implement modes/animation.py: frame 0 anchor, frames 1..N predict from 1spp dirty + history
+- [x] 14.7 History buffer management: CircularBuffer of size 3, clear on jump cut
+- [x] 14.8 Total loss: `L_pred + 0.1 * L_energy + 0.09 * L_sigreg` (energy conservation added)
+- [x] 14.9 Periodic validation: every 5 predicted frames, render 1spp for surprise check
+- [x] 14.10 Test: Cornell box camera orbit 100 frames, surprise detection, jump cut recovery
 
 ## 15. Blender Scene Converter
 
 > Spec: `specs/blender-scene-converter/`
 
-- [ ] 15.1 Create `src/omen/converter/` directory
-- [ ] 15.2 Implement `blend_to_mitsuba.py`: load .blend via `bpy` headless, iterate objects, extract geometry/materials/lights/camera
-- [ ] 15.3 Convert Blender Principled BSDF -> mi.PrincipledBSDF (diffuse, roughness, metallic, specular, transmission, clearcoat, sheen)
-- [ ] 15.4 Convert Blender Glass BSDF -> mi.DielectricBSDF, Emission -> mi.AreaLight
-- [ ] 15.5 Convert lights: Point, Area, Sun, Spot -> Mitsuba equivalents
-- [ ] 15.6 Handle texture maps: extract image paths, UV maps, normal maps, environment maps, packed textures
-- [ ] 15.7 Apply modifiers before export (subdivision, mirror, boolean)
-- [ ] 15.8 Handle hair/particles: export as curve primitives
-- [ ] 15.9 Handle volumetrics: smoke, fire, fog -> mi.HomogeneousVolume or mi.GridVolume
+- [x] 15.1 Create `src/omen/converter/` directory
+- [x] 15.2 Implement `blend_to_mitsuba.py`: load .blend via `bpy` headless, iterate objects, extract geometry/materials/lights/camera
+- [x] 15.3 Convert Blender Principled BSDF -> mi.PrincipledBSDF (diffuse, roughness, metallic, specular, transmission, clearcoat, sheen)
+- [x] 15.4 Convert Blender Glass BSDF -> mi.DielectricBSDF, Emission -> mi.AreaLight
+- [x] 15.5 Convert lights: Point, Area, Sun, Spot -> Mitsuba equivalents
+- [x] 15.6 Handle texture maps: extract image paths, UV maps, normal maps, environment maps, packed textures
+- [x] 15.7 Apply modifiers before export (subdivision, mirror, boolean)
+- [x] 15.8 Handle hair/particles: export as curve primitives
+- [x] 15.9 Handle volumetrics: smoke, fire, fog -> mi.HomogeneousVolume or mi.GridVolume
 - [ ] 15.10 Test: Convert a complex Blender scene, verify Mitsuba render matches expected output
 
 ## 16. Production Training Pipeline
 
 > Spec: `specs/training-gym/`
 
-- [ ] 16.1 Verify AD variant: `mi.variant()` must contain `_ad_` (cuda_ad_rgb or llvm_ad_rgb)
-- [ ] 16.2 Implement Dr.Jit training pair generators (4spp noisy + 256spp GT, same seed) with AOV auxiliary passes
-- [ ] 16.3 Implement Nabla PyTorch-style training loop: model.train(), loss.backward(), optimizer.step()
-- [ ] 16.4 Use NablaAdamW(lr=5e-5, weight_decay=1e-3), gradient clip=1.0, BF16 precision
-- [ ] 16.5 Train MLA skip compression end-to-end: W_down and W_up projections learn with U-Net gradients
-- [ ] 16.6 Train MoE tile routing: fingerprint projections learn which tiles belong to which experts
-- [ ] 16.7 MoE load balancing: after each training step, update per-expert bias ±0.001 based on tile routing counts
-- [ ] 16.8 Energy conservation loss: `L_total = L_denoise + 0.1 * L_energy + 0.09 * L_sigreg`
+- [x] 16.1 Verify AD variant: `mi.variant()` must contain `_ad_` (cuda_ad_rgb or llvm_ad_rgb)
+- [x] 16.2 Implement Dr.Jit training pair generators (4spp noisy + 256spp GT, same seed) with AOV auxiliary passes
+- [x] 16.3 Implement Nabla PyTorch-style training loop: model.train(), loss.backward(), optimizer.step()
+- [x] 16.4 Use NablaAdamW(lr=5e-5, weight_decay=1e-3), gradient clip=1.0, BF16 precision
+- [x] 16.5 Train MLA skip compression end-to-end: W_down and W_up projections learn with U-Net gradients
+- [x] 16.6 Train MoE tile routing: fingerprint projections learn which tiles belong to which experts
+- [x] 16.7 MoE load balancing: after each training step, update per-expert bias ±0.001 based on tile routing counts
+- [x] 16.8 Energy conservation loss: `L_total = L_denoise + 0.1 * L_energy + 0.09 * L_sigreg`
 - [ ] 16.9 Train motion experts: generate training pairs with motion blur enabled (animated camera + objects), motion vectors as AOV
 - [ ] 16.10 Train temporal reprojection: supervise warped previous frame blending with ground truth
 - [ ] 16.11 Cornell box bootstrap validation: denoiser(100) -> confidence(100) -> multires(100) -> motion(100) -> temporal(200)
@@ -306,21 +306,21 @@
 
 > Spec: `specs/motion-blur-handling/`
 
-- [ ] 18.1 Create `motion.py` module: motion vector processing + temporal reprojection
-- [ ] 18.2 Implement motion vector reading: extract (H, W, 2) from Blender vector pass or Mitsuba AOV
-- [ ] 18.3 Implement temporal reprojection: `bilinear_warp(prev_clean, motion_vectors)` → reprojected frame aligned to current coordinates
-- [ ] 18.4 Compute motion coherence per pixel: `coherence = 1.0 - clamp(length(motion) / max_velocity, 0, 1)`
-- [ ] 18.5 Compute occlusion mask: detect velocity discontinuity between neighboring pixels
-- [ ] 18.6 Compute reprojection weight: `alpha = prev_confidence × coherence × (1 - occluded)`
-- [ ] 18.7 Merge reprojected + current: `output = alpha * reprojected + (1 - alpha) * current_noisy`
-- [ ] 18.8 Handle first frame: no previous frame → skip reprojection, single-frame denoise
-- [ ] 18.9 Handle jump cut: clear prev frame buffer, disable reprojection
-- [ ] 18.10 Handle missing motion vectors: fill zeros, disable reprojection, log "static denoise mode"
-- [ ] 18.11 Extend tile fingerprint from 17-dim to 23-dim: add velocity_mean(2) + velocity_var(2) + velocity_max(1) + occlusion_frac(1)
-- [ ] 18.12 Implement motion expert routing: Linear(23, 4) on fingerprint → select static/linear/fast/occlusion expert
-- [ ] 18.13 Test: Animated Cornell box (camera orbit) with motion blur, verify temporal reprojection reduces noise vs single-frame
-- [ ] 18.14 Test: Fast-moving object with occlusion, verify no ghosting artifacts in disoccluded regions
-- [ ] 18.15 Test: Motion-blurred scene WITHOUT motion vectors, verify graceful fallback to static mode
+- [x] 18.1 Create `motion.py` module: motion vector processing + temporal reprojection
+- [x] 18.2 Implement motion vector reading: extract (H, W, 2) from Blender vector pass or Mitsuba AOV
+- [x] 18.3 Implement temporal reprojection: `bilinear_warp(prev_clean, motion_vectors)` → reprojected frame aligned to current coordinates
+- [x] 18.4 Compute motion coherence per pixel: `coherence = 1.0 - clamp(length(motion) / max_velocity, 0, 1)`
+- [x] 18.5 Compute occlusion mask: detect velocity discontinuity between neighboring pixels
+- [x] 18.6 Compute reprojection weight: `alpha = prev_confidence × coherence × (1 - occluded)`
+- [x] 18.7 Merge reprojected + current: `output = alpha * reprojected + (1 - alpha) * current_noisy`
+- [x] 18.8 Handle first frame: no previous frame → skip reprojection, single-frame denoise
+- [x] 18.9 Handle jump cut: clear prev frame buffer, disable reprojection
+- [x] 18.10 Handle missing motion vectors: fill zeros, disable reprojection, log "static denoise mode"
+- [x] 18.11 Extend tile fingerprint from 17-dim to 23-dim: add velocity_mean(2) + velocity_var(2) + velocity_max(1) + occlusion_frac(1)
+- [x] 18.12 Implement motion expert routing: Linear(23, 4) on fingerprint → select static/linear/fast/occlusion expert
+- [x] 18.13 Test: Animated Cornell box (camera orbit) with motion blur, verify temporal reprojection reduces noise vs single-frame
+- [x] 18.14 Test: Fast-moving object with occlusion, verify no ghosting artifacts in disoccluded regions
+- [x] 18.15 Test: Motion-blurred scene WITHOUT motion vectors, verify graceful fallback to static mode
 
 ## 19. Performance Optimizations
 
@@ -328,10 +328,10 @@
 
 ### 19a: Async Pipeline (DualPipe)
 
-- [ ] 19a.1 Implement double-buffered render pipeline: Thread 1 = Mitsuba render, Thread 2 = JEPA denoise
-- [ ] 19a.2 Bounded queue (size 2) between render and denoise threads
-- [ ] 19a.3 GPU memory ping-pong: allocate 2× inference buffers for overlapping frames
-- [ ] 19a.4 Only enable async when VRAM > 2× single-frame inference budget, fall back to sequential otherwise
+- [x] 19a.1 Implement double-buffered render pipeline: Thread 1 = Mitsuba render, Thread 2 = JEPA denoise
+- [x] 19a.2 Bounded queue (size 2) between render and denoise threads
+- [x] 19a.3 GPU memory ping-pong: allocate 2× inference buffers for overlapping frames
+- [x] 19a.4 Only enable async when VRAM > 2× single-frame inference budget, fall back to sequential otherwise
 - [ ] 19a.5 Benchmark: measure throughput gain on 100-frame animation sequence (target ~1.8×)
 
 ### 19b: Speculative Multi-Frame Prediction (MTP)
@@ -345,12 +345,12 @@
 
 ### 19c: Scene Latent Caching with Smart Invalidation
 
-- [ ] 19c.1 Create `scene/latent_cache.py`: two-level cache (topology_hash + dynamic_hash)
-- [ ] 19c.2 Implement topology_hash: hash of face connectivity + material TYPES + light TYPES (excludes positions, values)
-- [ ] 19c.3 Implement dynamic_hash: hash of vertex positions + light intensities + material VALUES
-- [ ] 19c.4 Cache strategy: if topology_hash matches cached → incremental update via SceneDeltaEncoder (delta encode ~5ms vs full ~30ms)
-- [ ] 19c.5 Smart invalidation: full re-encode on births, material type changes, vertex count changes, light additions
-- [ ] 19c.6 Small delta path: object moves, light intensity changes, material param values change → delta update only
+- [x] 19c.1 Create `scene/latent_cache.py`: two-level cache (topology_hash + dynamic_hash)
+- [x] 19c.2 Implement topology_hash: hash of face connectivity + material TYPES + light TYPES (excludes positions, values)
+- [x] 19c.3 Implement dynamic_hash: hash of vertex positions + light intensities + material VALUES
+- [x] 19c.4 Cache strategy: if topology_hash matches cached → incremental update via SceneDeltaEncoder (delta encode ~5ms vs full ~30ms)
+- [x] 19c.5 Smart invalidation: full re-encode on births, material type changes, vertex count changes, light additions
+- [x] 19c.6 Small delta path: object moves, light intensity changes, material param values change → delta update only
 - [ ] 19c.7 Test: Static scene, verify latent reused across frames (0ms re-encode after first frame)
 - [ ] 19c.8 Test: Animated object (position changes only), verify delta encode works correctly
 - [ ] 19c.9 Test: New object added mid-animation, verify cache invalidation triggers full re-encode
@@ -387,21 +387,21 @@
 > References: `src/python/render_engine.py`, `src/python/test_pattern.py`
 > Blender source: `source/blender/render/RE_engine.h`, `intern/cycles/blender/`
 
-- [ ] 20.1 Register `OmenRenderEngine(bpy.types.RenderEngine)` with `bl_idname = "OMEN_RENDER"`, `bl_use_eevee_viewport = True`
-- [ ] 20.2 Implement `update_render_passes()` — declare Combined(4), Depth(1), Diffuse Color(3), Specular Color(3), Normal(3), Vector(4), CryptoMaterial(4)
-- [ ] 20.3 Implement `render(depsgraph)` — scene graph extraction → Mitsuba render → JEPA denoise → return result via `self.begin_result()`
-- [ ] 20.4 Implement `view_update()` / `view_draw()` — delegate to EEVEE for viewport preview (bl_use_eevee_viewport = True)
-- [ ] 20.5 Create `OmenProperties(bpy.types.PropertyGroup)` — spp, spp_gt, use_denoiser, model_tier (Fast/Medium/High), model_path, export_motion_vectors, export_cryptomatte
-- [ ] 20.6 Register properties on `bpy.types.Scene.omen_props` via PointerProperty
-- [ ] 20.7 Implement `_extract_scene_graph(depsgraph)` — iterate depsgraph.objects, extract meshes/lights/cameras per-object
-- [ ] 20.8 Implement `_extract_mesh(obj)` — `obj.to_mesh()` → vertices, faces, normals, UVs, material_indices, transform (4x4 matrix_world)
-- [ ] 20.9 Implement `_extract_material(mat)` — read `mat.node_tree` (bNodeTree, NTREE_SHADER) → nodes (bNode) + links (bNodeLink) + input socket values
-- [ ] 20.10 Implement `_extract_light(obj)` — light.type, energy, color, transform
-- [ ] 20.11 Implement `_extract_camera(obj)` — fov, clip_start, clip_end, transform
-- [ ] 20.12 Implement `_get_socket_value(socket)` — extract default values from bNodeSocket (VALUE/RGBA/VECTOR/INT/BOOLEAN types)
-- [ ] 20.13 Implement `_render_mitsuba()` — convert scene graph → Mitsuba scene dict → mi.render() → return pixels
-- [ ] 20.14 Implement `_denoise()` — load JEPA model, stack noisy RGBA + AOV buffers (14ch), forward pass → clean RGBA
-- [ ] 20.15 Create Blender addon `__init__.py` with register()/unregister() functions and panel UI for OmenProperties
+- [x] 20.1 Register `OmenRenderEngine(bpy.types.RenderEngine)` with `bl_idname = "OMEN_RENDER"`, `bl_use_eevee_viewport = True`
+- [x] 20.2 Implement `update_render_passes()` — declare Combined(4), Depth(1), Diffuse Color(3), Specular Color(3), Normal(3), Vector(4), CryptoMaterial(4)
+- [x] 20.3 Implement `render(depsgraph)` — scene graph extraction → Mitsuba render → JEPA denoise → return result via `self.begin_result()`
+- [x] 20.4 Implement `view_update()` / `view_draw()` — delegate to EEVEE for viewport preview (bl_use_eevee_viewport = True)
+- [x] 20.5 Create `OmenProperties(bpy.types.PropertyGroup)` — spp, spp_gt, use_denoiser, model_tier (Fast/Medium/High), model_path, export_motion_vectors, export_cryptomatte
+- [x] 20.6 Register properties on `bpy.types.Scene.omen_props` via PointerProperty
+- [x] 20.7 Implement `_extract_scene_graph(depsgraph)` — iterate depsgraph.objects, extract meshes/lights/cameras per-object
+- [x] 20.8 Implement `_extract_mesh(obj)` — `obj.to_mesh()` → vertices, faces, normals, UVs, material_indices, transform (4x4 matrix_world)
+- [x] 20.9 Implement `_extract_material(mat)` — read `mat.node_tree` (bNodeTree, NTREE_SHADER) → nodes (bNode) + links (bNodeLink) + input socket values
+- [x] 20.10 Implement `_extract_light(obj)` — light.type, energy, color, transform
+- [x] 20.11 Implement `_extract_camera(obj)` — fov, clip_start, clip_end, transform
+- [x] 20.12 Implement `_get_socket_value(socket)` — extract default values from bNodeSocket (VALUE/RGBA/VECTOR/INT/BOOLEAN types)
+- [x] 20.13 Implement `_render_mitsuba()` — convert scene graph → Mitsuba scene dict → mi.render() → return pixels
+- [x] 20.14 Implement `_denoise()` — load JEPA model, stack noisy RGBA + AOV buffers (14ch), forward pass → clean RGBA
+- [x] 20.15 Create Blender addon `__init__.py` with register()/unregister() functions and panel UI for OmenProperties
 - [ ] 20.16 Test: Install addon in Blender, select Omen render engine, render test scene, verify gradient output
 - [ ] 20.17 Test: Open Blender demo file (Classroom), verify scene graph extraction produces correct mesh/material/light/camera counts
 - [ ] 20.18 Test: Toggle AOV passes (motion vectors, cryptomatte on/off), verify passes appear/disappear correctly
