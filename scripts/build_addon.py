@@ -49,6 +49,8 @@ def build_zip(output_path: Path, skip_mojo: bool) -> Path:
     staging = Path(tempfile.mkdtemp(prefix="omen_build_"))
     addon_dir = staging / "omen_blender"
     engine_dir = staging / "omen_engine"
+    addon_dir.mkdir(parents=True, exist_ok=True)
+    engine_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         # Copy addon wrapper
@@ -60,11 +62,6 @@ def build_zip(output_path: Path, skip_mojo: bool) -> Path:
         # Copy engine module
         engine_src = SRC / "omen_engine"
         shutil.copytree(engine_src, engine_dir, dirs_exist_ok=True)
-
-        # Copy __init__.py for omen_engine
-        (addon_dir / "__init__.py").write_text(
-            (addon_src / "__init__.py").read_text()
-        )
 
         # Compile Mojo kernels
         if not skip_mojo:
