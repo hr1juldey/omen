@@ -2,10 +2,10 @@
 
 __version__ = "0.1.0"
 
-# Nabla import guard - graceful degradation if not installed
+# Nabla import guard - graceful degradation if not installed or wrong version
 try:
     import nabla as nb
     NABLA_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     nb = None
     NABLA_AVAILABLE = False

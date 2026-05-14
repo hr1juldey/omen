@@ -1,9 +1,8 @@
-"""OmenConfig core with serialization and validation."""
+"""OmenConfig core with serialization, validation, and factory methods."""
 
 from dataclasses import dataclass, field
 
 from omen.config.switches import ComponentSwitches, ModeSwitches, TrainingSwitches
-from omen.config.presets import v1_dense, v1_moe, v1_animation, full
 
 
 @dataclass
@@ -20,24 +19,43 @@ class OmenConfig:
     modes: ModeSwitches = field(default_factory=ModeSwitches)
     tier: str = "fast"
 
-    # Factory methods (delegated to presets.py)
     @staticmethod
     def v1_dense():
-        return v1_dense()
+        """V1: Dense denoiser, no MoE, no AR, no SIGReg."""
+        return OmenConfig()
 
     @staticmethod
     def v1_moe():
-        return v1_moe()
+        """After V1 validated: unlock MoE with scene-graph routing."""
+        cfg = OmenConfig()
+        cfg.components.moe = True
+        cfg.components.scene_graph_routing = True
+        return cfg
 
     @staticmethod
     def v1_animation():
-        return v1_animation()
+        """After MoE validated: unlock temporal prediction."""
+        cfg = OmenConfig.v1_moe()
+        cfg.components.ar_predictor = True
+        cfg.components.scene_delta_encoder = True
+        cfg.modes.temporal = True
+        return cfg
 
     @staticmethod
     def full():
-        return full()
+        """Everything enabled."""
+        cfg = OmenConfig()
+        cfg.components.moe = True
+        cfg.components.scene_graph_routing = True
+        cfg.components.ar_predictor = True
+        cfg.components.scene_delta_encoder = True
+        cfg.components.sigreg = True
+        cfg.components.simple_var_reg = False
+        cfg.modes.adaptive = True
+        cfg.modes.multires = True
+        cfg.modes.temporal = True
+        return cfg
 
-    # Serialization
     def to_dict(self) -> dict:
         """Serialize config to dictionary for checkpoint saving."""
         from dataclasses import asdict
@@ -56,7 +74,6 @@ class OmenConfig:
             tier=data.get("tier", "fast"),
         )
 
-    # Validation
     def validate(self) -> list[str]:
         """Validate config constraints. Returns list of error messages."""
         errors = []
