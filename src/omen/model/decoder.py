@@ -95,7 +95,7 @@ class Decoder(nn.Module):
         # Bottleneck: gated JEPA latent injection
         gate = nb.sigmoid(self.lat_gate(latent))
         l_feat = gate * self.lat_proj(latent)
-        bn = e4 * l_feat.reshape(latent.shape[0], 1, 1, 256)
+        bn = e4 * nb.reshape(l_feat, (int(latent.shape[0]), 1, 1, 256))
 
         # MLA compress high-res skips (save memory)
         c1 = self.mla1.forward_compress(s1)
@@ -145,4 +145,4 @@ class ConfidenceHead(nn.Module):
         """Predict per-pixel confidence map."""
         conf = self.net(latent)
         conf = conf.expand(conf.shape[0], height * width)
-        return conf.reshape(conf.shape[0], height, width, 1)
+        return nb.reshape(conf, (int(conf.shape[0]), height, width, 1))

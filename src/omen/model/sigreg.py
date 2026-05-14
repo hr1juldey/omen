@@ -43,7 +43,9 @@ def simple_variance_regularization(latent, eps: float = 1e-6):
     """
     if not NABLA_AVAILABLE:
         return 0.0
-    std = latent.std(axis=0)
+    mean = nb.mean(latent, axis=0)
+    var = nb.mean((latent - mean) * (latent - mean), axis=0)
+    std = nb.sqrt(var)
     return -nb.mean(nb.log(std + eps))
 
 

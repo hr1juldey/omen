@@ -45,9 +45,7 @@ class SceneGraphEncoder(nn.Module):
         self.mat_linear = nn.Linear(5, 64)
         # Lights: 7 params per light
         self.light_linear = nn.Linear(7, 64)
-        # Self-attention to aggregate
-        self.self_attn = nn.MultiHeadAttention(d_model=64, num_heads=4)
-        # Project to latent dim
+        # Project to latent dim (mean pooling replaces self-attn for 3 features)
         self.proj = nn.Linear(64, latent_dim)
 
     def forward(self, scene_graph: dict):
@@ -68,14 +66,23 @@ class SceneGraphEncoder(nn.Module):
             faces = geom.get("faces", None)
             if verts is not None:
                 # Compute face centers and normals as features
-                # Simplified: use vertex stats
+                # verts: (batch, num_verts, 3) -> centroid + spread = 6 features
                 if len(verts.shape) >= 2:
-                    face_feats = verts.mean(axis=0)  # centroid
-                    face_feats = face_feats.reshape(1, -1)
-                    # Pad/truncate to 6 features
-                    if face_feats.shape[-1] < 6:
-                        face_feats = nb.pad(face_feats, (0, 6 - face_feats.shape[-1]))
-                    face_feats = face_feats[:, :6]
+                    # Centroid: mean over vertex dim
+                    if len(verts.shape) == 3:
+                        centroid = verts.mean(axis=1)  # (B, 3)
+                        B = int(centroid.shape[0])
+                        D = int(centroid.shape[1])
+                        spread = nb.mean(
+                            (verts - nb.reshape(centroid, (B, 1, D))) ** 2, axis=1
+                        )  # (B, 3) variance per axis
+                        face_feats = nb.concatenate([centroid, spread], axis=-1)
+                    else:
+                        face_feats = nb.reshape(verts, (1, int(verts.shape[-1])))
+                        n = int(face_feats.shape[-1])
+                        if n < 6:
+                            face_feats = nb.pad(face_feats, ((0, 0), (0, 6 - n)))
+                        face_feats = face_feats[:, :6]
                     geom_emb = self.geom_linear(face_feats)
                     features.append(geom_emb)
 
@@ -99,14 +106,10 @@ class SceneGraphEncoder(nn.Module):
             # Empty scene - return zeros
             return nb.zeros((1, self.latent_dim))
 
-        # Concatenate all features
+        # Concatenate all features and mean pool
         all_feats = nb.concatenate(features, axis=0)
-
-        # Self-attention aggregation
-        all_feats = all_feats.reshape(1, *all_feats.shape)
-        attn_out = self.self_attn(all_feats, all_feats, all_feats)
-        # Pool over sequence dimension
-        pooled = attn_out.mean(axis=1)
+        pooled = nb.mean(all_feats, axis=0)
+        pooled = nb.reshape(pooled, (1, int(pooled.shape[0])))
 
         # Project to latent dim
         return self.proj(pooled)
@@ -165,18 +168,19 @@ class RenderFeatureEncoder(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """Fuse render and scene latents via cross-attention.
+    """Fuse render and scene latents via gated addition.
 
-    render_latent = F.scaled_dot_product_attention(render, scene, scene)
+    Replaces cross-attention with a learnable gate (nabla backward compatible).
     """
 
     def __init__(self, latent_dim: int = LATENT_DIM, num_heads: int = NUM_HEADS):
         super().__init__()
-        self.cross_attn = nn.MultiHeadAttention(d_model=latent_dim, num_heads=num_heads)
+        self.latent_dim = latent_dim
+        self.gate = nn.Linear(latent_dim, latent_dim)
         self.norm = nn.LayerNorm(latent_dim)
 
     def forward(self, render_latent: "nb.Tensor", scene_latent: "nb.Tensor"):
-        """Cross-attention fusion.
+        """Gated fusion.
 
         Args:
             render_latent: (batch, latent_dim) from RenderFeatureEncoder
@@ -185,13 +189,7 @@ class CrossAttentionFusion(nn.Module):
         Returns:
             fused: (batch, latent_dim)
         """
-        # Reshape for attention: (batch, 1, dim)
-        r = render_latent.reshape(render_latent.shape[0], 1, -1)
-        s = scene_latent.reshape(scene_latent.shape[0], 1, -1)
-
-        # Cross-attention: render attends to scene
-        attended = self.cross_attn(r, s, s)
-
-        # Residual + norm
-        fused = self.norm(r + attended)
-        return fused.reshape(fused.shape[0], -1)
+        # Learned gate: how much scene info to mix in
+        g = nb.sigmoid(self.gate(render_latent))
+        fused = self.norm(render_latent + g * scene_latent)
+        return fused

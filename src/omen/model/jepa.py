@@ -122,7 +122,7 @@ class OmenJEPA(nn.Module):
             pred_loss = pred_loss + F.mse_loss(predicted_noise, gt_residual)
 
         # Regularization (respects config switches)
-        reg_loss = self.sigreg(predicted_latent, config=cfg)
+        reg_loss = self.sigreg.forward(predicted_latent, config=cfg)
         total = pred_loss + SIGREG_LAMBDA * reg_loss
 
         return total, pred_loss, reg_loss
