@@ -1,7 +1,7 @@
-"""Per-scene LoRA fine-tuning with replay buffer and expert consolidation.
+"""Per-scene LoRA fine-tuning with stratified replay buffer.
 
-Implements sleep-like replay (diverse training pairs interleaved)
-and synaptic-consolidation analog (frozen adapters after convergence).
+Compatibility shim: uses StratifiedReplayBuffer internally while
+exporting the same interface for backward compatibility.
 """
 
 import hashlib
@@ -10,17 +10,22 @@ import os
 import random
 
 from omen.jepa_tensor import CHECKPOINT_DIR
+from omen.modes.replay import StratifiedReplayBuffer
 
 logger = logging.getLogger("omen.modes.lora_manager")
 
 LORA_TRIGGER_COUNT = 3
 LORA_FINETUNE_ITERS = 50
-REPLAY_BUFFER_SIZE = 50
+REPLAY_BUFFER_SIZE = 500
 REPLAY_SAMPLES_PER_STEP = 3
+REPLAY_RATIO = 0.5
 
 _render_counts: dict[str, int] = {}
 _training_cache: dict[str, list] = {}
-_replay_buffer: list[tuple] = []
+_replay_buffer = StratifiedReplayBuffer(
+    max_size=REPLAY_BUFFER_SIZE,
+    replay_ratio=REPLAY_RATIO,
+)
 _consolidated: set[str] = set()
 
 
@@ -32,22 +37,19 @@ def _scene_hash(scene_graph: dict) -> str:
 
 
 def _add_to_replay(shash: str, noisy, gt):
-    """Add training pair to global replay buffer, cap at REPLAY_BUFFER_SIZE."""
-    _replay_buffer.append((shash, noisy, gt))
-    if len(_replay_buffer) > REPLAY_BUFFER_SIZE:
-        _replay_buffer.pop(0)
+    """Add training pair to stratified replay buffer."""
+    _replay_buffer.add(shash, noisy, gt)
 
 
 def _sample_replay(shash: str, count: int) -> list:
     """Sample diverse pairs from OTHER scenes for replay interleaving."""
-    other = [(h, n, g) for h, n, g in _replay_buffer if h != shash]
-    if not other:
-        return []
-    return random.sample(other, min(count, len(other)))
+    samples = _replay_buffer.sample(shash, count)
+    # Return in format expected by legacy code: (shash, noisy, gt)
+    return [(shash, n, g) for n, g in samples]
 
 
 def train_on_scene(bridge, scene, scene_graph: dict):
-    """Train on scene pair with replay buffer and consolidation."""
+    """Train on scene pair with stratified replay buffer and consolidation."""
     from omen.training.data_gen import generate_denoiser_pair
 
     noisy, gt = generate_denoiser_pair(scene, spp_noisy=4, spp_gt=256)

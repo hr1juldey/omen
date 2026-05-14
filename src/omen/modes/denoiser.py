@@ -73,9 +73,48 @@ def _ssim_gate(denoised: np.ndarray, noisy: np.ndarray, threshold: float = 0.5) 
     return denoised
 
 
-def render_denoiser(scene, bridge, spp: int = 4, tier: str = "medium", train: bool = True) -> np.ndarray:
-    """Render noisy -> AOV -> fingerprints -> MoE -> JEPA denoise -> clean RGBA."""
+def render_denoiser(
+    scene,
+    bridge,
+    spp: int = 4,
+    tier: str = "medium",
+    train: bool = True,
+    config=None,
+) -> np.ndarray:
+    """Render noisy -> AOV -> fingerprints -> MoE -> JEPA denoise -> clean RGBA.
+
+    Args:
+        scene: Mitsuba scene
+        bridge: JEPABridge instance
+        spp: samples per pixel for noisy render
+        tier: tier configuration (fast/medium/beast)
+        train: whether to train on this render
+        config: OmenConfig with mode switches (uses default if None)
+
+    Returns:
+        denoised RGBA image
+    """
+    from omen.config import OmenConfig
     from omen.model.tier_config import log_tier_config
+
+    cfg = config or OmenConfig()
+    modes = cfg.modes
+
+    # Check denoiser mode switch
+    if not modes.denoiser:
+        raise RuntimeError("Denoiser mode is disabled. Enable config.modes.denoiser=True.")
+
+    # Adaptive mode check (placeholder - not implemented yet)
+    if modes.adaptive:
+        logger.info("Adaptive mode enabled (not yet implemented)")
+
+    # Multires mode check (placeholder - not implemented yet)
+    if modes.multires:
+        logger.info("Multires mode enabled (not yet implemented)")
+
+    # Temporal mode check (requires ARPredictor)
+    if modes.temporal and not cfg.components.ar_predictor:
+        logger.warning("Temporal mode requires ARPredictor. Enable config.components.ar_predictor=True")
 
     log_tier_config(tier)
 

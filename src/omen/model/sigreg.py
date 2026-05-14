@@ -27,6 +27,23 @@ NUM_PROJECTIONS = 1024
 DOMAIN_MAX = 3.0
 
 
+def simple_variance_regularization(latent, eps: float = 1e-6):
+    """Simple variance regularization: -log(std(latent) + eps).
+
+    3-line alternative to full SIGReg for working system.
+    Prevents latent collapse by penalizing low variance.
+
+    Args:
+        latent: (batch, dim) latent embeddings
+        eps: small constant for numerical stability
+
+    Returns:
+        scalar loss value (higher when variance is low)
+    """
+    std = latent.std(axis=0)
+    return -nb.mean(nb.log(std + eps))
+
+
 class SIGRegLoss(nn.Module):
     """SIGReg regularization loss.
 
@@ -42,18 +59,28 @@ class SIGRegLoss(nn.Module):
         self.num_projections = num_projections
         self.domain_max = domain_max
 
-    def forward(self, embeddings):
-        """Compute SIGReg loss on embeddings.
+    def forward(self, embeddings, config=None):
+        """Compute SIGReg loss on embeddings with config switch.
 
         Args:
             embeddings: (batch, dim) latent embeddings
+            config: OmenConfig with component switches (optional)
 
         Returns:
-            scalar loss value
+            scalar loss value (simple_reg, sigreg, or 0 based on config)
         """
         if not NABLA_AVAILABLE:
             return nb.tensor(0.0)
 
+        # Check config switches
+        if config is not None:
+            c = config.components
+            if c.simple_var_reg:
+                return simple_variance_regularization(embeddings)
+            if not c.sigreg:
+                return nb.tensor(0.0)
+
+        # Full SIGReg (original behavior)
         batch_size, dim = embeddings.shape
 
         # Generate random projections (fixed, not learned)

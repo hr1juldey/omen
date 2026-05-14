@@ -1,0 +1,255 @@
+"""Tile-based Mixture of Experts with dual routing: pixel fingerprint OR scene graph.
+
+8 material + 5 light + 5 geometry + 4 motion + 1 shared = 23 experts.
+Auxiliary-loss-free load balancing via bias vectors.
+
+Routing modes:
+- Pixel fingerprint (default): 23-dim tile fingerprint from aux buffers
+- Scene graph (switch-controlled): material_id + light_type embeddings
+"""
+
+import logging
+
+try:
+    import nabla as nb
+    from nabla import nn
+
+    NABLA_AVAILABLE = True
+except ImportError:
+    NABLA_AVAILABLE = False
+
+from omen.config import OmenConfig
+
+logger = logging.getLogger("omen.model.moe")
+
+FINGERPRINT_DIM = 23
+NUM_MATERIAL_TYPES = 6  # 0-5: diffuse, rough, glossy, glass, metal, emission
+NUM_LIGHT_TYPES = 4  # 0-3: point, area, environment, sun
+SCENE_GRAPH_EMBED_DIM = 64  # per-type embedding dim
+
+# Expert group sizes
+MATERIAL_EXPERTS = 8
+LIGHT_EXPERTS = 5
+GEOMETRY_EXPERTS = 5
+MOTION_EXPERTS = 4
+SHARED_EXPERTS = 1
+TOTAL_EXPERTS = (
+    MATERIAL_EXPERTS
+    + LIGHT_EXPERTS
+    + GEOMETRY_EXPERTS
+    + MOTION_EXPERTS
+    + SHARED_EXPERTS
+)
+
+
+class ExpertFFN(nn.Module):
+    """Single expert: Linear(C, 4C) -> SiLU -> Linear(4C, C)."""
+
+    def __init__(self, channels: int, hidden_mult: int = 4):
+        super().__init__()
+        hidden = channels * hidden_mult
+        self.w1 = nn.Linear(channels, hidden)
+        self.w2 = nn.Linear(hidden, channels)
+
+    def forward(self, x):
+        return self.w2(nb.silu(self.w1(x)))
+
+
+class SharedExpert(nn.Module):
+    """Always-active shared expert (DeepSeekMoE shared expert isolation)."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.ffn = ExpertFFN(channels)
+
+    def forward(self, x):
+        return self.ffn(x)
+
+
+class ExpertGroup(nn.Module):
+    """Group of homogeneous experts with load-balancing bias."""
+
+    def __init__(self, num_experts: int, channels: int, top_k: int = 2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        for i in range(num_experts):
+            setattr(self, f"expert_{i}", ExpertFFN(channels))
+        self.experts = [getattr(self, f"expert_{i}") for i in range(num_experts)]
+        self.bias = nb.zeros((num_experts,))
+
+    def forward(self, x, routing_logits):
+        """Route tokens to top-k experts in this group."""
+        biased_logits = routing_logits + self.bias
+        weights = nb.softmax(biased_logits, axis=-1)
+        top_weights, top_indices = nb.topk(weights, self.top_k, axis=-1)
+        top_weights = top_weights / top_weights.sum(axis=-1, keepdims=True)
+
+        output = nb.zeros_like(x)
+        for k in range(self.top_k):
+            idx = top_indices[:, :, k]
+            w = top_weights[:, :, k : k + 1]
+            for e in range(self.num_experts):
+                mask = (idx == e).astype(x.dtype)
+                expert_out = self.experts[e](x)
+                output = output + mask * w * expert_out
+
+        return output, {"top_weights": top_weights}
+
+    def update_bias(self, step_bias: float = 0.001):
+        """Adjust bias per training step (auxiliary-loss-free balancing)."""
+        counts = nb.zeros((self.num_experts,))
+        self.bias = self.bias + step_bias * (counts.mean() - counts)
+
+
+class TileMoERouter(nn.Module):
+    """Route 8x8 tiles to expert groups via dual routing paths.
+
+    Routing modes (controlled by config.components.scene_graph_routing):
+    - False (default): 23-dim tile fingerprint from aux buffers
+    - True: material_id + light_type embeddings from scene graph
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        top_k: int = 2,
+        config: OmenConfig = None,
+    ):
+        super().__init__()
+        self.config = config or OmenConfig()
+        self.shared = SharedExpert(channels)
+        self.materials = ExpertGroup(MATERIAL_EXPERTS, channels, top_k)
+        self.lights = ExpertGroup(LIGHT_EXPERTS, channels, top_k=1)
+        self.geometry = ExpertGroup(GEOMETRY_EXPERTS, channels, top_k=1)
+        self.motion = ExpertGroup(MOTION_EXPERTS, channels, top_k=1)
+
+        # Pixel fingerprint routing (original path)
+        self.mat_gate = nn.Linear(FINGERPRINT_DIM, MATERIAL_EXPERTS)
+        self.light_gate = nn.Linear(FINGERPRINT_DIM, LIGHT_EXPERTS)
+        self.geo_gate = nn.Linear(FINGERPRINT_DIM, GEOMETRY_EXPERTS)
+        self.motion_gate = nn.Linear(FINGERPRINT_DIM, MOTION_EXPERTS)
+
+        # Scene-graph routing (new path, only created when enabled)
+        if self.config.components.scene_graph_routing:
+            self.mat_embed = nn.Embedding(NUM_MATERIAL_TYPES, SCENE_GRAPH_EMBED_DIM)
+            self.light_embed = nn.Embedding(NUM_LIGHT_TYPES, SCENE_GRAPH_EMBED_DIM)
+            self.route_proj = nn.Linear(
+                SCENE_GRAPH_EMBED_DIM * 2, FINGERPRINT_DIM
+            )
+
+    def _route_from_scene_graph(self, scene_graph, aux):
+        """Build routing logits from material_ids and light_type_ids.
+
+        Args:
+            scene_graph: dict with material_ids (per-face) and lights params
+            aux: auxiliary buffer for downsampling reference
+
+        Returns:
+            routing: (B, H/8, W/8, 23) routing logits
+        """
+        # Extract material_ids and light_type_ids from scene graph
+        # scene_graph.geometry.material_ids: per-face uint32
+        # scene_graph.lights.params: (L, 7) with type_id in column 0
+
+        material_ids = scene_graph.get("geometry", {}).get("material_ids")
+        light_params = scene_graph.get("lights", {}).get("params")
+
+        if material_ids is None or light_params is None:
+            # Fallback to fingerprint routing if scene graph data missing
+            return self._route_from_fingerprints(aux)
+
+        # Get dominant material per 8x8 tile (simplified - would use Mitsuba AOV)
+        # For now, use a heuristic: material mode in scene
+        mat_id = int(nb.mean(material_ids.astype(nb.float32)).to_numpy().item())
+        mat_id = min(mat_id, NUM_MATERIAL_TYPES - 1)
+
+        # Get light type (first light in scene)
+        light_type = int(light_params[0, 0].to_numpy().item()) if light_params.shape[0] > 0 else 0
+        light_type = min(light_type, NUM_LIGHT_TYPES - 1)
+
+        # Embed and project
+        mat_emb = self.mat_embed(nb.tensor([[mat_id]]))  # (1, 1, 64)
+        light_emb = self.light_embed(nb.tensor([[light_type]]))  # (1, 1, 64)
+        combined = nb.concat([mat_emb, light_emb], axis=-1)  # (1, 1, 128)
+        routing_flat = self.route_proj(combined)  # (1, 1, 23)
+
+        # Expand to tile grid shape
+        # aux shape: (B, H, W, C) -> target (B, H/8, W/8, 23)
+        h_tiles = aux.shape[1] // 8
+        w_tiles = aux.shape[2] // 8
+        routing = routing_flat.repeat(aux.shape[0], h_tiles, w_tiles, 1)
+
+        return routing
+
+    def _route_from_fingerprints(self, aux):
+        """Build routing logits from pixel-derived fingerprints (original path).
+
+        Args:
+            aux: (B, H, W, C) auxiliary buffer with fingerprint data
+
+        Returns:
+            routing: (B, H/8, W/8, 23) routing logits
+        """
+        # Extract 23-dim fingerprint from aux buffer
+        # Fingerprint channels: material_hist(8) + normal_var(3) + depth_var(1) +
+        # edge_density(1) + dominant_mat(1) + mean_albedo(3) + velocity_stats(6)
+        fingerprint = aux[:, :, :, :FINGERPRINT_DIM]
+
+        # Downsample to 8x8 tile grid (average pooling)
+        h_tiles = aux.shape[1] // 8
+        w_tiles = aux.shape[2] // 8
+
+        # Simple average pooling over 8x8 tiles
+        fingerprint_tiles = (
+            fingerprint.reshape(aux.shape[0], h_tiles, 8, w_tiles, 8, FINGERPRINT_DIM)
+            .mean(axis=(2, 4))
+        )
+
+        return fingerprint_tiles
+
+    def forward(self, x, aux=None, scene_graph=None):
+        """Route tile tokens through MoE.
+
+        Args:
+            x: (B, N, C) tile token features
+            aux: (B, H, W, C) auxiliary buffer (for fingerprint routing)
+            scene_graph: dict (for scene-graph routing)
+
+        Returns:
+            output: (B, N, C) shared_expert(x) + sum(routed_experts(x))
+        """
+        c = self.config.components
+
+        # Build routing logits based on switch
+        if c.scene_graph_routing and scene_graph is not None:
+            fingerprints = self._route_from_scene_graph(scene_graph, aux or x)
+        else:
+            # Default: use pixel fingerprint routing
+            if aux is not None:
+                fingerprints = self._route_from_fingerprints(aux)
+            else:
+                # Fallback: zero routing (no expert dispatch)
+                fingerprints = nb.zeros((x.shape[0], 1, 1, FINGERPRINT_DIM))
+
+        # Reshape fingerprints to match token count
+        fp_flat = fingerprints.reshape(fingerprints.shape[0], -1, FINGERPRINT_DIM)
+
+        # Route through expert groups
+        result = self.shared(x)
+
+        if c.moe:
+            if c.moe_materials:
+                mat_out, _ = self.materials(x, self.mat_gate(fp_flat))
+                result = result + mat_out
+            if c.moe_lights:
+                light_out, _ = self.lights(x, self.light_gate(fp_flat))
+                result = result + light_out
+            if c.moe_geometry:
+                geo_out, _ = self.geometry(x, self.geo_gate(fp_flat))
+                result = result + geo_out
+            if c.moe_motion:
+                motion_out, _ = self.motion(x, self.motion_gate(fp_flat))
+                result = result + motion_out
+
+        return result
