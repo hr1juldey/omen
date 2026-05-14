@@ -1,0 +1,5 @@
+name: fix-training-wiring
+schema: spec-driven
+created: "2026-05-14"
+status: in-progress
+description: "Fix 8 training wiring bugs (Parts 2+3) with component switch architecture"
