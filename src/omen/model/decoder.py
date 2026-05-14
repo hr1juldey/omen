@@ -15,6 +15,7 @@ try:
 except ImportError:
     NABLA_AVAILABLE = False
 
+from omen.kernels.conv2d import conv2d_safe
 from omen.model.mla_skip import MLASkipPair
 
 logger = logging.getLogger("omen.model.decoder")
@@ -87,10 +88,10 @@ class Decoder(nn.Module):
             residual: (B, H, W, 3) predicted noise map
         """
         # Encoder path
-        s1 = nb.silu(nb.conv2d(noisy_image, self.e1, padding=(1, 1)))
-        s2 = nb.silu(nb.conv2d(s1, self.e2, stride=(2, 2), padding=(1, 1)))
-        s3 = nb.silu(nb.conv2d(s2, self.e3, stride=(2, 2), padding=(1, 1)))
-        e4 = nb.silu(nb.conv2d(s3, self.e4, stride=(2, 2), padding=(1, 1)))
+        s1 = nb.silu(conv2d_safe(noisy_image, self.e1, padding=(1, 1)))
+        s2 = nb.silu(conv2d_safe(s1, self.e2, stride=(2, 2), padding=(1, 1)))
+        s3 = nb.silu(conv2d_safe(s2, self.e3, stride=(2, 2), padding=(1, 1)))
+        e4 = nb.silu(conv2d_safe(s3, self.e4, stride=(2, 2), padding=(1, 1)))
 
         # Bottleneck: gated JEPA latent injection
         gate = nb.sigmoid(self.lat_gate(latent))
@@ -103,21 +104,21 @@ class Decoder(nn.Module):
 
         # Decoder: pixel shuffle up + skip concat + conv
         d4 = _pixel_shuffle(self.up4(bn))
-        d4 = nb.silu(nb.conv2d(
+        d4 = nb.silu(conv2d_safe(
             nb.concatenate([d4, s3], axis=-1), self.d4, padding=(1, 1)))
 
         d3 = _pixel_shuffle(self.up3(d4))
         r2 = self.mla2.forward_reconstruct(c2)
-        d3 = nb.silu(nb.conv2d(
+        d3 = nb.silu(conv2d_safe(
             nb.concatenate([d3, r2], axis=-1), self.d3, padding=(1, 1)))
 
         d2 = _pixel_shuffle(self.up2(d3))
         r1 = self.mla1.forward_reconstruct(c1)
-        d2 = nb.silu(nb.conv2d(
+        d2 = nb.silu(conv2d_safe(
             nb.concatenate([d2, r1], axis=-1), self.d2, padding=(1, 1)))
 
         # Output: 3-channel residual (no activation — noise can be +/-)
-        out = nb.conv2d(d2, self.d1, padding=(1, 1))
+        out = conv2d_safe(d2, self.d1, padding=(1, 1))
 
         # Handle non-divisible resolutions
         H, W = int(noisy_image.shape[1]), int(noisy_image.shape[2])

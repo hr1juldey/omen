@@ -11,6 +11,7 @@ Uses Nabla's call_custom_kernel API with numpy fallbacks.
 """
 
 from omen.kernels.aov_pack import compute_aov_pack_gpu, compute_aov_pack_numpy
+from omen.kernels.conv2d import conv2d_safe
 from omen.kernels.mla_compress import (
     compute_mla_compress_gpu,
     compute_mla_reconstruct_gpu,
@@ -31,6 +32,7 @@ __all__ = [
     "compute_ssim_gpu",
     "compute_ssim_map_gpu",
     "compute_tile_fingerprint_gpu",
+    "conv2d_safe",
     "compute_tile_fingerprint_numpy",
 ]
 

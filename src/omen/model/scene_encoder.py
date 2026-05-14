@@ -20,6 +20,8 @@ try:
 except ImportError:
     NABLA_AVAILABLE = False
 
+from omen.kernels.conv2d import conv2d_safe
+
 logger = logging.getLogger("omen.model.scene_encoder")
 
 LATENT_DIM = 1024
@@ -156,10 +158,10 @@ class RenderFeatureEncoder(nn.Module):
         Returns:
             latent: (batch, latent_dim)
         """
-        # nb.conv2d expects NHWC input, HWIO filter
-        x = nb.silu(nb.conv2d(rgba, self.conv1_filter, stride=2, padding=1, bias=self.conv1_bias))
-        x = nb.silu(nb.conv2d(x, self.conv2_filter, stride=2, padding=1, bias=self.conv2_bias))
-        x = nb.silu(nb.conv2d(x, self.conv3_filter, stride=2, padding=1, bias=self.conv3_bias))
+        # conv2d_safe: NHWC input, HWIO filter
+        x = nb.silu(conv2d_safe(rgba, self.conv1_filter, stride=2, padding=1, bias=self.conv1_bias))
+        x = nb.silu(conv2d_safe(x, self.conv2_filter, stride=2, padding=1, bias=self.conv2_bias))
+        x = nb.silu(conv2d_safe(x, self.conv3_filter, stride=2, padding=1, bias=self.conv3_bias))
 
         # Global average pool over spatial dims (H, W) -> (B, 128)
         x = x.mean(axis=(1, 2))

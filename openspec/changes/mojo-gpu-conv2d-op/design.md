@@ -143,10 +143,9 @@ Render frame N    ──copy──→  Train 1 step on frame N
 - If logging needed: save image to disk. Else: discard and move on.
 - Weekend (48h): ~86K renders × 2 train steps = ~172K training steps
 
-AOV channels (Mitsuba, 10 packed):
-- **Must-have**: albedo (3 ch) + normal (3 ch) + depth (1 ch) = 7 channels — always available
-- **Nice-to-have**: material_id (1 ch) + motion_vectors (2 ch) = 3 channels — zero-filled if unavailable
-- Packed into `(H, W, 10)` aux buffer by existing `aov_pack` Mojo kernel
+AOV channels (pluggable renderer):
+- **Mitsuba (now)**: 10 packed channels via `aov_pack` kernel. Must-have: albedo(3) + normal(3) + depth(1). Nice-to-have: material_id(1) + motion(2), zero-filled if unavailable.
+- **Cycles (future)**: 47+ render passes (diffuse/glossy/transmission/volume × direct/indirect/color, plus denoising albedo/normal/depth/roughness, cryptomatte, position, uv, mist, etc.). `aov_pack` normalizes to same packed format. Conv2d kernels are renderer-agnostic — they see the same 10-ch (or expanded) aux buffer regardless of path tracer backend.
 
 ### 9. Parallelization strategy (no race conditions)
 
