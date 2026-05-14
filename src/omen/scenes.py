@@ -1,11 +1,218 @@
-"""Complex scene generators for Omen testing and demos.
+"""Mitsuba scene builders for Omen JEPA training.
 
-Each scene is a Mitsuba dict designed to stress-test specific JEPA capabilities:
-MoE expert routing (material/light/geometry diversity), MLA skip compression,
-temporal coherence, and motion blur handling.
+Each scene exercises specific MoE expert routing paths and returns
+(mi.Scene, scene_graph) tuples with scene-graph metadata for routing.
+
+Follows the complex_scene.py pattern: mi.ScalarTransform4f, direct dict
+construction, no external assets, no Blender dependency.
 """
 
+from __future__ import annotations
+
 import numpy as np
+
+import mitsuba as mi
+
+mi.set_variant("scalar_rgb")
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure helpers
+# ---------------------------------------------------------------------------
+
+
+def _tf(translate=None, scale=None, rotate=None):
+    """Build a ScalarTransform4f from translate/scale/rotate kwargs."""
+    t = mi.ScalarTransform4f()
+    if translate is not None:
+        t = t @ mi.ScalarTransform4f.translate(translate)
+    if rotate is not None:
+        axis, angle = rotate
+        t = t @ mi.ScalarTransform4f.rotate(axis, angle)
+    if scale is not None:
+        t = t @ mi.ScalarTransform4f.scale(scale)
+    return t
+
+
+def _build_sensor_multi(
+    cameras: list[tuple[str, list, list]],
+    resolution: tuple[int, int] = (1920, 1080),
+    fov: float = 45.0,
+) -> list[tuple[str, dict]]:
+    """Build multiple perspective sensors at configurable positions.
+
+    Args:
+        cameras: list of (name, origin, target) tuples.
+        resolution: (width, height) for the film.
+        fov: field of view in degrees.
+
+    Returns:
+        list of (name, sensor_dict) pairs ready to insert into a scene dict.
+    """
+    sensors = []
+    for name, origin, target in cameras:
+        transform = mi.ScalarTransform4f.look_at(
+            origin=origin, target=target, up=[0, 1, 0]
+        )
+        sensor = {
+            "type": "perspective",
+            "fov": fov,
+            "fov_axis": "x",
+            "to_world": transform,
+            "film": {
+                "type": "hdrfilm",
+                "width": resolution[0],
+                "height": resolution[1],
+                "pixel_format": "rgba",
+                "component_format": "float32",
+            },
+            "sampler": {"type": "independent"},
+        }
+        sensors.append((name, sensor))
+    return sensors
+
+
+def _build_scene_graph(
+    vertices: np.ndarray,
+    faces: int,
+    materials: list[tuple[str, np.ndarray]],
+    lights: list[tuple[str, np.ndarray]],
+) -> dict:
+    """Build scene_graph metadata dict for SceneGraphEncoder.
+
+    Expected feature dimensions (see scene_encoder.py):
+        geom_linear: 6 features  — (face_count, bbox_min_xyz, bbox_max_xyz) → pad/truncate to 6
+        mat_linear:  5 features  — material parameters (albedo_rgb, roughness, metallic)
+        light_linear: 7 features — (position_xyz, color_rgb, intensity)
+
+    Args:
+        vertices: (N, 3) vertex positions.
+        faces: total face count.
+        materials: list of (type_str, 5-element param array).
+        lights: list of (type_str, 7-element param array).
+
+    Returns:
+        dict with geometry/materials/lights keys.
+    """
+    # Encode geometry: pack (face_count, bbox_min, bbox_max) → pad to 6
+    bbox_min = vertices.min(axis=0) if len(vertices) > 0 else np.zeros(3)
+    bbox_max = vertices.max(axis=0) if len(vertices) > 0 else np.zeros(3)
+    geom_feat = np.concatenate([[faces], bbox_min, bbox_max]).astype(np.float32)[:6]
+    if geom_feat.shape[0] < 6:
+        geom_feat = np.pad(geom_feat, (0, 6 - geom_feat.shape[0]))
+
+    if not materials:
+        mat_params = np.zeros((1, 5), dtype=np.float32)
+        mat_types = ["diffuse"]
+    else:
+        mat_params = np.stack([m[1] for m in materials]).astype(np.float32)
+        mat_types = [m[0] for m in materials]
+
+    if not lights:
+        light_params = np.zeros((1, 7), dtype=np.float32)
+        light_types = ["area"]
+    else:
+        light_params = np.stack([l[1] for l in lights]).astype(np.float32)
+        light_types = [l[0] for l in lights]
+
+    return {
+        "geometry": {
+            "vertices": np.asarray(vertices, dtype=np.float32).reshape(-1, 3),
+            "faces": faces,
+            "features": geom_feat,
+        },
+        "materials": {
+            "params": mat_params,
+            "types": mat_types,
+        },
+        "lights": {
+            "params": light_params,
+            "types": light_types,
+        },
+    }
+
+
+class SceneAnimation:
+    """Animate a base Mitsuba scene dict across frames.
+
+    Supports 4 animation channels: camera, mesh, material, light.
+    Each channel is a dict mapping object names to per-frame parameter lists.
+    Per-frame dicts are generated by interpolating from the base scene.
+
+    Example::
+
+        anim = SceneAnimation(base_scene, n_frames=10, channels={
+            "camera": {
+                "sensor": {"origin": [[0,1,4], [0,1,2]], "target": [[0,1,0]]*2},
+            },
+        })
+        for frame_dict in anim:
+            mi.load_dict(frame_dict)
+    """
+
+    def __init__(
+        self,
+        base_scene: dict,
+        n_frames: int = 10,
+        channels: dict | None = None,
+    ):
+        self.base = base_scene
+        self.n_frames = n_frames
+        self.channels = channels or {}
+
+    def __len__(self) -> int:
+        return self.n_frames
+
+    def __iter__(self):
+        for i in range(self.n_frames):
+            yield self.frame(i)
+
+    def frame(self, idx: int) -> dict:
+        """Return a deep-copied scene dict with animated parameters at frame *idx*."""
+        import copy
+
+        scene = copy.deepcopy(self.base)
+        t = idx / max(self.n_frames - 1, 1)  # normalised 0..1
+
+        for channel_name, objects in self.channels.items():
+            for obj_name, params in objects.items():
+                if obj_name not in scene:
+                    continue
+                for param_name, values in params.items():
+                    if len(values) < 2:
+                        continue
+                    # Linear interpolation between first and last value
+                    v0 = np.asarray(values[0], dtype=np.float64)
+                    v1 = np.asarray(values[-1], dtype=np.float64)
+                    interpolated = v0 + t * (v1 - v0)
+
+                    if channel_name == "camera":
+                        if "to_world" in scene[obj_name]:
+                            origin = interpolated.tolist() if param_name == "origin" else None
+                            target_val = None
+                            if param_name == "target":
+                                target_val = interpolated.tolist()
+                            if origin is not None or target_val is not None:
+                                cur_origin = scene[obj_name].get("_origin", [0, 1, 5])
+                                cur_target = scene[obj_name].get("_target", [0, 0, 0])
+                                if origin is not None:
+                                    cur_origin = origin
+                                if target_val is not None:
+                                    cur_target = target_val
+                                scene[obj_name]["_origin"] = cur_origin
+                                scene[obj_name]["_target"] = cur_target
+                                scene[obj_name]["to_world"] = mi.ScalarTransform4f.look_at(
+                                    origin=cur_origin, target=cur_target, up=[0, 1, 0]
+                                )
+                    else:
+                        # Mesh / material / light: direct parameter update
+                        scene[obj_name][param_name] = interpolated.tolist()
+
+        return scene
+
+
+# Scene registry — populated by each build_*() function below.
+SCENE_REGISTRY: dict[str, callable] = {}
 
 
 def create_e_shaped_room(width: float = 10.0, height: float = 3.0) -> dict:
@@ -193,3 +400,920 @@ def _default_sensor(origin, target):
                  "pixel_format": "rgba", "component_format": "float32"},
         "sampler": {"type": "independent"},
     }
+
+
+# ===========================================================================
+# Scene Builders — new (mi.Scene, scene_graph) API
+# ===========================================================================
+
+
+def _diffuse_bsdf(color: list[float]) -> dict:
+    return {"type": "diffuse", "reflectance": {"type": "rgb", "value": color}}
+
+
+def _rect_wall(
+    width: float, height: float, pos: list[float], color: list[float],
+    orientation: str = "z",
+) -> dict:
+    """Vertical rectangle (wall) using _tf() — the complex_scene.py pattern."""
+    if orientation == "x":
+        # Wall faces along X axis: rotate 90° around Y
+        t = _tf(translate=pos, rotate=([0, 1, 0], 90), scale=[width, height, 1])
+    elif orientation == "z":
+        # Wall faces along Z axis: no rotation needed, but rectangle default faces +Y
+        t = _tf(translate=pos, rotate=([1, 0, 0], -90), scale=[width, height, 1])
+    else:
+        t = _tf(translate=pos, scale=[width, height, 1])
+    return {
+        "type": "rectangle",
+        "to_world": t,
+        "bsdf": _diffuse_bsdf(color),
+    }
+
+
+def build_cornell_box(resolution: tuple[int, int] = (1920, 1080)) -> tuple:
+    """Classic Cornell Box — GI color-bleeding stress test.
+
+    Red left wall, green right wall, white floor/ceiling/back.
+    Two diffuse boxes on floor. Area light on ceiling.
+
+    Returns (mi.Scene, scene_graph) tuple.
+
+    Exercises: diffuse expert, geometry expert, area-light expert.
+    """
+    # Box dimensions (classic Cornell: 5.5m cube centred at origin)
+    W, H, D = 5.5, 5.5, 5.5
+
+    # Colours
+    red = [0.63, 0.065, 0.05]
+    green = [0.14, 0.45, 0.091]
+    white = [0.725, 0.71, 0.68]
+    light_color = [0.8, 0.8, 0.8]
+
+    scene_dict: dict = {"type": "scene"}
+    scene_dict["integrator"] = {"type": "path", "max_depth": 8}
+
+    # --- 6 walls (tasks 2.1) ---
+    scene_dict["floor"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, 0, 0], scale=[W, D, 1]),
+        "bsdf": _diffuse_bsdf(white),
+    }
+    scene_dict["ceiling"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, H, 0], rotate=([1, 0, 0], 90), scale=[W, D, 1]),
+        "bsdf": _diffuse_bsdf(white),
+    }
+    scene_dict["back_wall"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, H / 2, -D / 2], scale=[W, H, 1]),
+        "bsdf": _diffuse_bsdf(white),
+    }
+    scene_dict["left_wall"] = {
+        "type": "rectangle",
+        "to_world": _tf(
+            translate=[-W / 2, H / 2, 0],
+            rotate=([0, 1, 0], 90),
+            scale=[D, H, 1],
+        ),
+        "bsdf": _diffuse_bsdf(red),
+    }
+    scene_dict["right_wall"] = {
+        "type": "rectangle",
+        "to_world": _tf(
+            translate=[W / 2, H / 2, 0],
+            rotate=([0, 1, 0], -90),
+            scale=[D, H, 1],
+        ),
+        "bsdf": _diffuse_bsdf(green),
+    }
+
+    # --- Tall box (task 2.1) ---
+    tall_w, tall_h, tall_d = 1.05, 2.4, 1.2
+    scene_dict["tall_box"] = {
+        "type": "cube",
+        "to_world": _tf(
+            translate=[-0.65, tall_h / 2, -0.65],
+            scale=[tall_w, tall_h, tall_d],
+        ),
+        "bsdf": _diffuse_bsdf(white),
+    }
+
+    # --- Short box (task 2.1) ---
+    short_w, short_h, short_d = 1.2, 1.0, 1.05
+    scene_dict["short_box"] = {
+        "type": "cube",
+        "to_world": _tf(
+            translate=[0.7, short_h / 2, 0.5],
+            rotate=([0, 1, 0], -18),
+            scale=[short_w, short_h, short_d],
+        ),
+        "bsdf": _diffuse_bsdf(white),
+    }
+
+    # --- Area light on ceiling (task 2.2) ---
+    light_w, light_h = 1.3, 1.05
+    scene_dict["ceiling_light"] = {
+        "type": "rectangle",
+        "to_world": _tf(
+            translate=[0, H - 0.01, 0],
+            rotate=([1, 0, 0], 90),
+            scale=[light_w, light_h, 1],
+        ),
+        "emitter": {"type": "area", "radiance": {"type": "rgb", "value": light_color}},
+        "bsdf": {"type": "diffuse", "reflectance": {"type": "rgb", "value": [0.0, 0.0, 0.0]}},
+    }
+
+    # --- 5 Cameras (task 2.3) ---
+    cx, cy, cz = 0, H / 2, 0  # scene centre
+    cameras = [
+        ("front", [0, cy, D * 0.9], [cx, cy, cz]),
+        ("left_45", [-D * 0.6, cy, D * 0.6], [cx, cy, cz]),
+        ("right_45", [D * 0.6, cy, D * 0.6], [cx, cy, cz]),
+        ("top_down", [0, H * 0.95, 0.1], [cx, 0, cz]),
+        ("closeup", [-0.3, tall_h + 0.3, 0.3], [-0.65, tall_h * 0.6, -0.65]),
+    ]
+    sensors = _build_sensor_multi(cameras, resolution=resolution)
+    for name, sensor in sensors:
+        scene_dict[f"sensor_{name}"] = sensor
+    scene_dict["sensor"] = sensors[0][1]  # default = front
+
+    # Load scene
+    scene = mi.load_dict(scene_dict)
+
+    # --- Scene graph metadata (task 2.4) ---
+    # Vertices: approximate corner positions for walls + boxes
+    hw, hd = W / 2, D / 2
+    verts = np.array([
+        # Floor corners
+        [-hw, 0, -hd], [hw, 0, -hd], [hw, 0, hd], [-hw, 0, hd],
+        # Ceiling corners
+        [-hw, H, -hd], [hw, H, -hd], [hw, H, hd], [-hw, H, hd],
+        # Tall box (approximate 8 corners)
+        [-0.65 - tall_w / 2, 0, -0.65 - tall_d / 2],
+        [-0.65 + tall_w / 2, tall_h, -0.65 + tall_d / 2],
+        # Short box (approximate)
+        [0.7 - short_w / 2, 0, 0.5 - short_d / 2],
+        [0.7 + short_w / 2, short_h, 0.5 + short_d / 2],
+    ], dtype=np.float32)
+
+    # Materials: (type, 5-params) — [r, g, b, roughness, metallic]
+    materials = [
+        ("diffuse", np.array([0.63, 0.065, 0.05, 1.0, 0.0])),   # red wall
+        ("diffuse", np.array([0.14, 0.45, 0.091, 1.0, 0.0])),   # green wall
+        ("diffuse", np.array([0.725, 0.71, 0.68, 1.0, 0.0])),   # white
+    ]
+
+    # Lights: (type, 7-params) — [px, py, pz, r, g, b, intensity]
+    lights = [
+        ("area", np.array([0, H, 0, 0.8, 0.8, 0.8, 17.0])),
+    ]
+
+    scene_graph = _build_scene_graph(
+        vertices=verts,
+        faces=12,  # 6 walls + 2 boxes × 6 faces (cube) — but rectangle = 2 tris each
+        materials=materials,
+        lights=lights,
+    )
+
+    return scene, scene_graph
+
+
+def _cornell_camera_orbit(n_frames: int = 12) -> list[tuple[str, list, list]]:
+    """Generate camera positions for an orbit around the Cornell Box."""
+    import math
+
+    H = 5.5
+    cx, cy, cz = 0, H / 2, 0
+    radius = 7.0
+    cameras = []
+    for i in range(n_frames):
+        angle = 2 * math.pi * i / n_frames
+        origin = [cx + radius * math.sin(angle), cy, cz + radius * math.cos(angle)]
+        cameras.append((f"orbit_{i:03d}", origin, [cx, cy, cz]))
+    return cameras
+
+
+def cornell_animations(
+    base_resolution: tuple[int, int] = (1920, 1080),
+) -> dict:
+    """Pre-built animation generators for the Cornell Box.
+
+    Returns dict mapping animation name → generator of mi.Scene objects.
+    Each generator yields one mi.Scene per frame.
+    """
+    import types as _types  # noqa: F811 — avoid clash if needed
+
+    W, H, D = 5.5, 5.5, 5.5
+    white = [0.725, 0.71, 0.68]
+    red = [0.63, 0.065, 0.05]
+    green = [0.14, 0.45, 0.091]
+
+    def _base(walls: bool = True, boxes: bool = True,
+              left_color=red, right_color=green,
+              light_radiance=[0.8, 0.8, 0.8]) -> dict:
+        """Build a fresh Cornell Box scene dict (no Mitsuba objects reused)."""
+        d: dict = {"type": "scene", "integrator": {"type": "path", "max_depth": 8}}
+        d["floor"] = {"type": "rectangle", "to_world": _tf(translate=[0, 0, 0], scale=[W, D, 1]), "bsdf": _diffuse_bsdf(white)}
+        d["ceiling"] = {"type": "rectangle", "to_world": _tf(translate=[0, H, 0], rotate=([1, 0, 0], 90), scale=[W, D, 1]), "bsdf": _diffuse_bsdf(white)}
+        d["back_wall"] = {"type": "rectangle", "to_world": _tf(translate=[0, H / 2, -D / 2], scale=[W, H, 1]), "bsdf": _diffuse_bsdf(white)}
+        if walls:
+            d["left_wall"] = {"type": "rectangle", "to_world": _tf(translate=[-W / 2, H / 2, 0], rotate=([0, 1, 0], 90), scale=[D, H, 1]), "bsdf": _diffuse_bsdf(left_color)}
+            d["right_wall"] = {"type": "rectangle", "to_world": _tf(translate=[W / 2, H / 2, 0], rotate=([0, 1, 0], -90), scale=[D, H, 1]), "bsdf": _diffuse_bsdf(right_color)}
+        if boxes:
+            d["tall_box"] = {"type": "cube", "to_world": _tf(translate=[-0.65, 1.2, -0.65], rotate=([0, 1, 0], -18), scale=[1.05, 2.4, 1.2]), "bsdf": _diffuse_bsdf(white)}
+            d["short_box"] = {"type": "cube", "to_world": _tf(translate=[0.7, 0.5, 0.5], scale=[1.2, 1.0, 1.05]), "bsdf": _diffuse_bsdf(white)}
+        d["ceiling_light"] = {
+            "type": "rectangle",
+            "to_world": _tf(translate=[0, H - 0.01, 0], rotate=([1, 0, 0], 90), scale=[1.3, 1.05, 1]),
+            "emitter": {"type": "area", "radiance": {"type": "rgb", "value": light_radiance}},
+            "bsdf": _diffuse_bsdf([0, 0, 0]),
+        }
+        return d
+
+    orbit_cams = _cornell_camera_orbit(12)
+    sensors = _build_sensor_multi(orbit_cams, resolution=base_resolution)
+    default_sensor = sensors[0][1]
+
+    # --- 2.5 Camera orbit (12 frames) ---
+    def _orbit_frames():
+        for _, sensor in sensors:
+            d = _base()
+            d["sensor"] = sensor
+            yield mi.load_dict(d)
+
+    # --- 2.6 Mesh animation (8 frames: rotate tall box, translate short box) ---
+    def _mesh_frames():
+        for i in range(8):
+            d = _base(boxes=False)
+            angle = -18 + (90 * i / 7)
+            short_z = 0.5 + 1.5 * i / 7
+            d["tall_box"] = {"type": "cube", "to_world": _tf(translate=[-0.65, 1.2, -0.65], rotate=([0, 1, 0], angle), scale=[1.05, 2.4, 1.2]), "bsdf": _diffuse_bsdf(white)}
+            d["short_box"] = {"type": "cube", "to_world": _tf(translate=[0.7, 0.5, short_z], scale=[1.2, 1.0, 1.05]), "bsdf": _diffuse_bsdf(white)}
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # --- 2.7 Material animation (6 frames: red→orange, green→teal) ---
+    def _material_frames():
+        for i in range(6):
+            t = i / 5
+            r = [0.63 + 0.17 * t, 0.065 + 0.135 * t, 0.05]
+            g = [0.14 + 0.16 * t, 0.45, 0.091 + 0.109 * t]
+            d = _base(left_color=r, right_color=g)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # --- 2.8 Light animation (8 frames: dim + warm shift) ---
+    def _light_frames():
+        for i in range(8):
+            t = i / 7
+            s = 1.0 - 0.5 * t
+            lr = [0.8 * s, 0.8 * s * (1 - 0.15 * t), 0.8 * s * (1 - 0.3 * t)]
+            d = _base(light_radiance=lr)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    return {
+        "camera_orbit": _orbit_frames(),
+        "mesh": _mesh_frames(),
+        "material": _material_frames(),
+        "light": _light_frames(),
+    }
+
+
+# ===========================================================================
+# 3. Veach Ajar Door — MIS stress test, dielectric+conductor+diffuse, 3 lights
+# ===========================================================================
+
+
+def build_veach_ajar(resolution: tuple[int, int] = (1920, 1080)) -> tuple:
+    """Veach Ajar Door — MIS/bidirectional stress test.
+
+    Dark room with slightly open door. Glass sphere (dielectric),
+    metal sphere (conductor Au), matte sphere (diffuse).
+    3 light sources: point, spot, area.
+
+    Returns (mi.Scene, scene_graph) tuple.
+
+    Exercises: dielectric expert, conductor expert, all light experts.
+    """
+    scene_dict: dict = {"type": "scene"}
+    scene_dict["integrator"] = {"type": "path", "max_depth": 12}
+
+    # Dark room 6×4×6
+    W, H, D = 6.0, 4.0, 6.0
+    black = [0.05, 0.05, 0.05]
+    dark = [0.15, 0.15, 0.15]
+
+    # Walls
+    scene_dict["floor"] = {"type": "rectangle", "to_world": _tf(translate=[0, 0, 0], scale=[W, D, 1]), "bsdf": _diffuse_bsdf(dark)}
+    scene_dict["ceiling"] = {"type": "rectangle", "to_world": _tf(translate=[0, H, 0], rotate=([1, 0, 0], 90), scale=[W, D, 1]), "bsdf": _diffuse_bsdf(black)}
+    scene_dict["back_wall"] = {"type": "rectangle", "to_world": _tf(translate=[0, H / 2, -D / 2], scale=[W, H, 1]), "bsdf": _diffuse_bsdf(black)}
+    scene_dict["left_wall"] = {"type": "rectangle", "to_world": _tf(translate=[-W / 2, H / 2, 0], rotate=([0, 1, 0], 90), scale=[D, H, 1]), "bsdf": _diffuse_bsdf(black)}
+    scene_dict["right_wall"] = {"type": "rectangle", "to_world": _tf(translate=[W / 2, H / 2, 0], rotate=([0, 1, 0], -90), scale=[D, H, 1]), "bsdf": _diffuse_bsdf(black)}
+
+    # Front wall with door gap — two rectangles with a gap between them
+    gap_y = 2.8  # top of door
+    gap_w = 1.0  # door width (centred)
+    scene_dict["front_wall_top"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, (H + gap_y) / 2, D / 2], scale=[W, H - gap_y, 1]),
+        "bsdf": _diffuse_bsdf(black),
+    }
+    scene_dict["front_wall_left"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[-(W + gap_w) / 4, gap_y / 2, D / 2], scale=[(W - gap_w) / 2, gap_y, 1]),
+        "bsdf": _diffuse_bsdf(black),
+    }
+    scene_dict["front_wall_right"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[(W + gap_w) / 4, gap_y / 2, D / 2], scale=[(W - gap_w) / 2, gap_y, 1]),
+        "bsdf": _diffuse_bsdf(black),
+    }
+
+    # Glass sphere (dielectric)
+    scene_dict["glass_sphere"] = {
+        "type": "sphere",
+        "center": [-1.0, 0.6, -1.0],
+        "radius": 0.6,
+        "bsdf": {"type": "dielectric", "int_ior": 1.5, "ext_ior": 1.0},
+    }
+
+    # Metal sphere (conductor Au)
+    scene_dict["metal_sphere"] = {
+        "type": "sphere",
+        "center": [1.0, 0.5, -0.5],
+        "radius": 0.5,
+        "bsdf": {"type": "roughconductor", "material": "Au", "alpha": 0.02},
+    }
+
+    # Matte sphere (diffuse)
+    scene_dict["matte_sphere"] = {
+        "type": "sphere",
+        "center": [0.0, 0.4, 0.5],
+        "radius": 0.4,
+        "bsdf": _diffuse_bsdf([0.8, 0.8, 0.8]),
+    }
+
+    # 3 lights
+    scene_dict["point_light"] = {
+        "type": "point",
+        "position": [0.0, 3.5, D / 2 + 0.5],  # just outside door
+        "intensity": {"type": "rgb", "value": [30.0, 25.0, 18.0]},
+    }
+    scene_dict["spot_light"] = {
+        "type": "spot",
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0.0, H - 0.1, -1.0], target=[0.0, 0.0, -1.0], up=[0, 0, 1]
+        ),
+        "cutoff_angle": 25,
+        "beam_width": 15,
+        "intensity": {"type": "rgb", "value": [15.0, 15.0, 20.0]},
+    }
+    scene_dict["area_light"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0.0, H - 0.01, -2.5], rotate=([1, 0, 0], 90), scale=[1.5, 1.0, 1]),
+        "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [3.0, 3.0, 4.0]}},
+        "bsdf": _diffuse_bsdf([0, 0, 0]),
+    }
+
+    # 5 Cameras
+    cameras = [
+        ("through_door", [0, 2.0, D / 2 + 1.5], [0, 1.5, -1]),
+        ("side_view", [W / 2 - 0.3, 2.0, 0], [0, 1.5, -1]),
+        ("above", [0, H - 0.3, 0.1], [0, 0, -1]),
+        ("close_glass", [-0.8, 1.0, -0.3], [-1.0, 0.6, -1.0]),
+        ("close_metal", [0.8, 0.8, 0.0], [1.0, 0.5, -0.5]),
+    ]
+    sensors = _build_sensor_multi(cameras, resolution=resolution)
+    for name, sensor in sensors:
+        scene_dict[f"sensor_{name}"] = sensor
+    scene_dict["sensor"] = sensors[0][1]
+
+    scene = mi.load_dict(scene_dict)
+
+    # Scene graph
+    verts = np.array([
+        [-W / 2, 0, -D / 2], [W / 2, 0, -D / 2], [W / 2, 0, D / 2], [-W / 2, 0, D / 2],
+        [-W / 2, H, -D / 2], [W / 2, H, -D / 2],
+        # Glass sphere center + top
+        [-1.0, 0, -1.0], [-1.0, 1.2, -1.0],
+        # Metal sphere center + top
+        [1.0, 0, -0.5], [1.0, 1.0, -0.5],
+        # Matte sphere center + top
+        [0.0, 0, 0.5], [0.0, 0.8, 0.5],
+    ], dtype=np.float32)
+
+    materials = [
+        ("dielectric", np.array([1.0, 1.0, 1.0, 0.0, 0.0])),
+        ("roughconductor", np.array([1.0, 0.84, 0.0, 0.02, 1.0])),
+        ("diffuse", np.array([0.8, 0.8, 0.8, 1.0, 0.0])),
+    ]
+    lights = [
+        ("point", np.array([0.0, 3.5, D / 2 + 0.5, 30.0, 25.0, 18.0, 1.0])),
+        ("spot", np.array([0.0, H - 0.1, -1.0, 15.0, 15.0, 20.0, 1.0])),
+        ("area", np.array([0.0, H, -2.5, 3.0, 3.0, 4.0, 1.0])),
+    ]
+    scene_graph = _build_scene_graph(verts, faces=14, materials=materials, lights=lights)
+
+    return scene, scene_graph
+
+
+# ===========================================================================
+# 4. Shaderball — material validation, all BSDF types
+# ===========================================================================
+
+
+def build_shaderball(resolution: tuple[int, int] = (1920, 1080)) -> tuple:
+    """Shaderball — material validation sphere row on checkerboard.
+
+    5 spheres: conductor, roughconductor, plastic, roughplastic, dielectric.
+    Checkerboard ground plane. Area light + constant env.
+
+    Returns (mi.Scene, scene_graph) tuple.
+
+    Exercises: ALL material experts.
+    """
+    scene_dict: dict = {"type": "scene"}
+    scene_dict["integrator"] = {"type": "path", "max_depth": 8}
+
+    # Checkerboard ground (roughplastic)
+    scene_dict["ground"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, 0, 0], scale=[12, 12, 1]),
+        "bsdf": {
+            "type": "roughplastic",
+            "alpha": 0.4,
+            "diffuse_reflectance": {"type": "rgb", "value": [0.6, 0.6, 0.6]},
+            "int_ior": 1.5,
+        },
+    }
+
+    # 5 material spheres in a row at z=0, spaced 1.5 apart
+    R = 0.5
+    spacing = 1.5
+    x_start = -2 * spacing
+    mat_defs = [
+        ("conductor_sphere", {"type": "conductor"}),
+        ("roughconductor_sphere", {"type": "roughconductor", "material": "Cu", "alpha": 0.15}),
+        ("plastic_sphere", {"type": "plastic", "diffuse_reflectance": {"type": "rgb", "value": [0.8, 0.2, 0.2]}, "int_ior": 1.5}),
+        ("roughplastic_sphere", {"type": "roughplastic", "diffuse_reflectance": {"type": "rgb", "value": [0.2, 0.5, 0.8]}, "alpha": 0.2, "int_ior": 1.5}),
+        ("dielectric_sphere", {"type": "dielectric", "int_ior": 1.5, "ext_ior": 1.0}),
+    ]
+    mat_types = ["conductor", "roughconductor", "plastic", "roughplastic", "dielectric"]
+
+    for i, (name, bsdf) in enumerate(mat_defs):
+        x = x_start + i * spacing
+        scene_dict[name] = {
+            "type": "sphere",
+            "center": [x, R, 0],
+            "radius": R,
+            "bsdf": bsdf,
+        }
+
+    # Area light above
+    scene_dict["key_light"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, 6, -2], rotate=([1, 0, 0], 60), scale=[3, 3, 1]),
+        "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [5.0, 4.8, 4.5]}},
+        "bsdf": _diffuse_bsdf([0, 0, 0]),
+    }
+
+    # Constant env
+    scene_dict["env"] = {
+        "type": "constant",
+        "radiance": {"type": "rgb", "value": [0.4, 0.4, 0.45]},
+    }
+
+    # 4 cameras
+    cameras = [
+        ("front", [0, 1.5, 6], [0, 0.5, 0]),
+        ("angle_45", [4, 2.5, 4], [0, 0.5, 0]),
+        ("top_down", [0, 7, 0.1], [0, 0, 0]),
+        ("closeup", [-1, 1.0, 2], [0, 0.5, 0]),
+    ]
+    sensors = _build_sensor_multi(cameras, resolution=resolution)
+    for name, sensor in sensors:
+        scene_dict[f"sensor_{name}"] = sensor
+    scene_dict["sensor"] = sensors[0][1]
+
+    scene = mi.load_dict(scene_dict)
+
+    # Scene graph
+    verts = np.array([
+        [-6, 0, -6], [6, 0, -6], [6, 0, 6], [-6, 0, 6],
+    ] + [[x_start + i * spacing, 0, 0] for i in range(5)]
+      + [[x_start + i * spacing, 2 * R, 0] for i in range(5)],
+        dtype=np.float32,
+    )
+    materials = [
+        ("conductor", np.array([0.95, 0.93, 0.88, 0.0, 1.0])),
+        ("roughconductor", np.array([0.95, 0.64, 0.54, 0.15, 1.0])),
+        ("plastic", np.array([0.8, 0.2, 0.2, 0.0, 0.0])),
+        ("roughplastic", np.array([0.2, 0.5, 0.8, 0.2, 0.0])),
+        ("dielectric", np.array([1.0, 1.0, 1.0, 0.0, 0.0])),
+    ]
+    lights = [
+        ("area", np.array([0, 6, -2, 5.0, 4.8, 4.5, 1.0])),
+    ]
+    scene_graph = _build_scene_graph(verts, faces=8, materials=materials, lights=lights)
+
+    return scene, scene_graph
+
+
+# ===========================================================================
+# 5. Studio Product — conductor + roughplastic, 3-point lighting
+# ===========================================================================
+
+
+def build_studio_product(resolution: tuple[int, int] = (1920, 1080)) -> tuple:
+    """Studio Product — 3-point lit objects with conductor + roughplastic.
+
+    Gold sphere (roughconductor Au), copper cylinder (roughconductor Cu),
+    matte vase (roughplastic). 3 area lights: key, fill, rim.
+
+    Returns (mi.Scene, scene_graph) tuple.
+
+    Exercises: conductor expert, roughplastic expert.
+    """
+    scene_dict: dict = {"type": "scene"}
+    scene_dict["integrator"] = {"type": "path", "max_depth": 8}
+
+    # Ground plane
+    scene_dict["ground"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, 0, 0], scale=[8, 8, 1]),
+        "bsdf": {
+            "type": "roughplastic",
+            "alpha": 0.6,
+            "diffuse_reflectance": {"type": "rgb", "value": [0.25, 0.25, 0.25]},
+            "int_ior": 1.5,
+        },
+    }
+
+    # Gold sphere
+    scene_dict["gold_sphere"] = {
+        "type": "sphere",
+        "center": [-0.8, 0.5, 0],
+        "radius": 0.5,
+        "bsdf": {"type": "roughconductor", "material": "Au", "alpha": 0.05},
+    }
+
+    # Copper cylinder
+    scene_dict["copper_cyl"] = {
+        "type": "cylinder",
+        "to_world": _tf(translate=[0.6, 0.0, -0.3], scale=[0.25, 0.8, 0.25]),
+        "bsdf": {"type": "roughconductor", "material": "Cu", "alpha": 0.1},
+    }
+
+    # Matte vase (roughplastic sphere)
+    scene_dict["vase"] = {
+        "type": "sphere",
+        "center": [0.0, 0.45, 0.8],
+        "radius": 0.45,
+        "bsdf": {
+            "type": "roughplastic",
+            "alpha": 0.15,
+            "diffuse_reflectance": {"type": "rgb", "value": [0.6, 0.3, 0.2]},
+            "int_ior": 1.5,
+        },
+    }
+
+    # 3-point lighting
+    # Key light (warm, 45° right-above)
+    scene_dict["key_light"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[2.5, 3.0, 1.0], rotate=([0, 1, 0], -30), scale=[1.5, 1.0, 1]),
+        "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [6.0, 5.0, 3.5]}},
+        "bsdf": _diffuse_bsdf([0, 0, 0]),
+    }
+    # Fill light (cool, 45° left)
+    scene_dict["fill_light"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[-2.5, 2.5, 1.5], rotate=([0, 1, 0], 30), scale=[1.2, 0.8, 1]),
+        "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [2.5, 3.0, 4.0]}},
+        "bsdf": _diffuse_bsdf([0, 0, 0]),
+    }
+    # Rim light (behind, above)
+    scene_dict["rim_light"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, 3.5, -2.0], rotate=([1, 0, 0], -30), scale=[2.0, 0.6, 1]),
+        "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [3.0, 3.0, 4.5]}},
+        "bsdf": _diffuse_bsdf([0, 0, 0]),
+    }
+
+    # 4 cameras
+    cameras = [
+        ("front", [0, 1.5, 4], [0, 0.4, 0]),
+        ("three_quarter", [2.5, 2.0, 3], [0, 0.4, 0]),
+        ("overhead", [0, 5, 0.1], [0, 0, 0]),
+        ("hero_low", [0.5, 0.6, 2.5], [0, 0.5, 0]),
+    ]
+    sensors = _build_sensor_multi(cameras, resolution=resolution)
+    for name, sensor in sensors:
+        scene_dict[f"sensor_{name}"] = sensor
+    scene_dict["sensor"] = sensors[0][1]
+
+    scene = mi.load_dict(scene_dict)
+
+    # Scene graph
+    verts = np.array([
+        [-4, 0, -4], [4, 0, -4], [4, 0, 4], [-4, 0, 4],
+        [-0.8, 0, 0], [-0.8, 1.0, 0],
+        [0.6, 0, -0.3], [0.6, 0.8, -0.3],
+        [0.0, 0, 0.8], [0.0, 1.05, 0.8],
+    ], dtype=np.float32)
+
+    materials = [
+        ("roughconductor", np.array([1.0, 0.84, 0.0, 0.05, 1.0])),   # Au
+        ("roughconductor", np.array([0.95, 0.64, 0.54, 0.1, 1.0])),  # Cu
+        ("roughplastic", np.array([0.6, 0.3, 0.2, 0.15, 0.0])),     # vase
+    ]
+    lights = [
+        ("area", np.array([2.5, 3.0, 1.0, 6.0, 5.0, 3.5, 1.0])),    # key
+        ("area", np.array([-2.5, 2.5, 1.5, 2.5, 3.0, 4.0, 1.0])),   # fill
+        ("area", np.array([0, 3.5, -2.0, 3.0, 3.0, 4.5, 1.0])),     # rim
+    ]
+    scene_graph = _build_scene_graph(verts, faces=8, materials=materials, lights=lights)
+
+    return scene, scene_graph
+
+
+# ===========================================================================
+# 6. Foggy Corridor — volumetric, null BSDF, homogeneous medium
+# ===========================================================================
+
+
+def build_foggy_corridor(resolution: tuple[int, int] = (1920, 1080)) -> tuple:
+    """Foggy Corridor — L-shaped corridor with volumetric fog.
+
+    L-shaped corridor (diffuse gray walls). Homogeneous medium (fog)
+    inside a null-BSDF volume boundary. Point light at junction,
+    spot light at one end.
+
+    Returns (mi.Scene, scene_graph) tuple.
+
+    Exercises: null BSDF, volume expert, point-light expert.
+    """
+    scene_dict: dict = {"type": "scene"}
+    scene_dict["integrator"] = {"type": "volpath", "max_depth": 8}
+
+    gray = [0.5, 0.5, 0.5]
+    dark_floor = [0.2, 0.2, 0.2]
+
+    # L-shape corridor: main arm along Z (length 8), side arm along X (length 5)
+    # Main corridor: 2×3×8 box (open at one end for side arm)
+    cW, cH, cL = 2.0, 3.0, 8.0  # corridor width, height, length
+    sL = 5.0  # side arm length
+
+    # Main corridor floor
+    scene_dict["main_floor"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, 0, -cL / 2], scale=[cW, cL, 1]),
+        "bsdf": _diffuse_bsdf(dark_floor),
+    }
+    # Main corridor ceiling
+    scene_dict["main_ceiling"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, cH, -cL / 2], rotate=([1, 0, 0], 90), scale=[cW, cL, 1]),
+        "bsdf": _diffuse_bsdf(gray),
+    }
+    # Main corridor left wall
+    scene_dict["main_left_wall"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[-cW / 2, cH / 2, -cL / 2], rotate=([0, 1, 0], 90), scale=[cL, cH, 1]),
+        "bsdf": _diffuse_bsdf(gray),
+    }
+    # Main corridor right wall (partial — has opening for side arm)
+    scene_dict["main_right_wall_end"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[cW / 2, cH / 2, -cL + sL / 2], rotate=([0, 1, 0], -90), scale=[sL / 2, cH, 1]),
+        "bsdf": _diffuse_bsdf(gray),
+    }
+    # Main corridor back wall
+    scene_dict["main_back_wall"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[0, cH / 2, -cL], scale=[cW, cH, 1]),
+        "bsdf": _diffuse_bsdf(gray),
+    }
+
+    # Side arm (extends from right wall, z=0 to z=-sL/2)
+    scene_dict["side_floor"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[cW / 2 + sL / 2, 0, -sL / 4], scale=[sL, sL / 2, 1]),
+        "bsdf": _diffuse_bsdf(dark_floor),
+    }
+    scene_dict["side_ceiling"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[cW / 2 + sL / 2, cH, -sL / 4], rotate=([1, 0, 0], 90), scale=[sL, sL / 2, 1]),
+        "bsdf": _diffuse_bsdf(gray),
+    }
+    scene_dict["side_right_wall"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[cW / 2 + sL, cH / 2, -sL / 4], rotate=([0, 1, 0], -90), scale=[sL / 2, cH, 1]),
+        "bsdf": _diffuse_bsdf(gray),
+    }
+    scene_dict["side_end_wall"] = {
+        "type": "rectangle",
+        "to_world": _tf(translate=[cW / 2 + sL / 2, cH / 2, -sL / 2], scale=[sL, cH, 1]),
+        "bsdf": _diffuse_bsdf(gray),
+    }
+
+    # Volumetric fog — homogeneous medium inside a null-BSDF shape
+    # Use a cube covering the corridor as the volume boundary
+    fog_sigma_t = 0.2
+    fog_albedo = 0.9
+    scene_dict["fog_volume"] = {
+        "type": "cube",
+        "to_world": _tf(
+            translate=[cW / 4, cH / 2, -cL / 2],
+            scale=[cW / 2 + sL, cH, cL],
+        ),
+        "bsdf": {"type": "null"},
+        "interior": {
+            "type": "homogeneous",
+            "sigma_t": {"type": "rgb", "value": [fog_sigma_t] * 3},
+            "albedo": {"type": "rgb", "value": [fog_albedo] * 3},
+        },
+    }
+
+    # Point light at junction
+    scene_dict["junction_light"] = {
+        "type": "point",
+        "position": [0, cH - 0.5, 0],
+        "intensity": {"type": "rgb", "value": [15.0, 12.0, 10.0]},
+    }
+
+    # Spot light at end of side arm
+    scene_dict["end_spot"] = {
+        "type": "spot",
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[cW / 2 + sL - 0.5, cH - 0.3, -sL / 4],
+            target=[cW / 2, cH / 2, -sL / 4],
+            up=[0, 0, 1],
+        ),
+        "cutoff_angle": 30,
+        "beam_width": 20,
+        "intensity": {"type": "rgb", "value": [12.0, 12.0, 15.0]},
+    }
+
+    # 4 Cameras
+    cameras = [
+        ("entrance", [0, 1.5, 3], [0, 1.5, -2]),
+        ("junction_left", [-0.3, 1.5, -0.5], [1.0, 1.5, -1.0]),
+        ("junction_right", [0.3, 1.5, -0.5], [2.0, 1.5, -1.0]),
+        ("down_side", [cW / 2 + 1, 1.5, -sL / 4], [cW / 2 + 3, 1.5, -sL / 4]),
+    ]
+    sensors = _build_sensor_multi(cameras, resolution=resolution)
+    for name, sensor in sensors:
+        scene_dict[f"sensor_{name}"] = sensor
+    scene_dict["sensor"] = sensors[0][1]
+
+    scene = mi.load_dict(scene_dict)
+
+    # Scene graph
+    verts = np.array([
+        [-cW / 2, 0, -cL], [cW / 2, 0, 0], [cW / 2, 0, -cL],
+        [-cW / 2, cH, -cL], [cW / 2, cH, 0],
+        [cW / 2 + sL, 0, -sL / 2], [cW / 2 + sL, cH, -sL / 2],
+    ], dtype=np.float32)
+
+    materials = [
+        ("diffuse", np.array([0.5, 0.5, 0.5, 1.0, 0.0])),
+        ("null", np.array([0.0, 0.0, 0.0, 0.0, 0.0])),
+    ]
+    lights = [
+        ("point", np.array([0, cH - 0.5, 0, 15.0, 12.0, 10.0, 1.0])),
+        ("spot", np.array([cW / 2 + sL - 0.5, cH - 0.3, -sL / 4, 12.0, 12.0, 15.0, 1.0])),
+    ]
+    scene_graph = _build_scene_graph(verts, faces=14, materials=materials, lights=lights)
+    scene_graph["volume"] = {"sigma_t": fog_sigma_t, "albedo": fog_albedo, "g": 0.0}
+
+    return scene, scene_graph
+
+
+# Register all scene builders at module level
+SCENE_REGISTRY["cornell"] = build_cornell_box
+SCENE_REGISTRY["veach"] = build_veach_ajar
+SCENE_REGISTRY["shaderball"] = build_shaderball
+SCENE_REGISTRY["studio"] = build_studio_product
+SCENE_REGISTRY["foggy"] = build_foggy_corridor
+
+
+# ===========================================================================
+# CLI Entry Point — python -m omen.scenes
+# ===========================================================================
+
+_SCENE_DESCRIPTIONS = {
+    "cornell": "Cornell Box — GI color-bleeding, diffuse walls + area light",
+    "veach": "Veach Ajar Door — MIS stress test, glass/metal/matte + 3 light types",
+    "shaderball": "Shaderball — material validation, 5 BSDF types on checkerboard",
+    "studio": "Studio Product — 3-point lighting, conductor + roughplastic",
+    "foggy": "Foggy Corridor — volumetric fog, null BSDF, homogeneous medium",
+}
+
+
+def _cli():
+    """Command-line interface for scene rendering and training data generation."""
+    import argparse
+    import time
+
+    # Ensure all builders are registered
+    _ = [
+        build_cornell_box, build_veach_ajar, build_shaderball,
+        build_studio_product, build_foggy_corridor,
+    ]
+
+    parser = argparse.ArgumentParser(
+        prog="python -m omen.scenes",
+        description="Omen scene rendering and online training data generation",
+    )
+    parser.add_argument("--list", action="store_true", help="List available scenes")
+    parser.add_argument("--scene", type=str, help="Scene name to render/train")
+    parser.add_argument("--spp", type=int, default=64, help="SPP for single render (default: 64)")
+    parser.add_argument("--gt-spp", type=int, default=256, help="GT SPP for training (default: 256)")
+    parser.add_argument("--noisy-spp", type=int, default=4, help="Noisy SPP for training (default: 4)")
+    parser.add_argument("--resolution", type=str, default="1920x1080", help="Resolution WxH")
+    parser.add_argument("--count", type=int, default=1, help="Number of training steps")
+    parser.add_argument("--output", type=str, default=None, help="Output file path (.exr)")
+    parser.add_argument("--save-images", action="store_true", help="Save images to disk (debug)")
+    parser.add_argument("--camera", type=str, default="default", help="Camera: default, all, or name")
+    parser.add_argument("--animate", action="store_true", help="Render animation frames")
+    parser.add_argument("--animate-type", type=str, default="camera_orbit",
+                        help="Animation channel: camera_orbit, mesh, material, light")
+    args = parser.parse_args()
+
+    if args.list:
+        print("Available scenes:")
+        for name in sorted(SCENE_REGISTRY.keys()):
+            desc = _SCENE_DESCRIPTIONS.get(name, "")
+            print(f"  {name:12s} {desc}")
+        return
+
+    if not args.scene:
+        parser.print_help()
+        return
+
+    if args.scene not in SCENE_REGISTRY:
+        print(f"Unknown scene '{args.scene}'. Use --list to see available scenes.")
+        return
+
+    builder = SCENE_REGISTRY[args.scene]
+    w, h = map(int, args.resolution.split("x"))
+
+    # Single render mode
+    if not args.animate and args.count <= 1 and args.output:
+        t0 = time.perf_counter()
+        scene, sg = builder(resolution=(w, h))
+        img = mi.render(scene, spp=args.spp)
+        dt = time.perf_counter() - t0
+        arr = np.array(img)
+        bitmap = mi.Bitmap(arr)
+        bitmap.write(args.output)
+        print(f"Rendered {args.scene} at {args.spp}spp in {dt:.2f}s → {args.output}")
+        print(f"  Image: {arr.shape}, NaN: {np.isnan(arr).any()}, Range: [{arr.min():.4f}, {arr.max():.4f}]")
+        return
+
+    # Online training mode
+    from omen.training.online_gen import TrainingDataGenerator
+
+    gen = TrainingDataGenerator(
+        resolution=(w, h),
+        gt_spp=args.gt_spp,
+        noisy_spp=args.noisy_spp,
+        save_images=args.save_images,
+        output_dir=args.output or "./debug/",
+    )
+
+    if args.animate:
+        from omen.training.anim_gen import AnimationDataGenerator
+        anim_gen = AnimationDataGenerator(
+            resolution=(w, h),
+            gt_spp=args.gt_spp,
+            noisy_spp=args.noisy_spp,
+            save_images=args.save_images,
+            output_dir=args.output or "./debug/",
+        )
+        for step_data in anim_gen.animate(builder, anim_name=args.animate_type, n_frames=args.count):
+            gt = step_data["gt_image"]
+            noisy = step_data["noisy_image"]
+            residual = step_data["residual"]
+            rmse = np.sqrt(np.mean(residual ** 2))
+            print(f"  Frame {step_data.get('frame_idx', '?')}: "
+                  f"gt range=[{gt.min():.3f},{gt.max():.3f}], "
+                  f"noisy RMSE={rmse:.4f}")
+    else:
+        for step in range(args.count):
+            for step_data in gen.train_step(builder, camera=args.camera, seed=step):
+                gt = step_data["gt_image"]
+                noisy = step_data["noisy_image"]
+                residual = step_data["residual"]
+                rmse = np.sqrt(np.mean(residual ** 2))
+                print(f"  Step {step + 1}/{args.count}: "
+                      f"gt range=[{gt.min():.3f},{gt.max():.3f}], "
+                      f"noisy RMSE={rmse:.4f}, "
+                      f"shape={gt.shape}")
+
+
+if __name__ == "__main__":
+    _cli()
