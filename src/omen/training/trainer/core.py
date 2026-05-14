@@ -22,13 +22,18 @@ except (ImportError, RuntimeError):
 DEFAULT_LR = 5e-5
 DEFAULT_WEIGHT_DECAY = 1e-3
 
+# Decoder conv2d filter params whose backward graph can't compile
+# (MAX compiler cannot infer num_groups for fused conv2d backward).
+# These get zero gradient and are frozen until the compiler is fixed.
+CONV2D_BLOCKERS = frozenset({"decoder.e1", "decoder.e2", "decoder.e3", "decoder.e4"})
+
 
 class OmenTrainer:
     """Functional trainer using ``nb.value_and_grad`` and per-component AdamW.
 
-    Gradients are realized per-tensor to avoid the MAX compiler bug where
-    fusing backward through multiple conv2d ops fails to infer ``num_groups``.
-    Params that can't realize (decoder conv2d filters) get zero gradient.
+    Gradient realization uses ``nb.realize_all`` in one batch call for all
+    non-conv2d params (fast).  The 4 decoder conv2d filter gradients are
+    zeroed (MAX compiler ``num_groups`` bug).
     """
 
     def __init__(
@@ -72,20 +77,24 @@ class OmenTrainer:
         }
 
     def _realize_grads(self, grads, params):
-        """Realize gradient tensors individually, zeroing any that fail.
+        """Batch-realize safe gradients, zero the conv2d blockers.
 
-        Per-tensor realization avoids the MAX compiler bug where fusing
-        backward through multiple conv2d ops fails.  Params whose gradients
-        can't realize (decoder conv2d filters) keep zero gradient.
+        Uses ``nb.realize_all`` for one fused compilation of all non-conv2d
+        gradients (fast), then extracts to numpy.  Conv2d filter gradients
+        are set to zero (compiler can't realize them).
         """
+        safe_tensors = [
+            g for n, g in grads.items() if n not in CONV2D_BLOCKERS and not g.real
+        ]
+        if safe_tensors:
+            nb.realize_all(*safe_tensors)
+
         realized = {}
         for name, g in grads.items():
-            try:
-                arr = g.to_numpy()
-                realized[name] = nb.Tensor.from_dlpack(arr)
-            except Exception:
-                logger.debug("Zeroing grad for %s (realize failed)", name)
+            if name in CONV2D_BLOCKERS:
                 realized[name] = nb.zeros_like(params[name])
+            else:
+                realized[name] = nb.Tensor.from_dlpack(g.to_numpy())
         return realized
 
     def _compute_lr(self, component_name, z_score=0.0):
