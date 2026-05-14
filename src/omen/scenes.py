@@ -1192,6 +1192,341 @@ def build_foggy_corridor(resolution: tuple[int, int] = (1920, 1080)) -> tuple:
     return scene, scene_graph
 
 
+# ===========================================================================
+# Scene Animations — Veach, Shaderball, Studio, Foggy
+# ===========================================================================
+
+
+def veach_animations(base_resolution: tuple[int, int] = (1920, 1080)) -> dict:
+    """Veach Ajar Door animation generators."""
+    W, H, D = 6.0, 4.0, 6.0
+    black = [0.05, 0.05, 0.05]
+    dark = [0.15, 0.15, 0.15]
+
+    def _base(glass_ior=1.5, metal_alpha=0.02,
+              point_pos=[0.0, 3.5, D / 2 + 0.5], point_intensity=[30.0, 25.0, 18.0],
+              spot_intensity=[15.0, 15.0, 20.0], door_angle=5.0,
+              glass_pos=[-1.0, 0.6, -1.0]) -> dict:
+        d: dict = {"type": "scene", "integrator": {"type": "path", "max_depth": 12}}
+        d["floor"] = {"type": "rectangle", "to_world": _tf(translate=[0, 0, 0], scale=[W, D, 1]), "bsdf": _diffuse_bsdf(dark)}
+        d["ceiling"] = {"type": "rectangle", "to_world": _tf(translate=[0, H, 0], rotate=([1, 0, 0], 90), scale=[W, D, 1]), "bsdf": _diffuse_bsdf(black)}
+        d["back_wall"] = {"type": "rectangle", "to_world": _tf(translate=[0, H / 2, -D / 2], scale=[W, H, 1]), "bsdf": _diffuse_bsdf(black)}
+        d["left_wall"] = {"type": "rectangle", "to_world": _tf(translate=[-W / 2, H / 2, 0], rotate=([0, 1, 0], 90), scale=[D, H, 1]), "bsdf": _diffuse_bsdf(black)}
+        d["right_wall"] = {"type": "rectangle", "to_world": _tf(translate=[W / 2, H / 2, 0], rotate=([0, 1, 0], -90), scale=[D, H, 1]), "bsdf": _diffuse_bsdf(black)}
+        gap_y = 2.8
+        gap_w = 1.0
+        d["front_wall_top"] = {"type": "rectangle", "to_world": _tf(translate=[0, (H + gap_y) / 2, D / 2], scale=[W, H - gap_y, 1]), "bsdf": _diffuse_bsdf(black)}
+        d["front_wall_left"] = {"type": "rectangle", "to_world": _tf(translate=[-(W + gap_w) / 4, gap_y / 2, D / 2], scale=[(W - gap_w) / 2, gap_y, 1]), "bsdf": _diffuse_bsdf(black)}
+        d["front_wall_right"] = {"type": "rectangle", "to_world": _tf(translate=[(W + gap_w) / 4, gap_y / 2, D / 2], scale=[(W - gap_w) / 2, gap_y, 1]), "bsdf": _diffuse_bsdf(black)}
+        d["glass_sphere"] = {"type": "sphere", "center": glass_pos, "radius": 0.6,
+                             "bsdf": {"type": "dielectric", "int_ior": glass_ior, "ext_ior": 1.0}}
+        d["metal_sphere"] = {"type": "sphere", "center": [1.0, 0.5, -0.5], "radius": 0.5,
+                             "bsdf": {"type": "roughconductor", "material": "Au", "alpha": metal_alpha}}
+        d["matte_sphere"] = {"type": "sphere", "center": [0.0, 0.4, 0.5], "radius": 0.4,
+                             "bsdf": _diffuse_bsdf([0.8, 0.8, 0.8])}
+        d["point_light"] = {"type": "point", "position": point_pos,
+                            "intensity": {"type": "rgb", "value": point_intensity}}
+        d["spot_light"] = {"type": "spot",
+                           "to_world": mi.ScalarTransform4f.look_at(origin=[0.0, H - 0.1, -1.0], target=[0.0, 0.0, -1.0], up=[0, 0, 1]),
+                           "cutoff_angle": 25, "beam_width": 15,
+                           "intensity": {"type": "rgb", "value": spot_intensity}}
+        d["area_light"] = {"type": "rectangle",
+                           "to_world": _tf(translate=[0.0, H - 0.01, -2.5], rotate=([1, 0, 0], 90), scale=[1.5, 1.0, 1]),
+                           "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [3.0, 3.0, 4.0]}},
+                           "bsdf": _diffuse_bsdf([0, 0, 0])}
+        return d
+
+    sensors = _build_sensor_multi([
+        ("through_door", [0, 2.0, D / 2 + 1.5], [0, 1.5, -1]),
+        ("side_view", [W / 2 - 0.3, 2.0, 0], [0, 1.5, -1]),
+    ], resolution=base_resolution)
+    default_sensor = sensors[0][1]
+
+    # 3.6 Camera dolly: 10 frames from corridor through door
+    def _camera_frames():
+        for i in range(10):
+            t = i / 9
+            z = D / 2 + 1.5 - t * (D / 2 + 2.5)
+            y = 2.0 - t * 0.5
+            sensor = _build_sensor_multi([("cam", [0, y, z], [0, 1.5, -1])], resolution=base_resolution)[0][1]
+            d = _base()
+            d["sensor"] = sensor
+            yield mi.load_dict(d)
+
+    # 3.7 Mesh: 8 frames door opening + glass sphere slide
+    def _mesh_frames():
+        for i in range(8):
+            t = i / 7
+            gx = -1.0 + 0.3 * t
+            d = _base(glass_pos=[gx, 0.6, -1.0])
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 3.8 Material: 6 frames glass IOR 1.3→1.8, metal roughness 0.02→0.3
+    def _material_frames():
+        for i in range(6):
+            t = i / 5
+            d = _base(glass_ior=1.3 + 0.5 * t, metal_alpha=0.02 + 0.28 * t)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 3.9 Light: 8 frames point light moves to center, spot dims
+    def _light_frames():
+        for i in range(8):
+            t = i / 7
+            pz = D / 2 + 0.5 - t * (D / 2 + 0.5)
+            si = [15.0 * (1 - 0.75 * t)] * 2 + [20.0 * (1 - 0.75 * t)]
+            d = _base(point_pos=[0.0, 3.5, pz], spot_intensity=si)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    return {"camera_orbit": _camera_frames(), "mesh": _mesh_frames(),
+            "material": _material_frames(), "light": _light_frames()}
+
+
+def shaderball_animations(base_resolution: tuple[int, int] = (1920, 1080)) -> dict:
+    """Shaderball animation generators."""
+    def _base(rough_cond=0.15, rough_plastic=0.2, plastic_ior=1.5) -> dict:
+        d: dict = {"type": "scene", "integrator": {"type": "path", "max_depth": 8}}
+        ground = [0.18, 0.18, 0.18]
+        d["ground"] = {"type": "rectangle", "to_world": _tf(translate=[0, 0, 0], scale=[8, 8, 1]),
+                       "bsdf": {"type": "roughplastic", "alpha": 0.5,
+                                "diffuse_reflectance": {"type": "rgb", "value": ground}}}
+        # 5 material spheres in a row
+        sx = -2.0
+        d["mirror"] = {"type": "sphere", "center": [sx, 0.5, 0], "radius": 0.5,
+                       "bsdf": {"type": "conductor", "material": "Au"}}
+        d["rough_cu"] = {"type": "sphere", "center": [sx + 1, 0.5, 0], "radius": 0.5,
+                         "bsdf": {"type": "roughconductor", "material": "Cu", "alpha": rough_cond}}
+        d["plastic"] = {"type": "sphere", "center": [sx + 2, 0.5, 0], "radius": 0.5,
+                        "bsdf": {"type": "plastic", "diffuse_reflectance": {"type": "rgb", "value": [0.8, 0.6, 0.5]},
+                                 "int_ior": plastic_ior}}
+        d["rough_plastic"] = {"type": "sphere", "center": [sx + 3, 0.5, 0], "radius": 0.5,
+                              "bsdf": {"type": "roughplastic", "alpha": rough_plastic,
+                                       "diffuse_reflectance": {"type": "rgb", "value": [0.7, 0.5, 0.35]}}}
+        d["glass"] = {"type": "sphere", "center": [sx + 4, 0.5, 0], "radius": 0.5,
+                      "bsdf": {"type": "dielectric", "int_ior": 1.5, "ext_ior": 1.0}}
+        d["area_light"] = {"type": "rectangle",
+                           "to_world": _tf(translate=[0, 5, 0], rotate=([1, 0, 0], 90), scale=[3, 3, 1]),
+                           "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [15.0, 15.0, 17.0]}},
+                           "bsdf": _diffuse_bsdf([0, 0, 0])}
+        d["env"] = {"type": "constant", "radiance": {"type": "rgb", "value": [0.4, 0.4, 0.45]}}
+        return d
+
+    default_sensor = _build_sensor_multi(
+        [("front", [0, 2.5, 5], [0, 0.5, 0])], resolution=base_resolution)[0][1]
+
+    # 4.5 Camera: 12-frame orbit at 45°
+    def _camera_frames():
+        import math
+        for i in range(12):
+            theta = 2 * math.pi * i / 12
+            r = 5.0
+            x, z = r * math.cos(theta), r * math.sin(theta)
+            sensor = _build_sensor_multi(
+                [("cam", [x, 2.5, z], [0, 0.5, 0])], resolution=base_resolution)[0][1]
+            d = _base()
+            d["sensor"] = sensor
+            yield mi.load_dict(d)
+
+    # 4.6 Mesh: 8-frame sphere scaling
+    def _mesh_frames():
+        for i in range(8):
+            t = i / 7
+            s = 0.5 + 1.0 * t  # scale 0.5x to 1.5x on central sphere
+            d = _base()
+            d["rough_cu"]["center"] = [-1.0, 0.5 * s, 0]
+            d["rough_cu"]["radius"] = 0.5 * s
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 4.7 Material: 10-frame roughness sweep
+    def _material_frames():
+        for i in range(10):
+            t = i / 9
+            d = _base(rough_cond=0.0 + 0.5 * t, rough_plastic=0.1 + 0.3 * t,
+                      plastic_ior=1.3 + 0.4 * t)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 4.8 Light: 8-frame area light rotation
+    def _light_frames():
+        import math
+        for i in range(8):
+            angle = 180 * i / 7
+            d = _base()
+            d["area_light"]["to_world"] = _tf(
+                translate=[0, 5, 0], rotate=([1, 0, 0], 90), rotate2=([0, 1, 0], angle), scale=[3, 3, 1])
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    return {"camera_orbit": _camera_frames(), "mesh": _mesh_frames(),
+            "material": _material_frames(), "light": _light_frames()}
+
+
+def studio_animations(base_resolution: tuple[int, int] = (1920, 1080)) -> dict:
+    """Studio Product animation generators."""
+    def _base(au_alpha=0.05, cu_alpha=0.12, vase_color=[0.5, 0.45, 0.4],
+              key_rad=[25.0, 22.0, 18.0], fill_rad=[8.0, 10.0, 12.0],
+              rim_rad=[6.0, 6.0, 8.0]) -> dict:
+        d: dict = {"type": "scene", "integrator": {"type": "path", "max_depth": 8}}
+        d["ground"] = {"type": "rectangle", "to_world": _tf(translate=[0, 0, 0], scale=[6, 6, 1]),
+                       "bsdf": _diffuse_bsdf([0.08, 0.08, 0.08])}
+        d["gold_sphere"] = {"type": "sphere", "center": [-0.8, 0.45, 0], "radius": 0.45,
+                            "bsdf": {"type": "roughconductor", "material": "Au", "alpha": au_alpha}}
+        d["copper_cyl"] = {"type": "cylinder", "center0": [0.7, 0, -0.15], "center1": [0.7, 0.7, -0.15],
+                           "radius": 0.2,
+                           "bsdf": {"type": "roughconductor", "material": "Cu", "alpha": cu_alpha}}
+        d["vase"] = {"type": "sphere", "center": [0, 0.35, 0.5], "radius": 0.35,
+                     "bsdf": {"type": "roughplastic", "alpha": 0.25,
+                              "diffuse_reflectance": {"type": "rgb", "value": vase_color}}}
+        d["key_light"] = {"type": "rectangle",
+                          "to_world": _tf(translate=[2, 3, 1], rotate=([0, 1, 0], -45), rotate2=([1, 0, 0], -30), scale=[1.5, 1.5, 1]),
+                          "emitter": {"type": "area", "radiance": {"type": "rgb", "value": key_rad}},
+                          "bsdf": _diffuse_bsdf([0, 0, 0])}
+        d["fill_light"] = {"type": "rectangle",
+                           "to_world": _tf(translate=[-2, 2.5, 0.5], rotate=([0, 1, 0], 45), rotate2=([1, 0, 0], -20), scale=[1.2, 1.2, 1]),
+                           "emitter": {"type": "area", "radiance": {"type": "rgb", "value": fill_rad}},
+                           "bsdf": _diffuse_bsdf([0, 0, 0])}
+        d["rim_light"] = {"type": "rectangle",
+                          "to_world": _tf(translate=[0, 3.5, -2], rotate=([1, 0, 0], 70), scale=[2, 1, 1]),
+                          "emitter": {"type": "area", "radiance": {"type": "rgb", "value": rim_rad}},
+                          "bsdf": _diffuse_bsdf([0, 0, 0])}
+        return d
+
+    default_sensor = _build_sensor_multi(
+        [("front", [0, 1.5, 3.5], [0, 0.5, 0])], resolution=base_resolution)[0][1]
+
+    # 5.5 Camera: 12-frame turntable
+    def _camera_frames():
+        import math
+        for i in range(12):
+            theta = 2 * math.pi * i / 12
+            sensor = _build_sensor_multi(
+                [("cam", [3.5 * math.cos(theta), 1.5, 3.5 * math.sin(theta)], [0, 0.5, 0])],
+                resolution=base_resolution)[0][1]
+            d = _base()
+            d["sensor"] = sensor
+            yield mi.load_dict(d)
+
+    # 5.6 Mesh: 8-frame sphere lift + cylinder rotate + vase scale
+    def _mesh_frames():
+        for i in range(8):
+            t = i / 7
+            d = _base()
+            d["gold_sphere"]["center"] = [-0.8, 0.45 + 0.5 * t, 0]
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 5.7 Material: 6-frame roughness + color shift
+    def _material_frames():
+        for i in range(6):
+            t = i / 5
+            vc = [0.5 + 0.3 * t, 0.45 + 0.05 * t, 0.4 - 0.1 * t]
+            d = _base(au_alpha=0.02 + 0.18 * t, cu_alpha=0.1 + 0.2 * t, vase_color=vc)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 5.8 Light: 8-frame key dim + fill up + rim blue
+    def _light_frames():
+        for i in range(8):
+            t = i / 7
+            kr = [25.0 * (1 - 0.7 * t)] * 2 + [18.0 * (1 - 0.7 * t)]
+            fr = [8.0 + 7.0 * t, 10.0 + 8.0 * t, 12.0 + 10.0 * t]
+            rr = [6.0 * (1 - t), 6.0 * (1 - t), 8.0 + 6.0 * t]
+            d = _base(key_rad=kr, fill_rad=fr, rim_rad=rr)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    return {"camera_orbit": _camera_frames(), "mesh": _mesh_frames(),
+            "material": _material_frames(), "light": _light_frames()}
+
+
+def foggy_animations(base_resolution: tuple[int, int] = (1920, 1080)) -> dict:
+    """Foggy Corridor animation generators."""
+    cW, cH, sL = 2.5, 3.0, 8.0
+
+    def _base(fog_sigma=0.2, wall_color=[0.5, 0.5, 0.5],
+              point_pos=[0, cH - 0.5, 0], spot_cutoff=45) -> dict:
+        d: dict = {"type": "scene",
+                   "integrator": {"type": "volpath", "max_depth": 12}}
+        wc = wall_color
+        d["floor"] = {"type": "rectangle", "to_world": _tf(translate=[0, 0, 0], scale=[cW, sL, 1]),
+                      "bsdf": _diffuse_bsdf(wc)}
+        d["ceiling"] = {"type": "rectangle", "to_world": _tf(translate=[0, cH, 0], rotate=([1, 0, 0], 90), scale=[cW, sL, 1]),
+                        "bsdf": _diffuse_bsdf(wc)}
+        d["left_wall"] = {"type": "rectangle", "to_world": _tf(translate=[-cW / 2, cH / 2, 0], rotate=([0, 1, 0], 90), scale=[sL, cH, 1]),
+                          "bsdf": _diffuse_bsdf(wc)}
+        d["right_wall"] = {"type": "rectangle", "to_world": _tf(translate=[cW / 2, cH / 2, 0], rotate=([0, 1, 0], -90), scale=[sL, cH, 1]),
+                           "bsdf": _diffuse_bsdf(wc)}
+        d["back_wall"] = {"type": "rectangle", "to_world": _tf(translate=[0, cH / 2, -sL / 2], scale=[cW, cH, 1]),
+                          "bsdf": _diffuse_bsdf(wc)}
+        d["front_wall"] = {"type": "rectangle", "to_world": _tf(translate=[0, cH / 2, sL / 2], scale=[cW, cH, 1]),
+                           "bsdf": _diffuse_bsdf(wc)}
+        d["obstacle"] = {"type": "cube", "to_world": _tf(translate=[0, 0.5, -1.0], scale=[0.6, 1.0, 0.4]),
+                         "bsdf": _diffuse_bsdf([0.6, 0.6, 0.6])}
+        d["point_light"] = {"type": "point", "position": point_pos,
+                            "intensity": {"type": "rgb", "value": [15.0, 12.0, 10.0]}}
+        d["spot_light"] = {"type": "spot",
+                           "to_world": mi.ScalarTransform4f.look_at(
+                               origin=[cW / 2 + 0.1, cH - 0.3, -sL / 4],
+                               target=[0, 0, -sL / 4], up=[0, 0, 1]),
+                           "cutoff_angle": spot_cutoff, "beam_width": spot_cutoff * 0.6,
+                           "intensity": {"type": "rgb", "value": [12.0, 12.0, 15.0]}}
+        d["volume"] = {"type": "homogeneous",
+                       "sigma_t": {"type": "rgb", "value": [fog_sigma] * 3},
+                       "albedo": {"type": "rgb", "value": [0.9] * 3},
+                       "phase": {"type": "hg", "g": 0.3}}
+        return d
+
+    default_sensor = _build_sensor_multi(
+        [("entrance", [0, 1.5, sL / 2 - 0.3], [0, 1.5, -1])],
+        resolution=base_resolution)[0][1]
+
+    # 6.5 Camera: 10-frame walkthrough
+    def _camera_frames():
+        for i in range(10):
+            t = i / 9
+            z = sL / 2 - 0.3 - t * (sL - 1)
+            sensor = _build_sensor_multi(
+                [("cam", [0, 1.5, z], [0, 1.5, z - 1])], resolution=base_resolution)[0][1]
+            d = _base()
+            d["sensor"] = sensor
+            yield mi.load_dict(d)
+
+    # 6.6 Mesh: 6-frame obstacle move
+    def _mesh_frames():
+        for i in range(6):
+            t = i / 5
+            d = _base()
+            d["obstacle"] = {"type": "cube", "to_world": _tf(translate=[0, 0.5, -1.0 + 2.0 * t], scale=[0.6, 1.0, 0.4]),
+                             "bsdf": _diffuse_bsdf([0.6, 0.6, 0.6])}
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 6.7 Material: 8-frame wall color shift
+    def _material_frames():
+        for i in range(8):
+            t = i / 7
+            wc = [0.5 + 0.4 * t] * 3  # gray -> warm white
+            d = _base(wall_color=wc)
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    # 6.8 Light: 8-frame fog density + light move + spot cone
+    def _light_frames():
+        for i in range(8):
+            t = i / 7
+            pz = -t * (sL / 2)
+            sc = 45 - 30 * t  # 45° → 15°
+            d = _base(fog_sigma=0.05 + 0.45 * t, point_pos=[0, cH - 0.5, pz], spot_cutoff=max(sc, 10))
+            d["sensor"] = default_sensor
+            yield mi.load_dict(d)
+
+    return {"camera_orbit": _camera_frames(), "mesh": _mesh_frames(),
+            "material": _material_frames(), "light": _light_frames()}
+
+
 # Register all scene builders at module level
 SCENE_REGISTRY["cornell"] = build_cornell_box
 SCENE_REGISTRY["veach"] = build_veach_ajar

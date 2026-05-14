@@ -15,3 +15,7 @@ pytest = "*"
 
 # Mitsuba 3 installed via: pixi run pip install mitsuba drjit
 # (Mitsuba is not in conda-forge, see docs/BPY_MITSUBA_FINDINGS.md)
+
+[activation.env]
+MODULAR_HOME = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/max"
+MOJO_PIXI_ENV = "$PIXI_PROJECT_ROOT/.pixi/envs/default"

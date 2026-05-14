@@ -57,14 +57,21 @@ class OmenTrainer:
         scene_graph,
         z_score: float = 0.0,
     ):
-        """Single JEPA training step with per-component optimizers."""
+        """Single training step: JEPA latent loss + decoder noise loss."""
         self.model.train()
 
-        predicted_latent = self.model.encode(scene_graph, noisy)
-        target_latent = self.model.encode(scene_graph, ground_truth)
+        # Encode noisy and GT images to latent space
+        predicted_latent, _ = self.model.encode(scene_graph, noisy)
+        target_latent, _ = self.model.encode(scene_graph, ground_truth)
+
+        # Decoder predicts noise/residual from (latent, noisy_image)
+        noisy_rgb = noisy[:, :, :, :3]
+        predicted_noise = self.model.decode(predicted_latent, noisy_rgb)
+        gt_residual = ground_truth[:, :, :, :3] - noisy_rgb
 
         total_loss, pred_loss, reg_loss = self.model.compute_loss(
-            predicted_latent, target_latent, config=self.config
+            predicted_latent, target_latent, config=self.config,
+            predicted_noise=predicted_noise, gt_residual=gt_residual,
         )
 
         total_loss.backward()

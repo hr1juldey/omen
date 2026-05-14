@@ -75,10 +75,20 @@ class AnimationDataGenerator:
 
     def _get_frames(self, scene_name: str | None, anim_name: str):
         """Resolve animation frames for the given scene."""
-        if scene_name != "cornell":
+        from omen.scenes import (
+            cornell_animations, veach_animations, shaderball_animations,
+            studio_animations, foggy_animations,
+        )
+        anim_funcs = {
+            "cornell": cornell_animations,
+            "veach": veach_animations,
+            "shaderball": shaderball_animations,
+            "studio": studio_animations,
+            "foggy": foggy_animations,
+        }
+        if scene_name not in anim_funcs:
             return None
-        from omen.scenes import cornell_animations
-        anims = cornell_animations(base_resolution=self.resolution)
+        anims = anim_funcs[scene_name](base_resolution=self.resolution)
         if anim_name not in anims:
             logger.warning("Animation '%s' not found, using camera_orbit", anim_name)
         return anims.get(anim_name, anims.get("camera_orbit"))

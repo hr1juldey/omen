@@ -3,7 +3,7 @@
 Architecture (~8M params total):
 - SceneGraphEncoder + RenderFeatureEncoder + CrossAttention (~3M)
 - ARPredictor with ConditionalBlock layers (~4M) [optional]
-- Decoder Conv2dTranspose (~1M)
+- Decoder U-Net residual noise predictor (~2M)
 - ConfidenceHead MLP
 - EpisodicCorrection (~100K params) [optional]
 - SIGReg loss (0 learnable params) [optional]
@@ -73,9 +73,13 @@ class OmenJEPA(nn.Module):
         fused = self.fusion(render_latent, scene_latent)
         return fused, scene_latent
 
-    def decode(self, latent, height, width):
-        """Decode latent to RGBA image."""
-        return self.decoder(latent, height, width)
+    def decode(self, latent, noisy_image):
+        """Predict noise/residual from latent + noisy image.
+
+        Returns residual map (B, H, W, 3).
+        Denoised = noisy_image - residual.
+        """
+        return self.decoder(latent, noisy_image)
 
     def predict_confidence(self, latent, height, width):
         """Predict per-pixel confidence map."""
@@ -94,13 +98,16 @@ class OmenJEPA(nn.Module):
 
         return self.ar_predictor(history, current_latent, delta_emb)
 
-    def compute_loss(self, predicted_latent, target_latent, config=None):
-        """Compute JEPA loss with config switches.
+    def compute_loss(self, predicted_latent, target_latent, config=None,
+                     predicted_noise=None, gt_residual=None):
+        """Compute JEPA loss + optional decoder noise prediction loss.
 
         Args:
             predicted_latent: (batch, latent_dim) predicted latent
             target_latent: (batch, latent_dim) ground truth latent
             config: OmenConfig (uses self.config if None)
+            predicted_noise: (batch, H, W, 3) decoder predicted noise [optional]
+            gt_residual: (batch, H, W, 3) ground truth residual (gt - noisy) [optional]
 
         Returns:
             total_loss, pred_loss, reg_loss
@@ -109,6 +116,10 @@ class OmenJEPA(nn.Module):
 
         # JEPA prediction loss
         pred_loss = F.mse_loss(predicted_latent, target_latent)
+
+        # Decoder noise prediction loss
+        if predicted_noise is not None and gt_residual is not None:
+            pred_loss = pred_loss + F.mse_loss(predicted_noise, gt_residual)
 
         # Regularization (respects config switches)
         reg_loss = self.sigreg(predicted_latent, config=cfg)

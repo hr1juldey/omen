@@ -19,9 +19,15 @@ class JEPAInference:
         try:
             nb_rgba = to_nabla(rgba.reshape(1, height, width, 4), self._is_gpu)
             nb_scene = {k: to_nabla(v, self._is_gpu) for k, v in scene_graph.items()}
-            latent = self.model.encode(nb_scene, nb_rgba)
-            clean = self.model.decode(latent, height, width)
-            return to_numpy(clean).reshape(height, width, 4)
+            latent, _ = self.model.encode(nb_scene, nb_rgba)
+            # Decoder predicts noise/residual; clean = noisy - noise
+            nb_noisy = nb_rgba[:, :, :, :3]  # RGB only for decoder
+            predicted_noise = self.model.decode(latent, nb_noisy)
+            clean = nb_noisy - predicted_noise
+            # Re-add alpha channel
+            alpha = nb_rgba[:, :, :, 3:4]
+            clean_rgba = nb.concatenate([clean, alpha], axis=-1)
+            return to_numpy(clean_rgba).reshape(height, width, 4)
         except Exception as exc:
             logger.error("JEPA denoise failed: %s", exc)
             return rgba
@@ -33,10 +39,17 @@ class JEPAInference:
         try:
             nb_rgba = to_nabla(rgba.reshape(1, height, width, 4), self._is_gpu)
             nb_scene = {k: to_nabla(v, self._is_gpu) for k, v in scene_graph.items()}
-            latent = self.model.encode(nb_scene, nb_rgba)
-            clean = to_numpy(self.model.decode(latent, height, width)).reshape(height, width, 4)
-            conf = to_numpy(self.model.predict_confidence(latent, height, width)).reshape(height, width, 1)
-            return clean, conf
+            latent, _ = self.model.encode(nb_scene, nb_rgba)
+            # Denoise: predict noise, subtract
+            nb_noisy = nb_rgba[:, :, :, :3]
+            predicted_noise = self.model.decode(latent, nb_noisy)
+            clean = nb_noisy - predicted_noise
+            alpha = nb_rgba[:, :, :, 3:4]
+            clean_rgba = nb.concatenate([clean, alpha], axis=-1)
+            conf = to_numpy(
+                self.model.predict_confidence(latent, height, width)
+            ).reshape(height, width, 1)
+            return to_numpy(clean_rgba).reshape(height, width, 4), conf
         except Exception as exc:
             logger.error("JEPA confidence failed: %s", exc)
             return rgba, np.ones((height, width, 1), dtype=np.float32)
