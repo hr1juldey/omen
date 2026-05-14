@@ -16,7 +16,7 @@ except ImportError:
 
 logger = logging.getLogger("omen.model.decoder")
 
-LATENT_DIM = 192
+LATENT_DIM = 1024
 
 
 class Decoder(nn.Module):

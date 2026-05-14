@@ -28,7 +28,7 @@ from omen.model.episodic import EpisodicCorrection
 
 logger = logging.getLogger("omen.model.jepa")
 
-LATENT_DIM = 192
+LATENT_DIM = 1024
 SIGREG_LAMBDA = 0.09
 
 

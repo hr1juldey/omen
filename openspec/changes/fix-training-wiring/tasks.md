@@ -43,13 +43,13 @@
 
 ## Phase 5: Validation
 
-- [ ] 5.1 Verify V1 dense config (`OmenConfig.v1_dense()`) initializes correctly: MoE OFF, AR OFF, SIGReg OFF, episodic ON
-- [ ] 5.2 Verify forward pass with V1 config produces valid output (no NaN, correct shapes)
-- [ ] 5.3 Verify train_step with V1 config trains only enabled components (check gradient flow with requires_grad tracing)
-- [ ] 5.4 Verify switching MoE ON mid-training doesn't crash (parameters exist, just weren't trained)
-- [ ] 5.5 Verify switching AR ON mid-training doesn't crash (history buffer starts empty, grows)
-- [ ] 5.6 Run existing test suite — all tests pass with default config
-- [ ] 5.7 Verify scene-graph routing produces different expert assignments than pixel fingerprint routing on a test scene
-- [ ] 5.8 Verify surprise lr modulation changes optimizer lr when z_score > 0
-- [ ] 5.9 Verify stratified replay buffer maintains per-scene diversity across 10+ scene additions
-- [ ] 5.10 Verify episodic correction has separate optimizer with lr=2e-2 (vs base 5e-5)
+- [x] 5.1 Verify V1 dense config (`OmenConfig.v1_dense()`) initializes correctly: MoE OFF, AR OFF, SIGReg OFF, episodic ON
+- [x] 5.2 Verify forward pass with V1 config produces valid output (no NaN, correct shapes)
+- [x] 5.3 Verify train_step with V1 config trains only enabled components (check gradient flow with requires_grad tracing)
+- [x] 5.4 Verify switching MoE ON mid-training doesn't crash (parameters exist, just weren't trained)
+- [x] 5.5 Verify switching AR ON mid-training doesn't crash (history buffer starts empty, grows)
+- [x] 5.6 Run existing test suite — all tests pass with default config (28 passed)
+- [x] 5.7 Verify scene-graph routing produces different expert assignments than pixel fingerprint routing on a test scene
+- [x] 5.8 Verify surprise lr modulation changes optimizer lr when z_score > 0
+- [x] 5.9 Verify stratified replay buffer maintains per-scene diversity across 10+ scene additions
+- [x] 5.10 Verify episodic correction has separate optimizer with lr=2e-2 (vs base 5e-5)

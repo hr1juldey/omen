@@ -22,7 +22,7 @@ except ImportError:
 
 logger = logging.getLogger("omen.model.scene_encoder")
 
-LATENT_DIM = 192
+LATENT_DIM = 1024
 NUM_HEADS = 8
 
 

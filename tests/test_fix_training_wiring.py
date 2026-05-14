@@ -178,9 +178,9 @@ class TestStratifiedReplayBuffer:
         result = buffer.replay_ratio_count(5)
         assert result == 5, f"Expected 5, got {result}"
 
-        # 2:1 ratio (2 replay for 1 new = ratio=2/3): 3 new -> 2 replay
+        # 2:1 ratio (ratio=2/3): 3 new -> 6 replay (formula: 3 * 2/3 / 1/3 = 6)
         buffer2 = StratifiedReplayBuffer(max_size=100, replay_ratio=2/3)
-        assert buffer2.replay_ratio_count(3) == 2
+        assert buffer2.replay_ratio_count(3) == 6
 
     def test_replay_buffer_clear(self):
         """Verify clear() empties all buffers."""
@@ -279,11 +279,11 @@ class TestSimpleVarianceRegularization:
 
         # Create latent with unit variance (std = 1)
         # Expected loss: -log(1 + eps) ≈ 0
-        latent_unit = np.random.randn(100, 192)  # ~N(0,1)
+        latent_unit = np.random.randn(100, 1024)  # ~N(0,1)
 
         # Create latent with low variance (std ≈ 0.1)
         # Expected loss: -log(0.1 + eps) > 0 (penalty for collapse)
-        latent_low = np.random.randn(100, 192) * 0.1
+        latent_low = np.random.randn(100, 1024) * 0.1
 
         # Low variance should have higher loss (penalty for collapse)
         # Note: This is a conceptual test; actual values depend on eps
@@ -293,9 +293,10 @@ class TestSimpleVarianceRegularization:
         """Verify SIGRegLoss.forward() respects config switches."""
         from omen.model.sigreg import SIGRegLoss
         import nabla as nb
+        import numpy as np
 
         sigreg = SIGRegLoss()
-        embeddings = nb.randn((10, 192))
+        embeddings = nb.Tensor.from_dlpack(np.random.randn(10, 1024).astype(np.float32))
 
         # simple_var_reg ON
         config_on = OmenConfig()

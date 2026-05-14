@@ -20,7 +20,7 @@ except ImportError:
 
 logger = logging.getLogger("omen.model.arpredictor")
 
-LATENT_DIM = 192
+LATENT_DIM = 1024
 NUM_HEADS = 8
 NUM_LAYERS = 4
 HISTORY_SIZE = 3

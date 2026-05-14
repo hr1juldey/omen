@@ -79,7 +79,7 @@ class StratifiedReplayBuffer:
         # Avoid division by zero, handle edge case where ratio >= 1
         if self.replay_ratio >= 1.0:
             return 0
-        return int(new_count * self.replay_ratio / (1.0 - self.replay_ratio))
+        return round(new_count * self.replay_ratio / (1.0 - self.replay_ratio))
 
     def _trim(self) -> None:
         """Trim buffers to maintain total max_size."""
