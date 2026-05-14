@@ -73,13 +73,13 @@ class StratifiedReplayBuffer:
     def replay_ratio_count(self, new_count: int) -> int:
         """How many replay samples for N new samples (1:1 ratio).
 
-        Args:
-            new_count: Number of new training samples
-
-        Returns:
-            Number of replay samples to interleave
+        For replay_ratio=0.5: 50% new, 50% replay → 1 new = 1 replay
+        Formula: replay = new * ratio / (1 - ratio)
         """
-        return int(new_count * self.replay_ratio / (1 - self.replay_ratio))
+        # Avoid division by zero, handle edge case where ratio >= 1
+        if self.replay_ratio >= 1.0:
+            return 0
+        return int(new_count * self.replay_ratio / (1.0 - self.replay_ratio))
 
     def _trim(self) -> None:
         """Trim buffers to maintain total max_size."""

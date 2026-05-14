@@ -30,6 +30,10 @@ class OmenConfig:
         cfg = OmenConfig()
         cfg.components.moe = True
         cfg.components.scene_graph_routing = True
+        cfg.components.moe_materials = True
+        cfg.components.moe_lights = True
+        cfg.components.moe_geometry = True
+        cfg.components.moe_motion = True
         return cfg
 
     @staticmethod
@@ -85,9 +89,10 @@ class OmenConfig:
         if c.ar_predictor and not c.scene_delta_encoder:
             errors.append("ARPredictor requires scene_delta_encoder")
 
-        if not c.moe:
-            if any([c.moe_materials, c.moe_lights, c.moe_geometry, c.moe_motion]):
-                errors.append("MoE sub-switches require moe=True")
+        # Only check sub-switches if MoE is OFF
+        # When MoE is ON, sub-switches can be True or False independently
+        if not c.moe and any([c.moe_materials, c.moe_lights, c.moe_geometry, c.moe_motion]):
+            errors.append("MoE sub-switches require moe=True")
 
         if c.scene_graph_routing and not c.moe:
             errors.append("Scene-graph routing requires moe=True")

@@ -20,10 +20,10 @@ class ComponentSwitches:
 
     # MoE system
     moe: bool = False
-    moe_materials: bool = True
-    moe_lights: bool = True
-    moe_geometry: bool = True
-    moe_motion: bool = True
+    moe_materials: bool = False  # Only relevant when moe=True
+    moe_lights: bool = False
+    moe_geometry: bool = False
+    moe_motion: bool = False
     scene_graph_routing: bool = False
 
     # Temporal

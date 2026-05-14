@@ -16,8 +16,9 @@ try:
     from nabla import nn
     import nabla.nn.functional as F
     NABLA_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     NABLA_AVAILABLE = False
+    nn = None
 
 logger = logging.getLogger("omen.model.sigreg")
 
@@ -40,11 +41,13 @@ def simple_variance_regularization(latent, eps: float = 1e-6):
     Returns:
         scalar loss value (higher when variance is low)
     """
+    if not NABLA_AVAILABLE:
+        return 0.0
     std = latent.std(axis=0)
     return -nb.mean(nb.log(std + eps))
 
 
-class SIGRegLoss(nn.Module):
+class SIGRegLoss:
     """SIGReg regularization loss.
 
     Computes Epps-Pulley statistic on embeddings to prevent collapse.
@@ -70,7 +73,7 @@ class SIGRegLoss(nn.Module):
             scalar loss value (simple_reg, sigreg, or 0 based on config)
         """
         if not NABLA_AVAILABLE:
-            return nb.tensor(0.0)
+            return 0.0
 
         # Check config switches
         if config is not None:

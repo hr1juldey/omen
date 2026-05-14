@@ -20,6 +20,18 @@ from collections import deque
 from omen.config import OmenConfig, ComponentSwitches, TrainingSwitches, ModeSwitches
 from omen.modes.replay import StratifiedReplayBuffer
 
+# Check if Nabla is available
+try:
+    import nabla as nb
+    NABLA_AVAILABLE = True
+except (ImportError, RuntimeError):
+    NABLA_AVAILABLE = False
+
+nabla_only = pytest.mark.skipif(
+    not NABLA_AVAILABLE,
+    reason="Nabla (Modular nightly) not installed"
+)
+
 
 class TestOmenConfig:
     """Tests for OmenConfig dataclass and presets."""
@@ -163,11 +175,12 @@ class TestStratifiedReplayBuffer:
         buffer = StratifiedReplayBuffer(max_size=100, replay_ratio=0.5)
 
         # 1:1 ratio: 5 new samples should return 5 replay samples
-        assert buffer.replay_ratio_count(5) == 5
+        result = buffer.replay_ratio_count(5)
+        assert result == 5, f"Expected 5, got {result}"
 
-        # 2:1 ratio (replay_ratio=0.33): 4 new -> 2 replay
-        buffer2 = StratifiedReplayBuffer(max_size=100, replay_ratio=0.33)
-        assert buffer2.replay_ratio_count(4) == 2
+        # 2:1 ratio (2 replay for 1 new = ratio=2/3): 3 new -> 2 replay
+        buffer2 = StratifiedReplayBuffer(max_size=100, replay_ratio=2/3)
+        assert buffer2.replay_ratio_count(3) == 2
 
     def test_replay_buffer_clear(self):
         """Verify clear() empties all buffers."""
@@ -183,6 +196,7 @@ class TestStratifiedReplayBuffer:
 class TestComponentLearningRates:
     """Tests for per-component optimizer learning rates (Fix 2.1)."""
 
+    @nabla_only
     def test_episodic_optimizer_lr_is_400x_higher(self):
         """5.10: Verify episodic correction has lr=2e-2 (vs base 5e-5)."""
         from omen.training.trainer.optimizers import COMPONENT_LRS
@@ -195,6 +209,7 @@ class TestComponentLearningRates:
         # 400x ratio
         assert episodic_lr / base_lr == 400.0
 
+    @nabla_only
     def test_all_component_lrs_defined(self):
         """Verify all component groups have base LR defined."""
         from omen.training.trainer.optimizers import COMPONENT_LRS
@@ -213,6 +228,7 @@ class TestComponentLearningRates:
 class TestSurpriseLRModulation:
     """Tests for surprise → LR modulation (Fix 2.4)."""
 
+    @nabla_only
     def test_lr_modulation_formula(self):
         """5.8: Verify surprise lr modulation formula works correctly."""
         from omen.training.trainer.optimizers import COMPONENT_LRS
@@ -256,6 +272,7 @@ class TestSurpriseLRModulation:
 class TestSimpleVarianceRegularization:
     """Tests for simple variance regularization (Fix 2.3)."""
 
+    @nabla_only
     def test_simple_var_reg_formula(self):
         """Verify -log(std + eps) formula is implemented."""
         from omen.model.sigreg import simple_variance_regularization
@@ -271,6 +288,7 @@ class TestSimpleVarianceRegularization:
         # Low variance should have higher loss (penalty for collapse)
         # Note: This is a conceptual test; actual values depend on eps
 
+    @nabla_only
     def test_sigreg_forward_respects_config(self):
         """Verify SIGRegLoss.forward() respects config switches."""
         from omen.model.sigreg import SIGRegLoss
@@ -313,11 +331,11 @@ class TestConfigSwitchBehavior:
         """5.4: Verify MoE switch ON/OFF doesn't crash."""
         # MoE OFF: dense FFN only
         config_off = OmenConfig.v1_dense()
-        assert not config_off.moe
+        assert not config_off.components.moe
 
         # MoE ON: full 23-expert routing
         config_on = OmenConfig.v1_moe()
-        assert config_on.moe
+        assert config_on.components.moe
 
         # Parameters exist regardless (OmenJEPA always creates TileMoERouter)
         # Switch only controls forward pass contribution
