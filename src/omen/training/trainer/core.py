@@ -1,4 +1,4 @@
-"""OmenTrainer core class with per-component optimizers."""
+"""OmenTrainer: functional value_and_grad + per-component AdamW."""
 
 import logging
 import os
@@ -6,14 +6,16 @@ import os
 import numpy as np
 
 from omen.config import OmenConfig
-from omen.training.trainer.gradient import _clip_grad_norm
-from omen.training.trainer.optimizers import COMPONENT_LRS, create_optimizers
+from omen.training.trainer.gradient import clip_grad_norm_pytree
+from omen.training.trainer.loss import compute_training_loss
+from omen.training.trainer.optimizers import create_functional_optimizers
 
 logger = logging.getLogger("omen.training.trainer")
 
 try:
     import nabla as nb
-    from nabla import nn
+    from nabla.nn.optim import adamw_update
+
     NABLA_AVAILABLE = True
 except (ImportError, RuntimeError):
     NABLA_AVAILABLE = False
@@ -24,14 +26,10 @@ DEFAULT_GRADIENT_CLIP = 1.0
 
 
 class OmenTrainer:
-    """Nabla PyTorch-style trainer with per-component optimizers."""
+    """Functional trainer using ``nb.value_and_grad`` and per-component AdamW."""
 
     def __init__(
-        self,
-        model,
-        config: OmenConfig = None,
-        lr: float = DEFAULT_LR,
-        weight_decay: float = DEFAULT_WEIGHT_DECAY,
+        self, model, config=None, lr=DEFAULT_LR, weight_decay=DEFAULT_WEIGHT_DECAY
     ):
         if not NABLA_AVAILABLE:
             raise ImportError("Nabla required for training")
@@ -45,68 +43,60 @@ class OmenTrainer:
         if errors:
             raise ValueError(f"Invalid config: {'; '.join(errors)}")
 
-        self._optimizers, self._component_params = create_optimizers(
-            self.model, self.config, self.weight_decay
+        self._components = create_functional_optimizers(
+            self.model,
+            self.config,
+            self.weight_decay,
         )
-        logger.info("Created %d optimizers", len(self._optimizers))
 
-    def train_step(
-        self,
-        noisy,
-        ground_truth,
-        scene_graph,
-        z_score: float = 0.0,
-    ):
-        """Single training step: JEPA latent loss + decoder noise loss."""
+    def train_step(self, noisy, ground_truth, scene_graph, z_score=0.0):
+        """Single training step via ``nb.value_and_grad``."""
         self.model.train()
 
-        # Encode noisy and GT images to latent space
-        predicted_latent, _ = self.model.encode(scene_graph, noisy)
-        target_latent, _ = self.model.encode(scene_graph, ground_truth)
+        params = self.model.state_dict()
+        total_loss, grads = nb.value_and_grad(
+            compute_training_loss,
+            argnums=0,
+        )(params, self.model, noisy, ground_truth, scene_graph, self.config)
 
-        # Decoder predicts noise/residual from (latent, noisy_image)
-        noisy_rgb = noisy[:, :, :, :3]
-        predicted_noise = self.model.decode(predicted_latent, noisy_rgb)
-        gt_residual = ground_truth[:, :, :, :3] - noisy_rgb
+        grads = clip_grad_norm_pytree(grads, DEFAULT_GRADIENT_CLIP)
+        new_params = self._apply_optimizer_updates(params, grads, z_score)
+        self.model.load_state_dict(new_params)
 
-        total_loss, pred_loss, reg_loss = self.model.compute_loss(
-            predicted_latent, target_latent, config=self.config,
-            predicted_noise=predicted_noise, gt_residual=gt_residual,
-        )
-
-        total_loss.backward()
-        _clip_grad_norm(self.model.parameters(), DEFAULT_GRADIENT_CLIP)
-
-        applied_lrs = {}
-        for name, optimizer in self._active_optimizers():
-            lr = self._compute_lr(name, z_score)
-            optimizer.lr = lr
-            self.model = optimizer.step()
-            applied_lrs[name] = lr
-
-        self.model.zero_grad()
         self.iteration += 1
-
         return {
             "total_loss": float(total_loss.to_numpy().sum()),
-            "pred_loss": float(pred_loss.to_numpy().sum()),
-            "reg_loss": float(reg_loss.to_numpy().sum()),
             "iteration": self.iteration,
-            "applied_lrs": applied_lrs,
             "z_score": z_score,
         }
 
-    def _active_optimizers(self):
-        """Return list of (name, optimizer) for enabled components."""
-        return [(n, opt) for n, opt in self._optimizers.items()]
-
-    def _compute_lr(self, component_name: str, z_score: float = 0.0) -> float:
-        """Compute learning rate with surprise modulation."""
-        base_lr = COMPONENT_LRS.get(component_name, DEFAULT_LR)
+    def _compute_lr(self, component_name, z_score=0.0):
+        """Compute learning rate with optional surprise modulation."""
+        base_lr = self._components[component_name]["lr"]
         if not self.config.training.surprise_lr_modulation or z_score <= 0:
             return base_lr
         scale = self.config.training.surprise_lr_scale
         return base_lr * (1.0 + scale * min(z_score, 5.0))
+
+    def _apply_optimizer_updates(self, params, grads, z_score):
+        """Per-component ``adamw_update`` with surprise-modulated LRs."""
+        new_params = dict(params)
+        for name, comp in self._components.items():
+            names = comp["param_names"]
+            subset_p = {n: params[n] for n in names}
+            subset_g = {n: grads[n] for n in names}
+            lr = self._compute_lr(name, z_score)
+
+            updated_p, new_state = adamw_update(
+                subset_p,
+                subset_g,
+                comp["state"],
+                lr=lr,
+                weight_decay=comp["weight_decay"],
+            )
+            comp["state"] = new_state
+            new_params.update(updated_p)
+        return new_params
 
     def save_checkpoint(self, path):
         """Save model state dict and config to disk."""
@@ -128,10 +118,9 @@ class OmenTrainer:
 
         if "__config__" in data.files:
             try:
-                config_dict = data["__config__"].item()
-                self.config = OmenConfig.from_dict(config_dict)
-            except Exception as e:
-                logger.warning("Failed to load config, using default: %s", e)
+                self.config = OmenConfig.from_dict(data["__config__"].item())
+            except Exception as exc:
+                logger.warning("Failed to load config, using default: %s", exc)
                 self.config = OmenConfig.v1_dense()
         else:
             self.config = OmenConfig.v1_dense()
@@ -144,7 +133,9 @@ class OmenTrainer:
         self.model.load_state_dict(state_dict)
         self.iteration = int(data.get("__iteration__", 0))
 
-        self._optimizers, self._component_params = create_optimizers(
-            self.model, self.config, self.weight_decay
+        self._components = create_functional_optimizers(
+            self.model,
+            self.config,
+            self.weight_decay,
         )
         logger.info("Resumed from iteration %d", self.iteration)

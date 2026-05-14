@@ -1,19 +1,28 @@
-"""Gradient clipping utility for Nabla training."""
+"""Gradient clipping on pytree dicts for functional Nabla training."""
+
+from nabla import tree_map
 
 
-def _clip_grad_norm(parameters, max_norm):
-    """Clip gradient norm to prevent explosion."""
-    try:
-        total_norm = 0.0
-        for p in parameters:
-            if p.grad is not None:
-                total_norm += (p.grad ** 2).sum().to_numpy().item()
-        total_norm = total_norm ** 0.5
+def clip_grad_norm_pytree(grads, max_norm):
+    """Clip gradient norm on a ``{name: Tensor}`` pytree.
 
-        if total_norm > max_norm:
-            scale = max_norm / (total_norm + 1e-6)
-            for p in parameters:
-                if p.grad is not None:
-                    p.grad = p.grad * scale
-    except Exception:
-        pass
+    Unlike the imperative version that reads ``p.grad``, this operates
+    directly on the gradient dict returned by ``nb.value_and_grad``.
+
+    Args:
+        grads: ``{name: Tensor}`` gradient pytree.
+        max_norm: Maximum allowed global L2 norm.
+
+    Returns:
+        Clipped gradient pytree with the same structure.
+    """
+    total_sq = 0.0
+    for g in grads.values():
+        total_sq = total_sq + (g**2).sum().to_numpy().item()
+    total_norm = total_sq**0.5
+
+    if total_norm <= max_norm:
+        return grads
+
+    scale = max_norm / (total_norm + 1e-6)
+    return tree_map(lambda g: g * scale, grads)
