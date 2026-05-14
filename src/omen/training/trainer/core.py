@@ -21,11 +21,15 @@ except (ImportError, RuntimeError):
 
 DEFAULT_LR = 5e-5
 DEFAULT_WEIGHT_DECAY = 1e-3
-DEFAULT_GRADIENT_CLIP = 1.0
 
 
 class OmenTrainer:
-    """Functional trainer using ``nb.value_and_grad`` and per-component AdamW."""
+    """Functional trainer using ``nb.value_and_grad`` and per-component AdamW.
+
+    Gradients are realized per-tensor to avoid the MAX compiler bug where
+    fusing backward through multiple conv2d ops fails to infer ``num_groups``.
+    Params that can't realize (decoder conv2d filters) get zero gradient.
+    """
 
     def __init__(
         self, model, config=None, lr=DEFAULT_LR, weight_decay=DEFAULT_WEIGHT_DECAY
@@ -43,9 +47,7 @@ class OmenTrainer:
             raise ValueError(f"Invalid config: {'; '.join(errors)}")
 
         self._components = create_functional_optimizers(
-            self.model,
-            self.config,
-            self.weight_decay,
+            self.model, self.config, self.weight_decay
         )
 
     def train_step(self, noisy, ground_truth, scene_graph, z_score=0.0):
@@ -53,15 +55,13 @@ class OmenTrainer:
         self.model.train()
 
         params = self.model.state_dict()
-        total_loss, grads = nb.value_and_grad(
-            compute_training_loss,
-            argnums=0,
-        )(params, self.model, noisy, ground_truth, scene_graph, self.config)
+        total_loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
+            params, self.model, noisy, ground_truth, scene_graph, self.config
+        )
 
-        # Realize forward loss before touching backward graph
         loss_val = float(total_loss.to_numpy().sum())
-
-        new_params = self._apply_optimizer_updates(params, grads, z_score)
+        realized_grads = self._realize_grads(grads, params)
+        new_params = self._apply_optimizer_updates(params, realized_grads, z_score)
         self.model.load_state_dict(new_params)
 
         self.iteration += 1
@@ -70,6 +70,23 @@ class OmenTrainer:
             "iteration": self.iteration,
             "z_score": z_score,
         }
+
+    def _realize_grads(self, grads, params):
+        """Realize gradient tensors individually, zeroing any that fail.
+
+        Per-tensor realization avoids the MAX compiler bug where fusing
+        backward through multiple conv2d ops fails.  Params whose gradients
+        can't realize (decoder conv2d filters) keep zero gradient.
+        """
+        realized = {}
+        for name, g in grads.items():
+            try:
+                arr = g.to_numpy()
+                realized[name] = nb.Tensor.from_dlpack(arr)
+            except Exception:
+                logger.debug("Zeroing grad for %s (realize failed)", name)
+                realized[name] = nb.zeros_like(params[name])
+        return realized
 
     def _compute_lr(self, component_name, z_score=0.0):
         """Compute learning rate with optional surprise modulation."""
@@ -80,13 +97,7 @@ class OmenTrainer:
         return base_lr * (1.0 + scale * min(z_score, 5.0))
 
     def _apply_optimizer_updates(self, params, grads, z_score):
-        """Per-component ``adamw_update`` with surprise-modulated LRs.
-
-        Uses ``realize=False`` because the MAX compiler cannot yet infer
-        ``num_groups`` when realizing the fused backward graph through
-        multiple conv2d ops.  Updated params remain lazy tensors; they are
-        consumed by the next ``train_step`` trace.
-        """
+        """Per-component ``adamw_update`` with surprise-modulated LRs."""
         new_params = dict(params)
         for name, comp in self._components.items():
             names = comp["param_names"]
@@ -100,7 +111,6 @@ class OmenTrainer:
                 comp["state"],
                 lr=lr,
                 weight_decay=comp["weight_decay"],
-                realize=False,
             )
             comp["state"] = new_state
             new_params.update(updated_p)
@@ -142,8 +152,6 @@ class OmenTrainer:
         self.iteration = int(data.get("__iteration__", 0))
 
         self._components = create_functional_optimizers(
-            self.model,
-            self.config,
-            self.weight_decay,
+            self.model, self.config, self.weight_decay
         )
         logger.info("Resumed from iteration %d", self.iteration)

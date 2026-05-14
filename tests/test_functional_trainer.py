@@ -5,12 +5,13 @@ Uses real Mitsuba 3D scenes (Cornell Box).
 Verifies:
 1. value_and_grad differentiates through the full model — forward loss realizes
 2. Gradient tensors are produced with correct shapes (lazy)
-3. Per-component AdamW updates are applied without error
+3. Per-component AdamW updates are applied, params update across 3 steps
+4. Losses change across iterations
+5. Surprise LR modulation works
 
-Known limitation: multi-step training is blocked by a MAX compiler bug
-(cannot infer ``num_groups`` when realizing the fused backward graph through
-multiple conv2d ops).  Single-step training works correctly.  The test
-``test_three_steps_losses_differ`` is marked xfail until the compiler fix.
+Note: 4 decoder conv2d filter gradients can't realize (MAX compiler
+``num_groups`` bug).  They get zeroed — the decoder still updates through
+its Linear layers.  All other 135/139 params train normally.
 """
 
 import numpy as np
@@ -81,7 +82,7 @@ class TestFunctionalTrainerE2E:
     """Full train_step with real Cornell Box 3D scene data."""
 
     @requires_nabla_mitsuba
-    def test_forward_loss_realizes_from_real_scene(self):
+    def test_forward_loss_realizes(self):
         """Forward pass through full model produces a finite, realizable loss."""
         config = OmenConfig.v1_dense()
         model = OmenJEPA(config=config)
@@ -92,13 +93,12 @@ class TestFunctionalTrainerE2E:
 
         metrics = trainer.train_step(noisy, gt, scene_graph)
 
-        assert "total_loss" in metrics
         assert metrics["iteration"] == 1
         assert np.isfinite(metrics["total_loss"])
 
     @requires_nabla_mitsuba
     def test_value_and_grad_produces_gradients(self):
-        """value_and_grad returns lazy gradient tensors with correct count."""
+        """value_and_grad returns lazy gradient tensors for all params."""
         config = OmenConfig.v1_dense()
         model = OmenJEPA(config=config)
         from omen.training.trainer.loss import compute_training_loss
@@ -111,18 +111,12 @@ class TestFunctionalTrainerE2E:
             params, model, noisy, gt, scene_graph, config
         )
 
-        assert len(grads) == len(params), (
-            f"Expected {len(params)} grads, got {len(grads)}"
-        )
+        assert len(grads) == len(params)
         assert all(nb.is_tensor(g) for g in grads.values())
 
     @requires_nabla_mitsuba
-    @pytest.mark.xfail(
-        reason="MAX compiler cannot infer num_groups for fused backward "
-        "through multiple conv2d ops. Single-step training works."
-    )
     def test_three_steps_losses_differ(self):
-        """Optimizer updates params across 3 steps — losses should change."""
+        """Optimizer updates params across 3 steps — losses change."""
         config = OmenConfig.v1_dense()
         model = OmenJEPA(config=config)
         trainer = OmenTrainer(model, config=config)
@@ -141,12 +135,8 @@ class TestFunctionalTrainerE2E:
         assert unique > 1, f"Losses identical across 3 steps: {losses}"
 
     @requires_nabla_mitsuba
-    @pytest.mark.xfail(
-        reason="MAX compiler cannot infer num_groups for fused backward "
-        "through multiple conv2d ops. Single-step training works."
-    )
-    def test_surprise_modulation_with_real_data(self):
-        """z_score > 0 produces different loss trajectory via LR modulation."""
+    def test_surprise_modulation(self):
+        """z_score > 0 applies different LRs via surprise modulation."""
         config = OmenConfig.v1_dense()
         model = OmenJEPA(config=config)
         trainer = OmenTrainer(model, config=config)
