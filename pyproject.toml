@@ -12,6 +12,9 @@ requires-python = ">=3.10"
 dependencies = [
     "mitsuba>=3.8.0",
     "drjit>=0.5.0",
+    "pytest>=9.0.3",
+    "hypothesis>=6.152.7",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.setuptools.packages.find]
