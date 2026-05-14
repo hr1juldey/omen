@@ -92,7 +92,7 @@ class SceneGraphEncoder(nn.Module):
             params = mats.get("params", None)
             if params is not None and len(params.shape) >= 2:
                 mat_emb = self.mat_linear(params)
-                features.append(mat_emb)
+                features.append(nb.mean(mat_emb, axis=1))
 
         # Light features
         lights = scene_graph.get("lights", {})
@@ -100,7 +100,7 @@ class SceneGraphEncoder(nn.Module):
             params = lights.get("params", None)
             if params is not None and len(params.shape) >= 2:
                 light_emb = self.light_linear(params)
-                features.append(light_emb)
+                features.append(nb.mean(light_emb, axis=1))
 
         if not features:
             # Empty scene - return zeros

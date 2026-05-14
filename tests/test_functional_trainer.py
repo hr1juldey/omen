@@ -40,12 +40,28 @@ def _t(arr):
     return nb.Tensor.from_dlpack(np.asarray(arr, dtype=np.float32))
 
 
+def _to_tensor(arr, batch=False):
+    """Convert numpy array to nabla tensor, optionally adding batch dim."""
+    a = np.asarray(arr, dtype=np.float32)
+    if batch:
+        a = a[np.newaxis]
+    return nb.Tensor.from_dlpack(a)
+
+
 def _make_real_scene_graph():
-    """Build a real Cornell Box scene graph via build_cornell_box()."""
+    """Build a real Cornell Box scene graph with nabla tensors."""
     from omen.scenes import build_cornell_box
 
-    _scene, scene_graph = build_cornell_box(resolution=(32, 32))
-    return scene_graph
+    _scene, sg = build_cornell_box(resolution=(32, 32))
+    # Convert numpy arrays to nabla tensors with batch dim
+    return {
+        "geometry": {
+            "vertices": _to_tensor(sg["geometry"]["vertices"], batch=True),
+            "faces": sg["geometry"]["faces"],
+        },
+        "materials": {"params": _to_tensor(sg["materials"]["params"], batch=True)},
+        "lights": {"params": _to_tensor(sg["lights"]["params"], batch=True)},
+    }
 
 
 def _render_real_pair(scene_graph, spp_gt=16, spp_noisy=2):
