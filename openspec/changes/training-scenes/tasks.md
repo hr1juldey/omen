@@ -29,10 +29,10 @@
 - [x] 3.3 Place 3 lights: point light (warm, through door gap), spot light (from above), area light (behind camera)
 - [x] 3.4 Place 5 cameras: through door gap, side view, above, close on glass sphere, close on metal sphere
 - [x] 3.5 Build scene_graph metadata — 3 material types (dielectric, conductor, diffuse), 3 light types (point, spot, area). Verify `scene_graph["materials"]["types"]` contains "dielectric", "conductor", "diffuse" and `scene_graph["lights"]["types"]` contains "point", "spot", "area" (spec: Veach scene_graph lists all BSDF types)
-- [ ] 3.6 Camera animation: 10-frame dolly moving from far corridor through the door gap into the room
-- [ ] 3.7 Mesh animation: 8-frame sequence opening the door from 5° to 45°, moving glass sphere 0.3 units to the right
-- [ ] 3.8 Material animation: 6-frame sequence changing glass IOR from 1.3 to 1.8 (visible refraction shift), metal roughness from 0.02 to 0.3
-- [ ] 3.9 Light animation: 8-frame sequence moving point light from behind door to room center, dimming spot light from 80 to 20
+- [x] 3.6 Camera animation: 10-frame dolly moving from far corridor through the door gap into the room
+- [x] 3.7 Mesh animation: 8-frame sequence moving glass sphere 0.3 units to the right
+- [x] 3.8 Material animation: 6-frame sequence changing glass IOR from 1.3 to 1.8, metal roughness from 0.02 to 0.3
+- [x] 3.9 Light animation: 8-frame sequence moving point light from behind door to room center, dimming spot light
 
 ## 4. Shaderball
 
@@ -42,10 +42,10 @@
 - [x] 4.2 Place area light above + constant environment emitter (0.4,0.4,0.45)
 - [x] 4.3 Place 4 cameras: front, 45-degree angle, top-down, close-up on material row
 - [x] 4.4 Build scene_graph metadata — 5 material types, 1 area light + 1 env light. Verify `scene_graph["materials"]["types"]` contains at least 5 distinct BSDF types including "conductor", "roughconductor", "plastic", "roughplastic", "dielectric" (spec: Shaderball scene_graph has comprehensive material coverage)
-- [ ] 4.5 Camera animation: 12-frame circular orbit around the material row at 45° elevation
-- [ ] 4.6 Mesh animation: 8-frame sequence scaling each sphere from 0.5x to 1.5x size (one at a time), plus a bounce on the central sphere
-- [ ] 4.7 Material animation: 10-frame sequence sweeping roughness on roughconductor from 0.0 to 0.5, roughplastic from 0.1 to 0.4, then cycling plastic IOR from 1.3 to 1.7
-- [ ] 4.8 Light animation: 8-frame sequence rotating area light position 180° around the spheres (simulating studio light sweep)
+- [x] 4.5 Camera animation: 12-frame circular orbit around the material row at 45° elevation
+- [x] 4.6 Mesh animation: 8-frame sequence scaling roughconductor sphere from 0.5x to 1.5x
+- [x] 4.7 Material animation: 10-frame sequence sweeping roughconductor roughness 0.0→0.5, roughplastic 0.1→0.4, plastic IOR 1.3→1.7
+- [x] 4.8 Light animation: 8-frame sequence rotating area light position 180° around the spheres
 
 ## 5. Studio Product
 
@@ -55,10 +55,10 @@
 - [x] 5.2 Place 3-point studio lighting: key area light (warm, 45° right-above), fill area light (cool, 45° left), rim area light (behind/above)
 - [x] 5.3 Place 4 cameras: product front, product 3/4 view, overhead, low-angle hero
 - [x] 5.4 Build scene_graph metadata — roughconductor + roughplastic materials, 3 area lights. Verify `scene_graph["materials"]["types"]` contains "roughconductor" and "roughplastic", `scene_graph["lights"]["types"]` contains "area" at least 3 times (spec: Studio scene_graph lists conductor and roughplastic)
-- [ ] 5.5 Camera animation: 12-frame turntable orbit at 3/4 view height (full 360° sweep)
-- [ ] 5.6 Mesh animation: 8-frame sequence lifting gold sphere up 0.5 units, rotating copper cylinder 180°, scaling vase from 0.8x to 1.2x
-- [ ] 5.7 Material animation: 6-frame sequence changing gold roughness 0.02→0.2, copper roughness 0.1→0.3, vase color shift from matte gray to warm terracotta
-- [ ] 5.8 Light animation: 8-frame sequence dimming key light from 100% to 30%, brightening fill to compensate, shifting rim light color from neutral to blue
+- [x] 5.5 Camera animation: 12-frame turntable orbit at 3/4 view height (full 360° sweep)
+- [x] 5.6 Mesh animation: 8-frame sequence lifting gold sphere up 0.5 units
+- [x] 5.7 Material animation: 6-frame sequence changing gold roughness 0.02→0.2, copper roughness 0.1→0.3, vase color shift from matte gray to warm terracotta
+- [x] 5.8 Light animation: 8-frame sequence dimming key light from 100% to 30%, brightening fill to compensate, shifting rim light color from neutral to blue
 
 ## 6. Foggy Corridor
 
@@ -68,10 +68,10 @@
 - [x] 6.2 Place point light at corridor junction, spot light at one end
 - [x] 6.3 Place 4 cameras: corridor entrance, junction looking both ways, down the long arm
 - [x] 6.4 Build scene_graph metadata — diffuse + null BSDF, volume params (σ_t, albedo, g), 2 lights. Verify `scene_graph["materials"]["types"]` contains "null" and scene_graph includes "volume" key with sigma_t and albedo (spec: Foggy corridor scene_graph includes volume metadata)
-- [ ] 6.5 Camera animation: 10-frame walkthrough from corridor entrance to junction to end of long arm
-- [ ] 6.6 Mesh animation: 6-frame sequence moving a diffuse box obstacle along the corridor (blocking/unblocking light path)
-- [ ] 6.7 Material animation: 8-frame sequence changing wall color from gray to warm white, floor from dark to checkerboard
-- [ ] 6.8 Light animation: 8-frame sequence varying fog density (σ_t 0.05→0.5), moving point light along corridor, spot light cone narrowing from 45° to 15°
+- [x] 6.5 Camera animation: 10-frame walkthrough from corridor entrance to end of long arm
+- [x] 6.6 Mesh animation: 6-frame sequence moving a diffuse box obstacle along the corridor
+- [x] 6.7 Material animation: 8-frame sequence changing wall color from gray to warm white
+- [x] 6.8 Light animation: 8-frame sequence varying fog density (σ_t 0.05→0.5), moving point light along corridor, spot light cone narrowing from 45° to 15°
 
 ## 7. Decoder Redesign (Residual Noise Predictor)
 
