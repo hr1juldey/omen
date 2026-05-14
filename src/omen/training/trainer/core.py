@@ -8,7 +8,7 @@ import numpy as np
 from omen.config import OmenConfig
 from omen.training.trainer.gradient import clip_grad_norm_pytree
 from omen.training.trainer.loss import compute_training_loss
-from omen.training.trainer.optimizers import create_functional_optimizers
+from omen.training.trainer.optimizers import COMPONENT_LRS, create_functional_optimizers
 
 logger = logging.getLogger("omen.training.trainer")
 
@@ -59,13 +59,13 @@ class OmenTrainer:
             argnums=0,
         )(params, self.model, noisy, ground_truth, scene_graph, self.config)
 
-        grads = clip_grad_norm_pytree(grads, DEFAULT_GRADIENT_CLIP)
         new_params = self._apply_optimizer_updates(params, grads, z_score)
         self.model.load_state_dict(new_params)
 
         self.iteration += 1
+        loss_val = float(total_loss.to_numpy().sum())
         return {
-            "total_loss": float(total_loss.to_numpy().sum()),
+            "total_loss": loss_val,
             "iteration": self.iteration,
             "z_score": z_score,
         }
@@ -79,7 +79,11 @@ class OmenTrainer:
         return base_lr * (1.0 + scale * min(z_score, 5.0))
 
     def _apply_optimizer_updates(self, params, grads, z_score):
-        """Per-component ``adamw_update`` with surprise-modulated LRs."""
+        """Per-component ``adamw_update`` with surprise-modulated LRs.
+
+        Uses ``realize=False`` to avoid fusing the full backward graph,
+        then realizes each component's updated params individually.
+        """
         new_params = dict(params)
         for name, comp in self._components.items():
             names = comp["param_names"]
@@ -93,8 +97,13 @@ class OmenTrainer:
                 comp["state"],
                 lr=lr,
                 weight_decay=comp["weight_decay"],
+                realize=False,
             )
             comp["state"] = new_state
+            # Realize per-component to keep compilation graphs small
+            for v in updated_p.values():
+                if nb.is_tensor(v) and not v.real:
+                    v.realize()
             new_params.update(updated_p)
         return new_params
 
