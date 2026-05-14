@@ -28,12 +28,24 @@ DEFAULT_WEIGHT_DECAY = 1e-3
 CONV2D_BLOCKERS = frozenset({"decoder.e1", "decoder.e2", "decoder.e3", "decoder.e4"})
 
 
+def _to_real(tree):
+    """Recursively realize all lazy tensors in a pytree to numpy-backed."""
+    if nb.is_tensor(tree):
+        if tree.real:
+            return tree
+        return nb.Tensor.from_dlpack(tree.to_numpy())
+    if isinstance(tree, dict):
+        return {k: _to_real(v) for k, v in tree.items()}
+    return tree
+
+
 class OmenTrainer:
     """Functional trainer using ``nb.value_and_grad`` and per-component AdamW.
 
-    Gradient realization uses ``nb.realize_all`` in one batch call for all
-    non-conv2d params (fast).  The 4 decoder conv2d filter gradients are
-    zeroed (MAX compiler ``num_groups`` bug).
+    Gradient realization uses per-tensor ``.to_numpy()`` (avoids the fused
+    compilation that fails on shared conv2d backward subgraph).  Optimizer
+    outputs are realized after each step to break the lazy chain.  The 4
+    decoder conv2d filter gradients are zeroed (MAX compiler bug).
     """
 
     def __init__(
@@ -77,22 +89,19 @@ class OmenTrainer:
         }
 
     def _realize_grads(self, grads, params):
-        """Batch-realize safe gradients, zero the conv2d blockers.
+        """Realize safe gradients individually; zero conv2d blockers.
 
-        Uses ``nb.realize_all`` for one fused compilation of all non-conv2d
-        gradients (fast), then extracts to numpy.  Conv2d filter gradients
-        are set to zero (compiler can't realize them).
+        Per-tensor ``.to_numpy()`` avoids the fused ``nb.realize_all``
+        compilation that fails when 135+ safe grads share conv2d backward
+        subgraph nodes.  Conv2d filter gradients are zeroed (MAX compiler
+        ``num_groups`` bug).
         """
-        safe_tensors = [
-            g for n, g in grads.items() if n not in CONV2D_BLOCKERS and not g.real
-        ]
-        if safe_tensors:
-            nb.realize_all(*safe_tensors)
-
         realized = {}
         for name, g in grads.items():
             if name in CONV2D_BLOCKERS:
                 realized[name] = nb.zeros_like(params[name])
+            elif g.real:
+                realized[name] = g
             else:
                 realized[name] = nb.Tensor.from_dlpack(g.to_numpy())
         return realized
@@ -106,7 +115,11 @@ class OmenTrainer:
         return base_lr * (1.0 + scale * min(z_score, 5.0))
 
     def _apply_optimizer_updates(self, params, grads, z_score):
-        """Per-component ``adamw_update`` with surprise-modulated LRs."""
+        """Per-component ``adamw_update`` with surprise-modulated LRs.
+
+        All optimizer outputs are realized to numpy-backed tensors to break
+        the lazy computation chain between training steps.
+        """
         new_params = dict(params)
         for name, comp in self._components.items():
             names = comp["param_names"]
@@ -121,8 +134,11 @@ class OmenTrainer:
                 lr=lr,
                 weight_decay=comp["weight_decay"],
             )
-            comp["state"] = new_state
-            new_params.update(updated_p)
+
+            # Break lazy chain — realize to numpy-backed tensors
+            comp["state"] = _to_real(new_state)
+            for k, v in updated_p.items():
+                new_params[k] = _to_real(v)
         return new_params
 
     def save_checkpoint(self, path):
