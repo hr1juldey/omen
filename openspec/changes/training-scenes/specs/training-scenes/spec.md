@@ -68,35 +68,44 @@ The system SHALL provide `build_foggy_corridor()` that returns a `(mi.Scene, sce
 - **AND** the scene_graph SHALL include a "volume" key with sigma_t and albedo parameters
 
 ### Requirement: Training data generator
-The system SHALL provide `TrainingDataGenerator` class that generates (noisy, clean) image pairs from any scene builder function. It SHALL accept configurable SPP levels, resolution, and seed. It SHALL render both images with different seeds and return them as numpy arrays in NHWC format.
+The system SHALL provide `TrainingDataGenerator` class that runs online training using a diffusion-like pipeline: render GT at full HD + high SPP → encode to target latent, render noisy at full HD + low SPP → encode with scene_graph → JEPA loss → backprop → free images. Images SHALL NOT be saved to disk by default. A `save_images` toggle SHALL be available for debugging.
 
-#### Scenario: Generate a single training pair
-- **WHEN** `TrainingDataGenerator.generate_pair(build_cornell_box, noisy_spp=4, clean_spp=256)` is called
-- **THEN** it SHALL return `(noisy, clean, scene_graph)` where noisy and clean are numpy arrays of shape (H, W, 3)
-- **AND** the clean image SHALL have lower variance (higher quality) than the noisy image
+#### Scenario: Online training step (no disk I/O)
+- **WHEN** `TrainingDataGenerator.train_step_online(build_cornell_box)` is called
+- **THEN** it SHALL render one GT image at 256 SPP at full HD resolution (1920x1080)
+- **AND** render one noisy image at 4 SPP at the same full HD resolution
+- **AND** encode both through the model to compute JEPA loss and backprop
+- **AND** free both image arrays from memory after loss computation
+- **AND** NOT write any files to disk
 
-#### Scenario: Generate batch of pairs
-- **WHEN** `TrainingDataGenerator.generate_batch(build_cornell_box, count=10, noisy_spp=4, clean_spp=256)` is called
-- **THEN** it SHALL return a list of 10 `(noisy, clean, scene_graph)` tuples
-- **AND** each pair SHALL use a different random seed
+#### Scenario: Full HD ground truth render
+- **WHEN** `TrainingDataGenerator` is initialized with `resolution=(1920, 1080)` and `gt_spp=256`
+- **THEN** the GT render SHALL be exactly 1920x1080 at 256 SPP
+- **AND** the noisy render SHALL be the same 1920x1080 at the configured low SPP
 
-#### Scenario: Reduced resolution for training
-- **WHEN** `TrainingDataGenerator` is initialized with `max_resolution=(480, 270)`
-- **THEN** all generated images SHALL be at most 480x270 regardless of scene defaults
-- **AND** the aspect ratio SHALL be preserved
+#### Scenario: Debug save toggle
+- **WHEN** `TrainingDataGenerator` is initialized with `save_images=True` and `output_dir="./debug/"`
+- **THEN** each rendered pair SHALL be saved as .exr files to the output directory
+- **AND** a log message SHALL indicate the file path
+
+#### Scenario: Multi-camera training step
+- **WHEN** `TrainingDataGenerator.train_step_online(build_cornell_box, camera="all")` is called
+- **THEN** it SHALL run one train_step per camera position (5 cameras for Cornell Box)
+- **AND** each step SHALL use independent random seeds for noisy renders
 
 ### Requirement: CLI entry point for scene rendering
-The system SHALL provide a CLI via `python -m omen.scenes` that can render any of the 5 benchmark scenes with configurable SPP, resolution, and output path.
+The system SHALL provide a CLI via `python -m omen.scenes` that can render scenes and run online training. By default, images are NOT saved (online training mode). The `--save-images` flag enables saving to disk for debugging.
 
 #### Scenario: Render Cornell Box via CLI
-- **WHEN** `python -m omen.scenes --scene cornell --spp 64 --output cornell.exr` is executed
+- **WHEN** `python -m omen.scenes --scene cornell --spp 64 --save-images --output cornell.exr` is executed
 - **THEN** the system SHALL render the Cornell Box at 64spp and save to `cornell.exr`
 - **AND** print the render time and output path
 
-#### Scenario: Generate training pairs via CLI
-- **WHEN** `python -m omen.scenes --scene cornell --spp-pair 4,256 --count 5 --output-dir ./data/` is executed
-- **THEN** the system SHALL generate 5 training pairs and save them as numpy files
-- **AND** print the number of pairs generated and total disk size
+#### Scenario: Run online training (no saves)
+- **WHEN** `python -m omen.scenes --scene cornell --noisy-spp 4 --gt-spp 256 --count 5 --resolution 1920x1080` is executed
+- **THEN** the system SHALL run 5 online training steps (render GT + noisy, train, discard)
+- **AND** NOT save any images to disk
+- **AND** print training loss per step
 
 #### Scenario: List available scenes
 - **WHEN** `python -m omen.scenes --list` is executed

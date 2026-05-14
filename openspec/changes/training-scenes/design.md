@@ -10,14 +10,18 @@ Current state: `complex_scene.py` is a standalone script (not importable), `src/
 - 5 self-contained Mitsuba dict scene builders following the `complex_scene.py` pattern (mi.ScalarTransform4f, direct dict construction)
 - Each scene exercises a distinct set of MoE expert routing paths
 - Each scene returns a `scene_graph` metadata dict for scene-graph routing
-- A `TrainingDataGenerator` that renders (noisy, clean) pairs at configurable SPP
-- CLI entry point for quick scene rendering and data export
+- Multi-camera placement (4-5 cameras per scene) for view diversity
+- 4-channel animation per scene (camera, mesh, material, light) for temporal training data
+- Online training pipeline: render → encode → loss → backprop → discard (NO image saving by default)
+- `TrainingDataGenerator` renders in-place at full HD, feeds model directly, frees memory
+- `--save-images` debug toggle for inspecting renders
+- CLI entry point for scene rendering and data generation
 
 **Non-Goals:**
 - Loading external .obj/.ply files (all scenes use Mitsuba primitives)
 - Blender integration (this is pure Mitsuba training data)
-- Scene animation/temporal sequences (separate change)
-- HDRI envmap loading (Studio Product scene uses constant + area lights instead)
+- Saving training images to disk by default (online-only training, `--save-images` toggle for debug)
+- Loading external HDRI envmap files (Studio Product uses constant + area lights instead)
 - Multi-GPU rendering (single GPU or CPU only)
 
 ## Decisions
@@ -57,13 +61,31 @@ scene_graph = {
 
 **Rationale**: Matches `SceneGraphEncoder` input format exactly. Each encoder head (geom_linear, mat_linear, light_linear) gets the right shape.
 
-### D4: Training pair generation strategy
+### D4: Online training pipeline (diffusion-like, no disk saves)
 
-`TrainingDataGenerator` renders the same scene at two SPP levels:
-- **Noisy** (low SPP): 4-16 spp — simulates real-time path tracing
-- **Clean** (high SPP): 128-1024 spp — pseudo ground truth
+Training follows the diffusion model pattern but adapted for JEPA latent prediction:
 
-Pairs are rendered with different seeds to avoid correlation. The generator can batch-render multiple pairs and store them as numpy arrays.
+```
+For each training step:
+  1. Render GT: 1 image at 256/512 SPP, FULL HD (1920x1080 or higher)
+     → encode to latent via SceneGraphEncoder + RenderFeatureEncoder → target_latent
+  2. Render noisy: same view at 4^x SPP (4, 16, 64) at SAME full HD resolution
+     → encode with scene_graph → noisy_latent
+  3. Model predicts: clean_latent = model(noisy_latent, scene_graph)
+  4. Loss = JEPA_loss(predicted_latent, target_latent)
+  5. Backprop, optimizer step
+  6. Free both images from memory (no disk save)
+```
+
+Key differences from image diffusion:
+- **Not predicting Gaussian noise** — predicting clean latent from noisy-render latent
+- **Noise = path tracing variance** (low SPP), not Gaussian
+- **Input is (scene_graph_3D, noisy_render)** — scene graph provides structure, noisy render provides appearance
+- **GT is ONE big render** — 256/512 SPP at full HD, not multiple cheap renders
+- **Everything is in-memory** — no saving to disk, no .npz files by default
+- **`--save-images` toggle** for debugging only, off by default
+
+**Rationale**: This matches how diffusion models train (generate pair in-place, train, discard) but uses JEPA's latent prediction instead of noise prediction. The scene_graph input is what makes this unique — it's conditioning information like CLIP text embeddings in Stable Diffusion, but for 3D scene structure.
 
 ### D5: Scene progression for expert coverage
 
@@ -77,8 +99,12 @@ Pairs are rendered with different seeds to avoid correlation. The generator can 
 
 ## Risks / Trade-offs
 
-**[Risk] Render time for high-SPP pairs** → Mitigation: Default to 256spp for clean pairs (~5s on GPU). CLI flag to increase. GPU-batched rendering.
+**[Risk] Render time for high-SPP GT at full HD** → Mitigation: 256 SPP at 1920x1080 is ~5-15s on GPU. Training step dominates over render time since we backprop through the full encoder+decoder. Can use 128 SPP for early training, increase to 512 for fine-tuning.
+
+**[Risk] Full HD images use significant GPU memory** → Mitigation: Render → downsample to 480x270 for encoder input (reduced resolution encoding), but GT latent is computed from full HD. Only the numpy array lives in memory briefly, freed after loss computation.
 
 **[Risk] Scene-graph metadata may not perfectly match live Blender data** → Mitigation: The metadata schema matches `SceneGraphEncoder` input format. When Blender integration is live, the same schema will be used from the converter.
 
 **[Risk] 5 scenes may not cover all 23 experts** → Mitigation: Each scene targets a subset. The Shaderball scene exercises ALL material experts. Full expert coverage is achieved across all 5 scenes combined. More scenes can be added later.
+
+**[Risk] Animation frames multiply render cost** → Mitigation: Animation is optional (`--animate` flag). Per-frame cost is same as static. 170 animation frames at full HD is ~25 minutes total render time across all 5 scenes — acceptable for dataset generation.

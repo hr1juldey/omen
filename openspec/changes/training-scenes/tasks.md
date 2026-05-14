@@ -61,23 +61,23 @@
 - [ ] 6.7 Material animation: 8-frame sequence changing wall color from gray to warm white, floor from dark to checkerboard
 - [ ] 6.8 Light animation: 8-frame sequence varying fog density (σ_t 0.05→0.5), moving point light along corridor, spot light cone narrowing from 45° to 15°
 
-## 7. Training Data Generator
+## 7. Online Training Data Generator
 
-- [ ] 7.1 Implement `TrainingDataGenerator.__init__()` — accepts max_resolution, gpu flag, output_dir
-- [ ] 7.2 Implement `generate_pair()` — renders noisy (low SPP) + clean (high SPP) images from any scene builder, returns (noisy, clean, scene_graph) as numpy arrays
-- [ ] 7.3 Implement multi-camera support — generate_pair renders from all camera positions, returning a list of pairs per scene
-- [ ] 7.4 Implement `generate_batch()` — renders N pairs with different seeds, saves to output_dir as .npz files
-- [ ] 7.5 Implement `generate_animation_pairs()` — renders temporal frame sequences from all 4 animation channels (camera, mesh, material, light) for ARPredictor training; each frame pair gets (noisy, clean) renders
-- [ ] 7.6 Integrate with `StratifiedReplayBuffer` — `generate_and_store()` method that populates replay buffer keyed by scene_graph hash
+- [ ] 7.1 Implement `TrainingDataGenerator.__init__()` — accepts resolution (default 1920x1080), gt_spp (default 256), noisy_spp (default 4), gpu flag, save_images toggle (default False)
+- [ ] 7.2 Implement `train_step_online()` — core diffusion-like training loop: render GT at full HD + high SPP → encode to target_latent, render noisy at same resolution + low SPP → encode with scene_graph to noisy_latent, compute JEPA loss, backprop, free both images from memory. NO disk saves unless save_images=True
+- [ ] 7.3 Implement multi-camera training — `train_step_online()` iterates all camera positions, running one train_step per camera. Each camera gets independent noisy/GT renders
+- [ ] 7.4 Implement `train_animation_sequence()` — renders temporal frames from all 4 animation channels (camera, mesh, material, light), feeds consecutive frame pairs to ARPredictor for temporal loss. Each frame: render GT + noisy → encode → predict next latent → loss → backprop → free
+- [ ] 7.5 Implement `--save-images` toggle — when enabled, saves rendered pairs to output_dir as .exr/.png for debugging. Default OFF (online-only, images freed after loss computation)
+- [ ] 7.6 Integrate with `StratifiedReplayBuffer` — scene_graph hash keys per-scene sub-buffers; `train_step_online()` adds (noisy_latent, target_latent) to buffer, optionally samples replay pairs for mixed training
 
 ## 8. CLI Entry Point
 
-- [ ] 8.1 Add `__main__.py` or update `scenes.py` with argparse CLI: `--scene`, `--spp`, `--spp-pair`, `--count`, `--output`, `--output-dir`, `--list`, `--camera`, `--animate`, `--animate-type` (camera|mesh|material|light|all)
+- [ ] 8.1 Add `__main__.py` or update `scenes.py` with argparse CLI: `--scene`, `--spp`, `--gt-spp`, `--noisy-spp`, `--resolution`, `--count`, `--output`, `--list`, `--camera`, `--animate`, `--animate-type` (camera|mesh|material|light|all), `--save-images`
 - [ ] 8.2 Implement `--list` — print SCENE_REGISTRY names + descriptions
-- [ ] 8.3 Implement `--spp-pair` mode — generate training pairs and save as .npz
-- [ ] 8.4 Implement `--animate` flag — render animation frames for temporal data
+- [ ] 8.3 Implement `--save-images` toggle — when set, saves renders to output_dir as .exr/.png for inspection. Default: images are NOT saved (online training only)
+- [ ] 8.4 Implement `--animate` flag — render animation frames for temporal training
 - [ ] 8.5 Implement `--animate-type` flag — select which animation channels to render (camera, mesh, material, light, or all)
-- [ ] 8.6 Implement `--camera all` flag — render from all camera positions
+- [ ] 8.6 Implement `--camera all` flag — render/train from all camera positions
 
 ## 9. Validation
 
