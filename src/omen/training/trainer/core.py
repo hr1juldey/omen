@@ -6,9 +6,8 @@ import os
 import numpy as np
 
 from omen.config import OmenConfig
-from omen.training.trainer.gradient import clip_grad_norm_pytree
 from omen.training.trainer.loss import compute_training_loss
-from omen.training.trainer.optimizers import COMPONENT_LRS, create_functional_optimizers
+from omen.training.trainer.optimizers import create_functional_optimizers
 
 logger = logging.getLogger("omen.training.trainer")
 
@@ -59,11 +58,13 @@ class OmenTrainer:
             argnums=0,
         )(params, self.model, noisy, ground_truth, scene_graph, self.config)
 
+        # Realize forward loss before touching backward graph
+        loss_val = float(total_loss.to_numpy().sum())
+
         new_params = self._apply_optimizer_updates(params, grads, z_score)
         self.model.load_state_dict(new_params)
 
         self.iteration += 1
-        loss_val = float(total_loss.to_numpy().sum())
         return {
             "total_loss": loss_val,
             "iteration": self.iteration,
@@ -81,8 +82,10 @@ class OmenTrainer:
     def _apply_optimizer_updates(self, params, grads, z_score):
         """Per-component ``adamw_update`` with surprise-modulated LRs.
 
-        Uses ``realize=False`` to avoid fusing the full backward graph,
-        then realizes each component's updated params individually.
+        Uses ``realize=False`` because the MAX compiler cannot yet infer
+        ``num_groups`` when realizing the fused backward graph through
+        multiple conv2d ops.  Updated params remain lazy tensors; they are
+        consumed by the next ``train_step`` trace.
         """
         new_params = dict(params)
         for name, comp in self._components.items():
@@ -100,10 +103,6 @@ class OmenTrainer:
                 realize=False,
             )
             comp["state"] = new_state
-            # Realize per-component to keep compilation graphs small
-            for v in updated_p.values():
-                if nb.is_tensor(v) and not v.real:
-                    v.realize()
             new_params.update(updated_p)
         return new_params
 
