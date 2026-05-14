@@ -159,6 +159,48 @@ The system SHALL classify AOV passes into tiers: MUST (albedo, normal, depth —
 - **THEN** the model SHALL still preserve caustics in the denoised output using scene_graph knowledge
 - **AND** caustic region quality SHALL be within 3dB PSNR of full-pass denoising
 
+### Requirement: Renderer adapter interface (renderer-agnostic neural network)
+The neural network (encoder + decoder + MoE) SHALL be renderer-agnostic. It SHALL see a unified AOV buffer format regardless of which renderer produced the data. A `RendererAdapter` abstract base class SHALL translate renderer-specific data into this unified format. The adapter SHALL provide: `render()`, `get_aov()` (returns unified AOV dict, zero-fills missing passes), `list_available_passes()`, and `integrator_for_scene()`.
+
+#### Scenario: MitsubaAdapter zero-fills per-bounce passes
+- **WHEN** a scene is rendered via `MitsubaAdapter`
+- **THEN** the adapter SHALL provide MUST passes (albedo 3ch, normal 3ch, depth 1ch) and NICE-1 (position 3ch) from Mitsuba AOV integrator
+- **AND** NICE-2/3/4 passes (diffuse_direct, glossy_direct, transmission_direct, volume_direct) SHALL be zero-filled
+- **AND** the adapter SHALL detect volumetric scenes and switch integrator to `volpath`/`volpathmis`
+
+#### Scenario: CyclesAdapter provides full pass coverage
+- **WHEN** a scene is rendered via `CyclesAdapter`
+- **THEN** all MUST and NICE passes SHALL be populated with real data
+- **AND** no zero-filling SHALL be needed
+
+#### Scenario: Adapter returns unified AOV regardless of renderer
+- **WHEN** either adapter's `get_aov()` is called
+- **THEN** the returned dict SHALL have the same keys and shapes
+- **AND** the neural network SHALL receive identical-format input regardless of renderer
+
+### Requirement: Nabla API verification for U-Net decoder
+Before implementing the residual noise predictor U-Net decoder, the system SHALL verify that Nabla supports all required operations with correct autograd. Each verification SHALL be a standalone test that confirms: (1) the operation works, (2) gradients flow through it, (3) it produces correct shapes. Verifications SHALL cover: Pixel Shuffle via reshape+transpose, skip connections via concatenate, conv2d stride=2 downsampling, pooling, value_and_grad with multi-argument functions, and @nb.compile with the functional optimizer API.
+
+#### Scenario: Pixel Shuffle autograd verification
+- **WHEN** a manual Pixel Shuffle is implemented via `nb.reshape` + `nb.transpose`
+- **THEN** autograd SHALL flow correctly through both operations
+- **AND** the output shape SHALL be (B, H*2, W*2, C) given input (B, H, W, C*4)
+
+#### Scenario: Skip connection concatenation with autograd
+- **WHEN** `nb.concatenate([encoder_feat, decoder_feat], axis=-1)` is used for U-Net skip connections
+- **THEN** autograd SHALL flow through the concatenation to both branches
+- **AND** the output channels SHALL equal encoder_channels + decoder_channels
+
+#### Scenario: Compiled training step uses functional API
+- **WHEN** the training step is decorated with `@nb.compile`
+- **THEN** it SHALL use `nb.value_and_grad(loss_fn, argnums=0)` NOT `loss.backward()`
+- **AND** the optimizer SHALL use `nb.nn.optim.adamw_update()` (functional) NOT `optimizer.step()` (imperative)
+
+#### Scenario: Optimizer initialization order
+- **WHEN** a stateful `AdamW(model)` optimizer is created
+- **THEN** the model SHALL be in `train()` mode at optimizer creation time
+- **AND** `model.eval()` SHALL only be called for eval passes
+
 ### Requirement: CLI entry point for scene rendering
 The system SHALL provide a CLI via `python -m omen.scenes` that can render scenes and run online training. By default, images are NOT saved (online training mode). The `--save-images` flag enables saving to disk for debugging.
 
