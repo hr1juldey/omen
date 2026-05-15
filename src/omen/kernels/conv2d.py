@@ -78,7 +78,9 @@ def _im2col(x, kh, kw, sh, sw, ph, pw):
 class Im2colOp(UnaryOperation):
     """Nabla op wrapping Mojo conv2d_im2col GPU kernel."""
 
-    name = "conv2d_im2col"
+    @property
+    def name(self) -> str:
+        return "conv2d_im2col"
 
     def __init__(self, kh, kw, sh, sw, ph, pw):
         self.kh = kh
@@ -95,9 +97,10 @@ class Im2colOp(UnaryOperation):
         wout = (w + 2 * self.pw - self.kw) // self.sw + 1
         return [(b * hout * wout, self.kh * self.kw * cin)], [x.dtype], [x.device]
 
-    def kernel(self, x, **kwargs):
+    def kernel(self, args, kwargs):
         import nabla as nb
 
+        x = args[0]
         b, h, w, cin = (int(d) for d in x.shape)
         hout = (h + 2 * self.ph - self.kh) // self.sh + 1
         wout = (w + 2 * self.pw - self.kw) // self.sw + 1
@@ -109,15 +112,18 @@ class Im2colOp(UnaryOperation):
             dtype=np.float32,
         )
         params_t = nb.array(params)
-        return call_custom_kernel(
+        result = call_custom_kernel(
             "conv2d_im2col", str(KERNEL_DIR), x, params_t,
         )
+        return [result]
 
 
 class Col2imOp(UnaryOperation):
     """Nabla op wrapping Mojo conv2im_col2im GPU kernel."""
 
-    name = "conv2im_col2im"
+    @property
+    def name(self) -> str:
+        return "conv2im_col2im"
 
     def __init__(self, kh, kw, sh, sw, ph, pw, b, h, w, cin):
         self.kh = kh
@@ -138,9 +144,10 @@ class Col2imOp(UnaryOperation):
             [args[0].device],
         )
 
-    def kernel(self, col, **kwargs):
+    def kernel(self, args, kwargs):
         import nabla as nb
 
+        col = args[0]
         hout = (self.h + 2 * self.ph - self.kh) // self.sh + 1
         wout = (self.w + 2 * self.pw - self.kw) // self.sw + 1
         params = np.array(
@@ -151,9 +158,10 @@ class Col2imOp(UnaryOperation):
             dtype=np.float32,
         )
         params_t = nb.array(params)
-        return call_custom_kernel(
+        result = call_custom_kernel(
             "conv2im_col2im", str(KERNEL_DIR), col, params_t,
         )
+        return [result]
 
 
 def _im2col_gpu(x, kh, kw, sh, sw, ph, pw):
@@ -161,7 +169,7 @@ def _im2col_gpu(x, kh, kw, sh, sw, ph, pw):
     import nabla as nb
 
     op = Im2colOp(kh=kh, kw=kw, sh=sh, sw=sw, ph=ph, pw=pw)
-    return op(x, {})
+    return op([x], {})[0]
 
 
 def conv2d_safe(

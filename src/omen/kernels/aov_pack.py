@@ -26,15 +26,19 @@ KERNEL_DIR = Path(__file__).parent
 class AOVPackOp(UnaryOperation):
     """Nabla operation wrapping the Mojo AOV pack kernel."""
 
-    name = "aov_pack"
+    @property
+    def name(self) -> str:
+        return "aov_pack"
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
         x = args[0]
         h, w = x.shape[0], x.shape[1]
         return [(h, w, PACKED_CH)], [x.dtype], [x.device]
 
-    def kernel(self, x, **kwargs):
-        return call_custom_kernel("aov_pack", str(KERNEL_DIR), x, x.type)
+    def kernel(self, args, kwargs):
+        x = args[0]
+        result = call_custom_kernel("aov_pack", str(KERNEL_DIR), x, x.type)
+        return [result]
 
 
 def compute_aov_pack_gpu(source_np: np.ndarray) -> np.ndarray:
@@ -54,7 +58,7 @@ def compute_aov_pack_gpu(source_np: np.ndarray) -> np.ndarray:
 
         tensor = nb.Tensor.from_dlpack(source_np.astype(np.float32))
         op = AOVPackOp()
-        result = op(tensor, {})
+        result = op([tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("AOV pack Mojo kernel failed (%s) — numpy fallback", exc)

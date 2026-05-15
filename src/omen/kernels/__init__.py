@@ -61,7 +61,9 @@ KERNEL_DIR = Path(__file__).parent
 class TileFingerprintOp(UnaryOperation):
     """Nabla operation wrapping the Mojo tile fingerprint kernel."""
 
-    name = "tile_fingerprint"
+    @property
+    def name(self) -> str:
+        return "tile_fingerprint"
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
         """Required: infer output shapes without building graph nodes.
@@ -73,13 +75,15 @@ class TileFingerprintOp(UnaryOperation):
         out_shape = (h // TILE_SIZE, w // TILE_SIZE, FINGERPRINT_DIM)
         return [out_shape], [x.dtype], [x.device]
 
-    def kernel(self, x, **kwargs):
-        return call_custom_kernel(
+    def kernel(self, args, kwargs):
+        x = args[0]
+        result = call_custom_kernel(
             "tile_fingerprint",
             str(KERNEL_DIR),
             x,
             x.type,
         )
+        return [result]
 
 
 def compute_tile_fingerprint_gpu(aux_np: np.ndarray) -> np.ndarray:
@@ -98,7 +102,7 @@ def compute_tile_fingerprint_gpu(aux_np: np.ndarray) -> np.ndarray:
     try:
         aux_tensor = nb.Tensor.from_dlpack(aux_np.astype(np.float32))
         op = TileFingerprintOp()
-        result = op(aux_tensor, {})
+        result = op([aux_tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("Mojo kernel failed (%s) — falling back to numpy", exc)

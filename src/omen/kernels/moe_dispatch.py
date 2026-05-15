@@ -43,22 +43,26 @@ def compute_moe_dispatch_gpu(
         from nabla.ops import UnaryOperation
 
         class MoEDispatchOp(UnaryOperation):
-            name = "moe_dispatch"
+            @property
+            def name(self) -> str:
+                return "moe_dispatch"
 
             def compute_physical_shape(self, args, kwargs, output_sharding=None):
                 eo = args[0]
                 t, c, _ = eo.shape
                 return [(t, c)], [eo.dtype], [eo.device]
 
-            def kernel(self, expert_out, routing_w, **kwargs):
-                return call_custom_kernel(
+            def kernel(self, args, kwargs):
+                expert_out, routing_w = args[0], args[1]
+                result = call_custom_kernel(
                     "moe_dispatch", str(KERNEL_DIR), expert_out, routing_w
                 )
+                return [result]
 
         eo_tensor = nb.Tensor.from_dlpack(expert_outputs.astype(np.float32))
         rw_tensor = nb.Tensor.from_dlpack(routing_weights.astype(np.float32))
         op = MoEDispatchOp()
-        result = op([eo_tensor, rw_tensor], {})
+        result = op([eo_tensor, rw_tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MoE dispatch Mojo failed (%s) — numpy fallback", exc)

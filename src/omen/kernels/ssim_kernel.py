@@ -25,15 +25,19 @@ KERNEL_DIR = Path(__file__).parent
 class SSIMComputeOp(UnaryOperation):
     """Nabla op wrapping Mojo ssim_compute kernel."""
 
-    name = "ssim_compute"
+    @property
+    def name(self) -> str:
+        return "ssim_compute"
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
         img1 = args[0]
         h, w = img1.shape
         return [(h, w)], [img1.dtype], [img1.device]
 
-    def kernel(self, img1, img2, **kwargs):
-        return call_custom_kernel("ssim_compute", str(KERNEL_DIR), img1, img2)
+    def kernel(self, args, kwargs):
+        img1, img2 = args[0], args[1]
+        result = call_custom_kernel("ssim_compute", str(KERNEL_DIR), img1, img2)
+        return [result]
 
 
 def compute_ssim_gpu(img1: np.ndarray, img2: np.ndarray) -> float:
@@ -60,7 +64,7 @@ def compute_ssim_gpu(img1: np.ndarray, img2: np.ndarray) -> float:
         t1 = nb.Tensor.from_dlpack(i1)
         t2 = nb.Tensor.from_dlpack(i2)
         op = SSIMComputeOp()
-        result = op([t1, t2], {})
+        result = op([t1, t2], {})[0]
         ssim_map = result.to_numpy()
         return float(np.mean(ssim_map))
     except Exception as exc:
@@ -85,7 +89,7 @@ def compute_ssim_map_gpu(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
     t1 = nb.Tensor.from_dlpack(i1)
     t2 = nb.Tensor.from_dlpack(i2)
     op = SSIMComputeOp()
-    result = op([t1, t2], {})
+    result = op([t1, t2], {})[0]
     return result.to_numpy()
 
 

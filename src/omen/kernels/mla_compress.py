@@ -28,7 +28,9 @@ MAX_CHANNELS = 512
 class MLACompressOp(UnaryOperation):
     """Nabla op wrapping Mojo mla_compress kernel."""
 
-    name = "mla_compress"
+    @property
+    def name(self) -> str:
+        return "mla_compress"
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
         features = args[0]
@@ -37,14 +39,18 @@ class MLACompressOp(UnaryOperation):
         c_out = weights.shape[1]
         return [(n, c_out)], [features.dtype], [features.device]
 
-    def kernel(self, features, weights, **kwargs):
-        return call_custom_kernel("mla_compress", str(KERNEL_DIR), features, weights)
+    def kernel(self, args, kwargs):
+        features, weights = args[0], args[1]
+        result = call_custom_kernel("mla_compress", str(KERNEL_DIR), features, weights)
+        return [result]
 
 
 class MLAReconstructOp(UnaryOperation):
     """Nabla op wrapping Mojo mla_reconstruct kernel."""
 
-    name = "mla_reconstruct"
+    @property
+    def name(self) -> str:
+        return "mla_reconstruct"
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
         compressed = args[0]
@@ -53,10 +59,12 @@ class MLAReconstructOp(UnaryOperation):
         c_out = weights.shape[1]
         return [(n, c_out)], [compressed.dtype], [compressed.device]
 
-    def kernel(self, compressed, weights, **kwargs):
-        return call_custom_kernel(
+    def kernel(self, args, kwargs):
+        compressed, weights = args[0], args[1]
+        result = call_custom_kernel(
             "mla_reconstruct", str(KERNEL_DIR), compressed, weights
         )
+        return [result]
 
 
 def compute_mla_compress_gpu(features: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -78,7 +86,7 @@ def compute_mla_compress_gpu(features: np.ndarray, weights: np.ndarray) -> np.nd
         f_tensor = nb.Tensor.from_dlpack(features.astype(np.float32))
         w_tensor = nb.Tensor.from_dlpack(weights.astype(np.float32))
         op = MLACompressOp()
-        result = op([f_tensor, w_tensor], {})
+        result = op([f_tensor, w_tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MLA compress Mojo failed (%s) — numpy fallback", exc)
@@ -106,7 +114,7 @@ def compute_mla_reconstruct_gpu(
         c_tensor = nb.Tensor.from_dlpack(compressed.astype(np.float32))
         w_tensor = nb.Tensor.from_dlpack(weights.astype(np.float32))
         op = MLAReconstructOp()
-        result = op([c_tensor, w_tensor], {})
+        result = op([c_tensor, w_tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MLA reconstruct Mojo failed (%s) — numpy fallback", exc)
