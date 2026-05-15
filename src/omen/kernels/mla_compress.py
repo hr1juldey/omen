@@ -40,8 +40,12 @@ class MLACompressOp(UnaryOperation):
         return [(n, c_out)], [features.dtype], [features.device]
 
     def kernel(self, args, kwargs):
+        from max.graph import TensorType
+
         features, weights = args[0], args[1]
-        result = call_custom_kernel("mla_compress", str(KERNEL_DIR), features, weights)
+        n, c_out = int(features.shape[0]), int(weights.shape[1])
+        out_type = TensorType(dtype=features.dtype, shape=(n, c_out), device=features.device)
+        result = call_custom_kernel("mla_compress", str(KERNEL_DIR), [features, weights], out_type)
         return [result]
 
 
@@ -60,9 +64,13 @@ class MLAReconstructOp(UnaryOperation):
         return [(n, c_out)], [compressed.dtype], [compressed.device]
 
     def kernel(self, args, kwargs):
+        from max.graph import TensorType
+
         compressed, weights = args[0], args[1]
+        n, c_out = int(compressed.shape[0]), int(weights.shape[1])
+        out_type = TensorType(dtype=compressed.dtype, shape=(n, c_out), device=compressed.device)
         result = call_custom_kernel(
-            "mla_reconstruct", str(KERNEL_DIR), compressed, weights
+            "mla_reconstruct", str(KERNEL_DIR), [compressed, weights], out_type
         )
         return [result]
 

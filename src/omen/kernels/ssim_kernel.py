@@ -35,8 +35,12 @@ class SSIMComputeOp(UnaryOperation):
         return [(h, w)], [img1.dtype], [img1.device]
 
     def kernel(self, args, kwargs):
+        from max.graph import TensorType
+
         img1, img2 = args[0], args[1]
-        result = call_custom_kernel("ssim_compute", str(KERNEL_DIR), img1, img2)
+        h, w = int(img1.shape[0]), int(img1.shape[1])
+        out_type = TensorType(dtype=img1.dtype, shape=(h, w), device=img1.device)
+        result = call_custom_kernel("ssim_compute", str(KERNEL_DIR), [img1, img2], out_type)
         return [result]
 
 

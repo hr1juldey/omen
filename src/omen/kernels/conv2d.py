@@ -98,23 +98,16 @@ class Im2colOp(UnaryOperation):
         return [(b * hout * wout, self.kh * self.kw * cin)], [x.dtype], [x.device]
 
     def kernel(self, args, kwargs):
-        import nabla as nb
+        from max.graph import TensorType
 
-        x = args[0]
+        x, params = args[0], args[1]
         b, h, w, cin = (int(d) for d in x.shape)
         hout = (h + 2 * self.ph - self.kh) // self.sh + 1
         wout = (w + 2 * self.pw - self.kw) // self.sw + 1
-        params = np.array(
-            [
-                hout, wout, self.kh, self.kw, cin,
-                self.sh, self.sw, self.ph, self.pw, h, w,
-            ],
-            dtype=np.float32,
+        out_type = TensorType(
+            dtype=x.dtype, shape=(b * hout * wout, self.kh * self.kw * cin), device=x.device
         )
-        params_t = nb.array(params)
-        result = call_custom_kernel(
-            "conv2d_im2col", str(KERNEL_DIR), x, params_t,
-        )
+        result = call_custom_kernel("conv2d_im2col", str(KERNEL_DIR), [x, params], out_type)
         return [result]
 
 
@@ -145,22 +138,13 @@ class Col2imOp(UnaryOperation):
         )
 
     def kernel(self, args, kwargs):
-        import nabla as nb
+        from max.graph import TensorType
 
-        col = args[0]
-        hout = (self.h + 2 * self.ph - self.kh) // self.sh + 1
-        wout = (self.w + 2 * self.pw - self.kw) // self.sw + 1
-        params = np.array(
-            [
-                hout, wout, self.kh, self.kw, self.cin,
-                self.sh, self.sw, self.ph, self.pw, self.h, self.w,
-            ],
-            dtype=np.float32,
+        col, params = args[0], args[1]
+        out_type = TensorType(
+            dtype=col.dtype, shape=(self.b, self.h, self.w, self.cin), device=col.device
         )
-        params_t = nb.array(params)
-        result = call_custom_kernel(
-            "conv2im_col2im", str(KERNEL_DIR), col, params_t,
-        )
+        result = call_custom_kernel("conv2im_col2im", str(KERNEL_DIR), [col, params], out_type)
         return [result]
 
 
@@ -168,8 +152,29 @@ def _im2col_gpu(x, kh, kw, sh, sw, ph, pw):
     """Extract patches using Mojo GPU im2col kernel."""
     import nabla as nb
 
+    b, h, w, c_in = (int(d) for d in x.shape)
+    hout = _conv_out_size(h, kh, sh, ph)
+    wout = _conv_out_size(w, kw, sw, pw)
+    params_np = np.array(
+        [hout, wout, kh, kw, c_in, sh, sw, ph, pw, h, w], dtype=np.float32
+    )
+    params = nb.Tensor.from_dlpack(params_np)
     op = Im2colOp(kh=kh, kw=kw, sh=sh, sw=sw, ph=ph, pw=pw)
-    return op([x], {})[0]
+    return op([x, params], {})[0]
+
+
+def _col2im_gpu(col, kh, kw, sh, sw, ph, pw, b, h, w, cin):
+    """Scatter column matrix back to image using Mojo GPU col2im kernel."""
+    import nabla as nb
+
+    hout = _conv_out_size(h, kh, sh, ph)
+    wout = _conv_out_size(w, kw, sw, pw)
+    params_np = np.array(
+        [hout, wout, kh, kw, cin, sh, sw, ph, pw, h, w], dtype=np.float32
+    )
+    params = nb.Tensor.from_dlpack(params_np)
+    op = Col2imOp(kh=kh, kw=kw, sh=sh, sw=sw, ph=ph, pw=pw, b=b, h=h, w=w, cin=cin)
+    return op([col, params], {})[0]
 
 
 def conv2d_safe(

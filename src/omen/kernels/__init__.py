@@ -76,13 +76,14 @@ class TileFingerprintOp(UnaryOperation):
         return [out_shape], [x.dtype], [x.device]
 
     def kernel(self, args, kwargs):
+        from max.graph import TensorType
+
         x = args[0]
-        result = call_custom_kernel(
-            "tile_fingerprint",
-            str(KERNEL_DIR),
-            x,
-            x.type,
+        h, w = int(x.shape[0]), int(x.shape[1])
+        out_type = TensorType(
+            dtype=x.dtype, shape=(h // TILE_SIZE, w // TILE_SIZE, FINGERPRINT_DIM), device=x.device
         )
+        result = call_custom_kernel("tile_fingerprint", str(KERNEL_DIR), x, out_type)
         return [result]
 
 

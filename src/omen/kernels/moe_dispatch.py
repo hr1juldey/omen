@@ -53,9 +53,13 @@ def compute_moe_dispatch_gpu(
                 return [(t, c)], [eo.dtype], [eo.device]
 
             def kernel(self, args, kwargs):
+                from max.graph import TensorType
+
                 expert_out, routing_w = args[0], args[1]
+                t, c, _ = int(expert_out.shape[0]), int(expert_out.shape[1]), int(expert_out.shape[2])
+                out_type = TensorType(dtype=expert_out.dtype, shape=(t, c), device=expert_out.device)
                 result = call_custom_kernel(
-                    "moe_dispatch", str(KERNEL_DIR), expert_out, routing_w
+                    "moe_dispatch", str(KERNEL_DIR), [expert_out, routing_w], out_type
                 )
                 return [result]
 
