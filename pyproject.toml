@@ -7,7 +7,7 @@ name = "omen-integrator"
 version = "0.1.0"
 description = "Mitsuba 3 integrator with JEPA acceleration"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 dependencies = [
     "mitsuba>=3.8.0",
@@ -29,3 +29,10 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "omen_integrator" = ["*.py"]
+
+[workspace]
+channels = [
+  "https://conda.modular.com/max-nightly",
+  "https://repo.prefix.dev/modular-community",
+  "conda-forge",
+]
