@@ -19,3 +19,10 @@ pytest = "*"
 [activation.env]
 MODULAR_HOME = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/max"
 MOJO_PIXI_ENV = "$PIXI_PROJECT_ROOT/.pixi/envs/default"
+
+[workspace]
+channels = [
+  "https://conda.modular.com/max-nightly",
+  "https://repo.prefix.dev/modular-community",
+  "conda-forge",
+]
