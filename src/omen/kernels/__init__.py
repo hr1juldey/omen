@@ -98,7 +98,7 @@ def compute_tile_fingerprint_gpu(aux_np: np.ndarray) -> np.ndarray:
     try:
         aux_tensor = nb.Tensor.from_dlpack(aux_np.astype(np.float32))
         op = TileFingerprintOp()
-        result = op(aux_tensor)
+        result = op(aux_tensor, {})
         return result.to_numpy()
     except Exception as exc:
         logger.warning("Mojo kernel failed (%s) — falling back to numpy", exc)

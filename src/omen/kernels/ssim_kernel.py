@@ -85,7 +85,7 @@ def compute_ssim_map_gpu(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
     t1 = nb.Tensor.from_dlpack(i1)
     t2 = nb.Tensor.from_dlpack(i2)
     op = SSIMComputeOp()
-    result = op(t1, t2)
+    result = op([t1, t2], {})
     return result.to_numpy()
 
 

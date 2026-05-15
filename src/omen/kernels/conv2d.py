@@ -161,7 +161,7 @@ def _im2col_gpu(x, kh, kw, sh, sw, ph, pw):
     import nabla as nb
 
     op = Im2colOp(kh=kh, kw=kw, sh=sh, sw=sw, ph=ph, pw=pw)
-    return op(x)
+    return op(x, {})
 
 
 def conv2d_safe(

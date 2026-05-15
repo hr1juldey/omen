@@ -78,7 +78,7 @@ def compute_mla_compress_gpu(features: np.ndarray, weights: np.ndarray) -> np.nd
         f_tensor = nb.Tensor.from_dlpack(features.astype(np.float32))
         w_tensor = nb.Tensor.from_dlpack(weights.astype(np.float32))
         op = MLACompressOp()
-        result = op(f_tensor, w_tensor)
+        result = op([f_tensor, w_tensor], {})
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MLA compress Mojo failed (%s) — numpy fallback", exc)
@@ -106,7 +106,7 @@ def compute_mla_reconstruct_gpu(
         c_tensor = nb.Tensor.from_dlpack(compressed.astype(np.float32))
         w_tensor = nb.Tensor.from_dlpack(weights.astype(np.float32))
         op = MLAReconstructOp()
-        result = op(c_tensor, w_tensor)
+        result = op([c_tensor, w_tensor], {})
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MLA reconstruct Mojo failed (%s) — numpy fallback", exc)

@@ -58,7 +58,7 @@ def compute_moe_dispatch_gpu(
         eo_tensor = nb.Tensor.from_dlpack(expert_outputs.astype(np.float32))
         rw_tensor = nb.Tensor.from_dlpack(routing_weights.astype(np.float32))
         op = MoEDispatchOp()
-        result = op(eo_tensor, rw_tensor)
+        result = op([eo_tensor, rw_tensor], {})
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MoE dispatch Mojo failed (%s) — numpy fallback", exc)
