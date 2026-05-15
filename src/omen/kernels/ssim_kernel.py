@@ -60,7 +60,7 @@ def compute_ssim_gpu(img1: np.ndarray, img2: np.ndarray) -> float:
         t1 = nb.Tensor.from_dlpack(i1)
         t2 = nb.Tensor.from_dlpack(i2)
         op = SSIMComputeOp()
-        result = op(t1, t2)
+        result = op([t1, t2], {})
         ssim_map = result.to_numpy()
         return float(np.mean(ssim_map))
     except Exception as exc:

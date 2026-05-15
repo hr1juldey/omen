@@ -54,7 +54,7 @@ def compute_aov_pack_gpu(source_np: np.ndarray) -> np.ndarray:
 
         tensor = nb.Tensor.from_dlpack(source_np.astype(np.float32))
         op = AOVPackOp()
-        result = op(tensor)
+        result = op(tensor, {})
         return result.to_numpy()
     except Exception as exc:
         logger.warning("AOV pack Mojo kernel failed (%s) — numpy fallback", exc)
