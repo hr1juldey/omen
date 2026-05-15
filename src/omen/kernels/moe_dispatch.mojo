@@ -12,6 +12,11 @@ Output:
 Replaces the double Python loop in omen.model.moe ExpertGroup.forward().
 """
 
+import compiler
+from runtime.asyncrt import DeviceContextPtr
+from tensor import InputTensor, OutputTensor, foreach
+from utils.index import IndexList
+
 comptime MAX_EXPERTS = 8
 
 
@@ -26,21 +31,21 @@ struct MoEDispatch:
     @staticmethod
     def execute[target: StaticString](
         output: OutputTensor,
-        expert_outputs: InputTensor[dtype = output.dtype, rank = 3],
-        routing_weights: InputTensor[dtype = output.dtype, rank = 2],
+        expert_outputs: InputTensor[dtype = output.dtype, rank = 3, static_spec = _],
+        routing_weights: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
         ctx: DeviceContextPtr,
-    ):
+    ) raises:
         @parameter
-        def combine[W: Int](idx: IndexList[2]) -> SIMD[output.dtype, W]:
-            var token = idx[0]
-            var ch = idx[1]
+        def combine[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
+            var token = Int(idx[0])
+            var ch = Int(idx[1])
             var acc = SIMD[output.dtype, W](0.0)
 
             # Iterate all experts — unselected ones have weight=0, so
             # multiply-accumulate is safe and avoids dynamic indexing
             comptime for e in range(MAX_EXPERTS):
-                var w = routing_weights.load[1]([token, e])
-                var e_out = expert_outputs.load[1]([token, ch, e])
+                var w = routing_weights.load[1](IndexList[2](token, e))
+                var e_out = expert_outputs.load[1](IndexList[3](token, ch, e))
                 acc = acc + w * e_out
 
             return acc

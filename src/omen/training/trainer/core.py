@@ -6,6 +6,7 @@ import os
 import numpy as np
 
 from omen.config import OmenConfig
+from omen.training.trainer.gradient import clip_grad_norm_pytree
 from omen.training.trainer.loss import compute_training_loss
 from omen.training.trainer.optimizers import create_functional_optimizers
 
@@ -21,6 +22,7 @@ except (ImportError, RuntimeError):
 
 DEFAULT_LR = 5e-5
 DEFAULT_WEIGHT_DECAY = 1e-3
+DEFAULT_GRADIENT_CLIP = 1.0
 
 
 class OmenTrainer:
@@ -60,7 +62,8 @@ class OmenTrainer:
 
         loss_val = float(total_loss.to_numpy().sum())
         realized_grads = self._realize_grads(grads, params)
-        new_params = self._apply_optimizer_updates(params, realized_grads, z_score)
+        clipped_grads = clip_grad_norm_pytree(realized_grads, DEFAULT_GRADIENT_CLIP)
+        new_params = self._apply_optimizer_updates(params, clipped_grads, z_score)
         self.model.load_state_dict(new_params)
 
         self.iteration += 1
@@ -73,9 +76,13 @@ class OmenTrainer:
     def _realize_grads(self, grads, params):
         """Realize lazy gradient tensors to numpy-backed.
 
-        Per-tensor ``.to_numpy()`` avoids the fused ``nb.realize_all``
-        compilation that fails when many grads share backward subgraph nodes.
+        Single ``nb.realize_all`` compiles the backward graph once.
+        Replaced per-tensor ``.to_numpy()`` which caused 139 separate
+        compilations leaking ~30GB RAM.
         """
+        lazy_grads = [g for g in grads.values() if not g.real]
+        if lazy_grads:
+            nb.realize_all(*lazy_grads)
         realized = {}
         for name, g in grads.items():
             if g.real:

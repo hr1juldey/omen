@@ -12,6 +12,11 @@ SSIM constants: C1 = 0.01^2, C2 = 0.03^2 (standard values).
 Based on Wang et al. (2004) SSIM with uniform window weighting.
 """
 
+import compiler
+from runtime.asyncrt import DeviceContextPtr
+from tensor import InputTensor, OutputTensor, foreach
+from utils.index import IndexList
+
 comptime WIN = 7
 comptime PAD = WIN // 3  # 2 — reflect pad applied by Python bridge
 comptime FP_C1 = 0.0001  # (0.01)^2
@@ -25,14 +30,14 @@ struct SSIMCompute:
     @staticmethod
     def execute[target: StaticString](
         output: OutputTensor,
-        img1: InputTensor[dtype = output.dtype, rank = 2],
-        img2: InputTensor[dtype = output.dtype, rank = 2],
+        img1: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
+        img2: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
         ctx: DeviceContextPtr,
-    ):
+    ) raises:
         @parameter
-        def compute_ssim[W: Int](idx: IndexList[2]) -> SIMD[output.dtype, W]:
-            var h = idx[0]
-            var w = idx[1]
+        def compute_ssim[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
+            var h = Int(idx[0])
+            var w = Int(idx[1])
             var c1 = SIMD[output.dtype, W](FP_C1)
             var c2 = SIMD[output.dtype, W](FP_C2)
 
@@ -50,8 +55,8 @@ struct SSIMCompute:
                     var x = w + Int(dx) - PAD
                     # Boundary: skip out-of-range pixels
                     if y >= 0 and x >= 0:
-                        var v1 = img1.load[1]([y, x])
-                        var v2 = img2.load[1]([y, x])
+                        var v1 = img1.load[1](IndexList[2](y, x))
+                        var v2 = img2.load[1](IndexList[2](y, x))
                         sum1 = sum1 + v1
                         sum2 = sum2 + v2
                         sum11 = sum11 + v1 * v1

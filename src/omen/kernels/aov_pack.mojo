@@ -20,6 +20,11 @@ Output layout (matches aov.py AOV_PASSES):
   ch 8-9: motion vectors (zero if unavailable)
 """
 
+import compiler
+from runtime.asyncrt import DeviceContextPtr
+from tensor import InputTensor, OutputTensor, foreach
+from utils.index import IndexList
+
 comptime PACKED_CH = 10
 
 
@@ -30,27 +35,27 @@ struct AOVPack:
     @staticmethod
     def execute[target: StaticString](
         output: OutputTensor,
-        source: InputTensor[dtype = output.dtype, rank = 3],
+        source: InputTensor[dtype = output.dtype, rank = 3, static_spec = _],
         ctx: DeviceContextPtr,
-    ):
+    ) raises:
         @parameter
-        def pack_channel[W: Int](idx: IndexList[3]) -> SIMD[output.dtype, W]:
-            var h = idx[0]
-            var w = idx[1]
-            var ch = idx[2]
+        def pack_channel[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
+            var h = Int(idx[0])
+            var w = Int(idx[1])
+            var ch = Int(idx[2])
             var zero = SIMD[output.dtype, W](0.0)
 
             # Output ch 0-2 -> albedo from source ch 3-5
             if ch < 3:
-                return source.load[1]([h, w, ch + 3])
+                return source.load[1](IndexList[3](h, w, ch + 3))
 
             # Output ch 3-5 -> normal from source ch 6-8
             elif ch < 6:
-                return source.load[1]([h, w, ch + 3])
+                return source.load[1](IndexList[3](h, w, ch + 3))
 
             # Output ch 6 -> depth from source ch 9
             elif ch == 6:
-                return source.load[1]([h, w, 9])
+                return source.load[1](IndexList[3](h, w, 9))
 
             # Output ch 7, 8, 9 -> not in standard Mitsuba AOV
             return zero

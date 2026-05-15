@@ -15,6 +15,10 @@ C_in varies by tier: fast=192, medium=256, high=512
 C_latent = C_in // 16 (min 4)
 """
 
+import compiler
+from runtime.asyncrt import DeviceContextPtr
+from tensor import InputTensor, OutputTensor, foreach
+from utils.index import IndexList
 comptime TILE = 16
 
 
@@ -25,14 +29,14 @@ struct MLACompress:
     @staticmethod
     def execute[target: StaticString](
         output: OutputTensor,
-        features: InputTensor[dtype = output.dtype, rank = 2],
-        weights_down: InputTensor[dtype = output.dtype, rank = 2],
+        features: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
+        weights_down: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
         ctx: DeviceContextPtr,
-    ):
+    ) raises:
         @parameter
-        def compress[W: Int](idx: IndexList[2]) -> SIMD[output.dtype, W]:
-            var n = idx[0]
-            var c_out = idx[1]
+        def compress[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
+            var n = Int(idx[0])
+            var c_out = Int(idx[1])
             var acc = SIMD[output.dtype, W](0.0)
 
             # Accumulate: output[n, c_out] = sum_c(features[n, c] * W[c, c_out])
@@ -41,14 +45,18 @@ struct MLACompress:
                 var c_base = tile * TILE
                 comptime for d in range(TILE):
                     var c = c_base + d
-                    var feat = features.load[1]([n, c])
-                    var w = weights_down.load[1]([c, c_out])
+                    var feat = features.load[1](IndexList[2](n, c))
+                    var w = weights_down.load[1](IndexList[2](c, c_out))
                     acc = acc + feat * w
 
-            # Fused SiLU activation: x * sigmoid(x)
-            var one = SIMD[output.dtype, W](1.0)
-            var sig = one / (one + exp(-acc))
-            return acc * sig
+            # Fused hard-swish activation: x * clamp(x/6 + 0.5, 0, 1)
+            # Arithmetic-only (no exp/sigmoid — unavailable in nabla foreach)
+            var six = SIMD[output.dtype, W](6.0)
+            var half = SIMD[output.dtype, W](0.5)
+            var zero_val = SIMD[output.dtype, W](0.0)
+            var one_val = SIMD[output.dtype, W](1.0)
+            var gate = (acc / six + half).clamp(zero_val, one_val)
+            return acc * gate
 
         foreach[compress, target=target](output, ctx)
 
@@ -65,14 +73,14 @@ struct MLAReconstruct:
     @staticmethod
     def execute[target: StaticString](
         output: OutputTensor,
-        compressed: InputTensor[dtype = output.dtype, rank = 2],
-        weights_up: InputTensor[dtype = output.dtype, rank = 2],
+        compressed: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
+        weights_up: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
         ctx: DeviceContextPtr,
-    ):
+    ) raises:
         @parameter
-        def reconstruct[W: Int](idx: IndexList[2]) -> SIMD[output.dtype, W]:
-            var n = idx[0]
-            var c_out = idx[1]
+        def reconstruct[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
+            var n = Int(idx[0])
+            var c_out = Int(idx[1])
             var acc = SIMD[output.dtype, W](0.0)
 
             # C_latent is small (C_in // 16), so full unroll is fine
@@ -80,8 +88,8 @@ struct MLAReconstruct:
                 var c_base = tile * TILE
                 comptime for d in range(TILE):
                     var c = c_base + d
-                    var z = compressed.load[1]([n, c])
-                    var w = weights_up.load[1]([c, c_out])
+                    var z = compressed.load[1](IndexList[2](n, c))
+                    var w = weights_up.load[1](IndexList[2](c, c_out))
                     acc = acc + z * w
 
             return acc

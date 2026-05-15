@@ -1,19 +1,33 @@
-"""Conv2d via im2col + matmul using pure nabla operations.
+"""Conv2d via im2col + matmul with optional Mojo GPU acceleration.
 
-No custom Mojo kernels or Operation subclasses needed. Uses nabla built-ins
-(pad, slice, concatenate, matmul, reshape) which nabla auto-diffs through.
+Two paths:
+  1. Pure nabla (default): pad/slice/concat matmul — nabla auto-diffs through
+  2. Mojo GPU: call_custom_kernel for im2col/col2im — faster data rearrangement
 
-The Mojo GPU im2col/col2im kernels (conv2d_im2col.mojo, conv2im.mojo) are
-available for future optimization — swap the pure-nabla im2col/col2im with
-call_custom_kernel when the MAX kernel loading is properly configured.
+Both paths use nabla matmul for the compute-heavy part (forward + gradients).
+The Mojo GPU path accelerates the memory-bound im2col data rearrangement.
 
 Forward: im2col(x) -> patches, then patches @ filter_flat -> output
 Backward: automatic via nabla's built-in autodiff (matmul, reshape, etc.)
 """
 
 import logging
+from pathlib import Path
+
+import numpy as np
 
 logger = logging.getLogger("omen.kernels.conv2d")
+
+KERNEL_DIR = Path(__file__).parent
+
+try:
+    from nabla.ops import UnaryOperation, call_custom_kernel
+
+    NABLA_AVAILABLE = True
+except ImportError:
+    UnaryOperation = object
+    call_custom_kernel = None
+    NABLA_AVAILABLE = False
 
 
 def _conv_out_size(in_size: int, kernel: int, stride: int, pad: int) -> int:
@@ -41,10 +55,10 @@ def _im2col(x, kh, kw, sh, sw, ph, pw):
     for ki in range(kh):
         for kj in range(kw):
             if sh == 1:
-                patch = x[:, ki:ki + h_out, kj:kj + w_out, :]
+                patch = x[:, ki : ki + h_out, kj : kj + w_out, :]
             else:
                 # Strided access: extract then subsample via reshape trick
-                rows = x[:, ki:ki + h_out * sh, kj:kj + w_out * sh, :]
+                rows = x[:, ki : ki + h_out * sh, kj : kj + w_out * sh, :]
                 # (B, h_out*sh, w_out*sh, C) -> (B, h_out, sh, w_out, sh, C)
                 r = nb.reshape(rows, (b, h_out, sh, w_out, sh, c_in))
                 patch = r[:, :, 0, :, 0, :]
@@ -56,14 +70,109 @@ def _im2col(x, kh, kw, sh, sw, ph, pw):
     return nb.concatenate(patches, axis=1)
 
 
+# ---------------------------------------------------------------------------
+# Mojo GPU im2col / col2im Operation wrappers
+# ---------------------------------------------------------------------------
+
+
+class Im2colOp(UnaryOperation):
+    """Nabla op wrapping Mojo conv2d_im2col GPU kernel."""
+
+    name = "conv2d_im2col"
+
+    def __init__(self, kh, kw, sh, sw, ph, pw):
+        self.kh = kh
+        self.kw = kw
+        self.sh = sh
+        self.sw = sw
+        self.ph = ph
+        self.pw = pw
+
+    def compute_physical_shape(self, args, kwargs, output_sharding=None):
+        x = args[0]
+        b, h, w, cin = (int(d) for d in x.shape)
+        hout = (h + 2 * self.ph - self.kh) // self.sh + 1
+        wout = (w + 2 * self.pw - self.kw) // self.sw + 1
+        return [(b * hout * wout, self.kh * self.kw * cin)], [x.dtype], [x.device]
+
+    def kernel(self, x, **kwargs):
+        import nabla as nb
+
+        b, h, w, cin = (int(d) for d in x.shape)
+        hout = (h + 2 * self.ph - self.kh) // self.sh + 1
+        wout = (w + 2 * self.pw - self.kw) // self.sw + 1
+        params = np.array(
+            [
+                hout, wout, self.kh, self.kw, cin,
+                self.sh, self.sw, self.ph, self.pw, h, w,
+            ],
+            dtype=np.float32,
+        )
+        params_t = nb.array(params)
+        return call_custom_kernel(
+            "conv2d_im2col", str(KERNEL_DIR), x, params_t,
+        )
+
+
+class Col2imOp(UnaryOperation):
+    """Nabla op wrapping Mojo conv2im_col2im GPU kernel."""
+
+    name = "conv2im_col2im"
+
+    def __init__(self, kh, kw, sh, sw, ph, pw, b, h, w, cin):
+        self.kh = kh
+        self.kw = kw
+        self.sh = sh
+        self.sw = sw
+        self.ph = ph
+        self.pw = pw
+        self.b = b
+        self.h = h
+        self.w = w
+        self.cin = cin
+
+    def compute_physical_shape(self, args, kwargs, output_sharding=None):
+        return (
+            [(self.b, self.h, self.w, self.cin)],
+            [args[0].dtype],
+            [args[0].device],
+        )
+
+    def kernel(self, col, **kwargs):
+        import nabla as nb
+
+        hout = (self.h + 2 * self.ph - self.kh) // self.sh + 1
+        wout = (self.w + 2 * self.pw - self.kw) // self.sw + 1
+        params = np.array(
+            [
+                hout, wout, self.kh, self.kw, self.cin,
+                self.sh, self.sw, self.ph, self.pw, self.h, self.w,
+            ],
+            dtype=np.float32,
+        )
+        params_t = nb.array(params)
+        return call_custom_kernel(
+            "conv2im_col2im", str(KERNEL_DIR), col, params_t,
+        )
+
+
+def _im2col_gpu(x, kh, kw, sh, sw, ph, pw):
+    """Extract patches using Mojo GPU im2col kernel."""
+    import nabla as nb
+
+    op = Im2colOp(kh=kh, kw=kw, sh=sh, sw=sw, ph=ph, pw=pw)
+    return op(x)
+
+
 def conv2d_safe(
-    x, filter, stride=1, padding=0, bias=None,
+    x,
+    filter,
+    stride=1,
+    padding=0,
+    bias=None,
+    use_gpu=False,
 ):
     """Drop-in replacement for nb.conv2d using im2col + matmul.
-
-    Pure nabla implementation — no custom Mojo kernels needed.
-    Nabla auto-diffs through all ops (matmul, reshape, pad, etc.),
-    so gradients for both input and filter are computed automatically.
 
     Args:
         x: (B, H, W, C_in) NHWC tensor
@@ -71,12 +180,10 @@ def conv2d_safe(
         stride: int or (sh, sw)
         padding: int or (ph, pw) or (ph_top, ph_bot, pw_left, pw_right)
         bias: optional (C_out,) bias tensor
+        use_gpu: if True, use Mojo GPU im2col kernel (requires GPU + nabla)
 
     Returns:
         (B, H_out, W_out, C_out) output tensor
-
-    Note: nabla matmul is the compute-heavy part (forward + gradients).
-    im2col is a memory-bound data rearrangement via pad/slice/concat.
     """
     import nabla as nb
 
@@ -100,7 +207,14 @@ def conv2d_safe(
     w_out = _conv_out_size(w, kw, sw, pw)
 
     # im2col: (B*H_out*W_out, Kh*Kw*C_in)
-    patches = _im2col(x, kh, kw, sh, sw, ph, pw)
+    if use_gpu and NABLA_AVAILABLE:
+        try:
+            patches = _im2col_gpu(x, kh, kw, sh, sw, ph, pw)
+        except Exception as exc:
+            logger.warning("Mojo GPU im2col failed (%s) — pure nabla fallback", exc)
+            patches = _im2col(x, kh, kw, sh, sw, ph, pw)
+    else:
+        patches = _im2col(x, kh, kw, sh, sw, ph, pw)
 
     # matmul: (B*H_out*W_out, Kh*Kw*C_in) @ (Kh*Kw*C_in, C_out)
     filt_flat = nb.reshape(filter, (kh * kw * c_in, c_out))

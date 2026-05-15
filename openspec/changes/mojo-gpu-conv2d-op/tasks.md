@@ -35,6 +35,6 @@
 
 ## 7. End-to-End Verification
 
-- [ ] 7.1 Run `tests/test_functional_trainer.py` — all 4 tests pass.
+- [x] 7.1 Run `tests/test_functional_trainer.py` — all 4 tests pass.
 - [ ] 7.2 Run `scripts/test_e2e_training.py` — update to 1024×1024 if feasible, otherwise verify at 32×32 with new conv2d_safe.
-- [ ] 7.3 Run `ruff check --fix` + `ruff format` on all changed files.
+- [x] 7.3 Run `ruff check --fix` + `ruff format` on all changed files.

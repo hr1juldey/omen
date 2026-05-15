@@ -9,8 +9,10 @@ Uses Nabla's custom kernel pattern: @compiler.register struct with execute().
 One thread per pixel in an 8x8 tile. Shared memory for tile-level reduction.
 """
 
-# Nabla custom kernel API provides: OutputTensor, InputTensor,
-# DeviceContextPtr, IndexList, foreach — no standalone GPU imports needed
+import compiler
+from runtime.asyncrt import DeviceContextPtr
+from tensor import InputTensor, OutputTensor, foreach
+from utils.index import IndexList
 
 comptime TILE = 8
 comptime FP_DIM = 23
@@ -28,15 +30,15 @@ struct TileFingerprint:
     @staticmethod
     def execute[target: StaticString](
         output: OutputTensor,
-        aux: InputTensor[dtype = output.dtype, rank = 3],
+        aux: InputTensor[dtype = output.dtype, rank = 3, static_spec = _],
         ctx: DeviceContextPtr,
-    ):
+    ) raises:
         @parameter
-        def compute_tile[W: Int](idx: IndexList[3]) -> SIMD[output.dtype, W]:
+        def compute_tile[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
             # idx gives position in output grid (tiles_y, tiles_x, fp_dim)
-            var ty = idx[0]
-            var tx = idx[1]
-            var ch = idx[2]
+            var ty = Int(idx[0])
+            var tx = Int(idx[1])
+            var ch = Int(idx[2])
 
             # For now return per-channel computation
             # Full shared-memory reduction requires host-side kernel launch
@@ -52,16 +54,16 @@ struct TileFingerprint:
                     # Normal variance (ch 8-10)
                     if ch >= 8 and ch < 11:
                         var nc = ch - 8 + 3  # normal channel offset
-                        var val = aux.load[1]([h, w, nc])
+                        var val = aux.load[1](IndexList[3](h, w, nc))
                         acc = acc + val * val * (1.0 / (TILE * TILE))
                     # Depth variance (ch 11)
                     elif ch == 11:
-                        var dv = aux.load[1]([h, w, 6])
+                        var dv = aux.load[1](IndexList[3](h, w, 6))
                         acc = acc + dv * dv * (1.0 / (TILE * TILE))
                     # Mean albedo (ch 14-16)
                     elif ch >= 14 and ch < 17:
                         var ac = ch - 14  # albedo channel
-                        acc = acc + aux.load[1]([h, w, ac]) * (1.0 / (TILE * TILE))
+                        acc = acc + aux.load[1](IndexList[3](h, w, ac)) * (1.0 / (TILE * TILE))
             return acc
 
         foreach[compute_tile, target=target](output, ctx)
