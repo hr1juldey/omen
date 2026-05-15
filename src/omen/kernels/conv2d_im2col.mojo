@@ -43,24 +43,26 @@ struct Conv2dIm2col:
         @parameter
         def extract_patch[width: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, width]:
             var spatial_idx = Int(idx[0])
-            var kernel_idx = Int(idx[1])
+            var kernel_idx_start = Int(idx[1])
 
             var b = spatial_idx // Hout_Wout
             var rem = spatial_idx - b * Hout_Wout
             var oh = rem // Wout
             var ow = rem - oh * Wout
 
-            var kh = kernel_idx // Kw_Cin
-            var rem2 = kernel_idx - kh * Kw_Cin
-            var kw = rem2 // Cin
-            var ci = rem2 - kw * Cin
+            var result = SIMD[output.dtype, width](0.0)
+            comptime for lane in range(width):
+                var ki = kernel_idx_start + lane
+                var kh_local = ki // Kw_Cin
+                var rem2 = ki - kh_local * Kw_Cin
+                var kw_local = rem2 // Cin
+                var ci = rem2 - kw_local * Cin
 
-            var ih = oh * sh + kh - ph
-            var iw = ow * sw + kw - pw
+                var ih = oh * sh + kh_local - ph
+                var iw = ow * sw + kw_local - pw
 
-            if ih >= 0 and ih < H and iw >= 0 and iw < W:
-                return x.load[1](IndexList[4](b, ih, iw, ci))
-            else:
-                return SIMD[output.dtype, width](0.0)
+                if ih >= 0 and ih < H and iw >= 0 and iw < W:
+                    result[lane] = x.load[1](IndexList[4](b, ih, iw, ci))
+            return result
 
         foreach[extract_patch, target=target](output, ctx)

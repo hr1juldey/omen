@@ -46,25 +46,29 @@ struct Conv2dCol2im:
             var b = Int(idx[0])
             var ih = Int(idx[1])
             var iw = Int(idx[2])
-            var ci = Int(idx[3])
+            var ci_start = Int(idx[3])
 
-            var acc = SIMD[output.dtype, width](0.0)
+            var result = SIMD[output.dtype, width](0.0)
+            comptime for lane in range(width):
+                var ci = ci_start + lane
 
-            for oh in range(Hout):
-                var kh = ih + ph - oh * sh
-                if kh < 0 or kh >= Kh:
-                    continue
-
-                for ow in range(Wout):
-                    var kw = iw + pw - ow * sw
-                    if kw < 0 or kw >= Kw:
+                var acc = SIMD[output.dtype, 1](0.0)
+                for oh in range(Hout):
+                    var kh = ih + ph - oh * sh
+                    if kh < 0 or kh >= Kh:
                         continue
 
-                    var spatial_idx = b * Hout_Wout + oh * Wout + ow
-                    var kernel_idx = kh * Kw_Cin + kw * Cin + ci
+                    for ow in range(Wout):
+                        var kw = iw + pw - ow * sw
+                        if kw < 0 or kw >= Kw:
+                            continue
 
-                    acc = acc + col.load[1](IndexList[2](spatial_idx, kernel_idx))
+                        var spatial_idx = b * Hout_Wout + oh * Wout + ow
+                        var kernel_idx = kh * Kw_Cin + kw * Cin + ci
 
-            return acc
+                        acc = acc + col.load[1](IndexList[2](spatial_idx, kernel_idx))
+
+                result[lane] = acc
+            return result
 
         foreach[scatter_gather, target=target](output, ctx)

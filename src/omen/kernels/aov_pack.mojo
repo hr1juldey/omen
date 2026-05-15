@@ -42,22 +42,24 @@ struct AOVPack:
         def pack_channel[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
             var h = Int(idx[0])
             var w = Int(idx[1])
-            var ch = Int(idx[2])
-            var zero = SIMD[output.dtype, W](0.0)
+            var ch_start = Int(idx[2])
 
-            # Output ch 0-2 -> albedo from source ch 3-5
-            if ch < 3:
-                return source.load[1](IndexList[3](h, w, ch + 3))
+            var result = SIMD[output.dtype, W](0.0)
+            comptime for lane in range(W):
+                var ch = ch_start + lane
+                if ch < 3:
+                    result[lane] = source.load[1](
+                        IndexList[3](h, w, ch + 3)
+                    )
+                elif ch < 6:
+                    result[lane] = source.load[1](
+                        IndexList[3](h, w, ch + 3)
+                    )
+                elif ch == 6:
+                    result[lane] = source.load[1](
+                        IndexList[3](h, w, 9)
+                    )
 
-            # Output ch 3-5 -> normal from source ch 6-8
-            elif ch < 6:
-                return source.load[1](IndexList[3](h, w, ch + 3))
-
-            # Output ch 6 -> depth from source ch 9
-            elif ch == 6:
-                return source.load[1](IndexList[3](h, w, 9))
-
-            # Output ch 7, 8, 9 -> not in standard Mitsuba AOV
-            return zero
+            return result
 
         foreach[pack_channel, target=target](output, ctx)
