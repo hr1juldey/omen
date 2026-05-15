@@ -15,6 +15,10 @@ dependencies = [
     "pytest>=9.0.3",
     "hypothesis>=6.152.7",
     "pytest-cov>=7.1.0",
+    "mojo>=0.26.2.0",
+    "max>=26.3.0",
+    "modular>=26.3.0",
+    "nabla-ml>=26.2251344",
 ]
 
 [tool.pytest.ini_options]
