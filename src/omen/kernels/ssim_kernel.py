@@ -1,7 +1,9 @@
 """Python bridge for ssim_compute Mojo GPU kernel.
 
 Computes per-pixel SSIM map using 7x7 uniform window on GPU.
-Replaces the cumsum-based numpy SSIM in omen.modes.quality.
+Packs both images into a single (2, H+6, W+6) tensor to avoid the
+MAX framework multi-input custom kernel data transfer bug.
+Output is original (unpadded) image size (H, W).
 """
 
 import logging
@@ -20,27 +22,35 @@ except ImportError:
 logger = logging.getLogger("omen.kernels.ssim_kernel")
 
 KERNEL_DIR = Path(__file__).parent
+_PAD = 3  # (WIN-1)//2 = 3 for symmetric 7x7 window
 
 
 class SSIMComputeOp(UnaryOperation):
-    """Nabla op wrapping Mojo ssim_compute kernel."""
+    """Nabla op wrapping Mojo ssim_compute kernel.
+
+    Receives a single (2, H+6, W+6) stacked tensor containing both images.
+    Output is original (H, W) size.
+    """
 
     @property
     def name(self) -> str:
         return "ssim_compute"
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
-        img1 = args[0]
-        h, w = img1.shape
-        return [(h, w)], [img1.dtype], [img1.device]
+        source = args[0]
+        # source is (2, H+6, W+6) — output is (H, W) = original size
+        h = int(source.shape[1]) - 2 * _PAD
+        w = int(source.shape[2]) - 2 * _PAD
+        return [(h, w)], [source.dtype], [source.device]
 
     def kernel(self, args, kwargs):
         from max.graph import TensorType
 
-        img1, img2 = args[0], args[1]
-        h, w = int(img1.shape[0]), int(img1.shape[1])
-        out_type = TensorType(dtype=img1.dtype, shape=(h, w), device=img1.device)
-        result = call_custom_kernel("ssim_compute", str(KERNEL_DIR), [img1, img2], out_type)
+        source = args[0]
+        h = int(source.shape[1]) - 2 * _PAD
+        w = int(source.shape[2]) - 2 * _PAD
+        out_type = TensorType(dtype=source.dtype, shape=(h, w), device=source.device)
+        result = call_custom_kernel("ssim_compute", str(KERNEL_DIR), source, out_type)
         return [result]
 
 
@@ -60,15 +70,16 @@ def compute_ssim_gpu(img1: np.ndarray, img2: np.ndarray) -> float:
     try:
         import nabla as nb
 
-        # Pad images for boundary handling (reflect pad, size 2)
-        pad = 2
-        i1 = np.pad(img1.astype(np.float32), pad, mode="reflect")
-        i2 = np.pad(img2.astype(np.float32), pad, mode="reflect")
+        # Pad images for boundary handling (reflect pad, size 3)
+        i1 = np.pad(img1.astype(np.float32), _PAD, mode="reflect")
+        i2 = np.pad(img2.astype(np.float32), _PAD, mode="reflect")
 
-        t1 = nb.Tensor.from_dlpack(i1)
-        t2 = nb.Tensor.from_dlpack(i2)
+        # Stack into single (2, H+6, W+6) tensor — avoids multi-input bug
+        stacked_np = np.stack([i1, i2], axis=0)
+        stacked = nb.Tensor.from_dlpack(stacked_np)
+
         op = SSIMComputeOp()
-        result = op([t1, t2], {})[0]
+        result = op([stacked], {})[0]
         ssim_map = result.to_numpy()
         return float(np.mean(ssim_map))
     except Exception as exc:
@@ -87,13 +98,14 @@ def compute_ssim_map_gpu(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
 
     import nabla as nb
 
-    pad = 2
-    i1 = np.pad(img1.astype(np.float32), pad, mode="reflect")
-    i2 = np.pad(img2.astype(np.float32), pad, mode="reflect")
-    t1 = nb.Tensor.from_dlpack(i1)
-    t2 = nb.Tensor.from_dlpack(i2)
+    i1 = np.pad(img1.astype(np.float32), _PAD, mode="reflect")
+    i2 = np.pad(img2.astype(np.float32), _PAD, mode="reflect")
+
+    stacked_np = np.stack([i1, i2], axis=0)
+    stacked = nb.Tensor.from_dlpack(stacked_np)
+
     op = SSIMComputeOp()
-    result = op([t1, t2], {})[0]
+    result = op([stacked], {})[0]
     return result.to_numpy()
 
 

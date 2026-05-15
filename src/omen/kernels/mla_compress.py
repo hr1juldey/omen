@@ -3,7 +3,8 @@
 Fuses Linear projection + SiLU activation for U-Net skip compression.
 Reduces skip memory 16x: (N, C) -> (N, C//16).
 
-Uses Nabla's call_custom_kernel API, falls back to numpy matmul.
+Packs features + weights into a single flat tensor to avoid the
+MAX framework multi-input custom kernel data transfer bug.
 """
 
 import logging
@@ -22,55 +23,67 @@ except ImportError:
 logger = logging.getLogger("omen.kernels.mla_compress")
 
 KERNEL_DIR = Path(__file__).parent
-MAX_CHANNELS = 512
+
+
+def _pack_tensors(data: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Pack data + weights into single flat tensor with metadata header.
+
+    Layout: [N, C_in, C_latent, data_flat, weights_flat]
+    """
+    n, c_in = data.shape
+    _, c_lat = weights.shape
+    header = np.array([n, c_in, c_lat], dtype=np.float32)
+    return np.concatenate([header, data.flatten(), weights.flatten()])
 
 
 class MLACompressOp(UnaryOperation):
-    """Nabla op wrapping Mojo mla_compress kernel."""
+    """Nabla op wrapping Mojo mla_compress kernel (single packed input)."""
 
     @property
     def name(self) -> str:
         return "mla_compress"
 
+    def __init__(self, n: int, c_latent: int):
+        self.n = n
+        self.c_latent = c_latent
+
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
-        features = args[0]
-        weights = args[1]
-        n = features.shape[0]
-        c_out = weights.shape[1]
-        return [(n, c_out)], [features.dtype], [features.device]
+        return [(self.n, self.c_latent)], [args[0].dtype], [args[0].device]
 
     def kernel(self, args, kwargs):
         from max.graph import TensorType
 
-        features, weights = args[0], args[1]
-        n, c_out = int(features.shape[0]), int(weights.shape[1])
-        out_type = TensorType(dtype=features.dtype, shape=(n, c_out), device=features.device)
-        result = call_custom_kernel("mla_compress", str(KERNEL_DIR), [features, weights], out_type)
+        source = args[0]
+        out_type = TensorType(
+            dtype=source.dtype, shape=(self.n, self.c_latent), device=source.device
+        )
+        result = call_custom_kernel("mla_compress", str(KERNEL_DIR), source, out_type)
         return [result]
 
 
 class MLAReconstructOp(UnaryOperation):
-    """Nabla op wrapping Mojo mla_reconstruct kernel."""
+    """Nabla op wrapping Mojo mla_reconstruct kernel (single packed input)."""
 
     @property
     def name(self) -> str:
         return "mla_reconstruct"
 
+    def __init__(self, n: int, c_in: int):
+        self.n = n
+        self.c_in = c_in
+
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
-        compressed = args[0]
-        weights = args[1]
-        n = compressed.shape[0]
-        c_out = weights.shape[1]
-        return [(n, c_out)], [compressed.dtype], [compressed.device]
+        return [(self.n, self.c_in)], [args[0].dtype], [args[0].device]
 
     def kernel(self, args, kwargs):
         from max.graph import TensorType
 
-        compressed, weights = args[0], args[1]
-        n, c_out = int(compressed.shape[0]), int(weights.shape[1])
-        out_type = TensorType(dtype=compressed.dtype, shape=(n, c_out), device=compressed.device)
+        source = args[0]
+        out_type = TensorType(
+            dtype=source.dtype, shape=(self.n, self.c_in), device=source.device
+        )
         result = call_custom_kernel(
-            "mla_reconstruct", str(KERNEL_DIR), [compressed, weights], out_type
+            "mla_reconstruct", str(KERNEL_DIR), source, out_type
         )
         return [result]
 
@@ -91,10 +104,15 @@ def compute_mla_compress_gpu(features: np.ndarray, weights: np.ndarray) -> np.nd
     try:
         import nabla as nb
 
-        f_tensor = nb.Tensor.from_dlpack(features.astype(np.float32))
-        w_tensor = nb.Tensor.from_dlpack(weights.astype(np.float32))
-        op = MLACompressOp()
-        result = op([f_tensor, w_tensor], {})[0]
+        f32 = features.astype(np.float32)
+        w32 = weights.astype(np.float32)
+        n, c_lat = f32.shape[0], w32.shape[1]
+
+        packed = _pack_tensors(f32, w32)
+        tensor = nb.Tensor.from_dlpack(packed)
+
+        op = MLACompressOp(n=n, c_latent=c_lat)
+        result = op([tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MLA compress Mojo failed (%s) — numpy fallback", exc)
@@ -119,10 +137,15 @@ def compute_mla_reconstruct_gpu(
     try:
         import nabla as nb
 
-        c_tensor = nb.Tensor.from_dlpack(compressed.astype(np.float32))
-        w_tensor = nb.Tensor.from_dlpack(weights.astype(np.float32))
-        op = MLAReconstructOp()
-        result = op([c_tensor, w_tensor], {})[0]
+        c32 = compressed.astype(np.float32)
+        w32 = weights.astype(np.float32)
+        n, c_in = c32.shape[0], w32.shape[1]
+
+        packed = _pack_tensors(c32, w32)
+        tensor = nb.Tensor.from_dlpack(packed)
+
+        op = MLAReconstructOp(n=n, c_in=c_in)
+        result = op([tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MLA reconstruct Mojo failed (%s) — numpy fallback", exc)
@@ -130,6 +153,6 @@ def compute_mla_reconstruct_gpu(
 
 
 def _mla_compress_numpy(features: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """Numpy fallback: matmul + SiLU."""
+    """Numpy fallback: matmul + hard-swish (matches Mojo kernel)."""
     projected = features @ weights
-    return projected * (1.0 / (1.0 + np.exp(-projected)))  # SiLU
+    return projected * np.clip(projected / 6.0 + 0.5, 0.0, 1.0)

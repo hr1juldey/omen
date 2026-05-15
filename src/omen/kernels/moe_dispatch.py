@@ -1,7 +1,8 @@
 """Python bridge for moe_dispatch Mojo GPU kernel.
 
 Fuses expert routing + weighted combination into single GPU kernel.
-Replaces Python for-loops in omen.model.moe ExpertGroup.forward().
+Packs expert_outputs + routing_weights into single flat tensor to avoid
+the MAX framework multi-input custom kernel data transfer bug.
 """
 
 import logging
@@ -10,16 +11,58 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from nabla.ops import call_custom_kernel
+    from nabla.ops import UnaryOperation, call_custom_kernel
 
     NABLA_AVAILABLE = True
 except ImportError:
+    UnaryOperation = object
     NABLA_AVAILABLE = False
 
 logger = logging.getLogger("omen.kernels.moe_dispatch")
 
 MAX_EXPERTS = 8
 KERNEL_DIR = Path(__file__).parent
+
+
+def _pack_moe(expert_outputs: np.ndarray, routing_weights: np.ndarray) -> np.ndarray:
+    """Pack expert_outputs + routing_weights into single flat tensor.
+
+    Layout: [T, C, E, eo_flat, rw_flat]
+    """
+    t, c, e = expert_outputs.shape
+    header = np.array([t, c, e], dtype=np.float32)
+    return np.concatenate([header, expert_outputs.flatten(), routing_weights.flatten()])
+
+
+class MoEDispatchOp(UnaryOperation):
+    """Nabla op wrapping Mojo moe_dispatch kernel (single packed input)."""
+
+    @property
+    def name(self) -> str:
+        return "moe_dispatch"
+
+    def __init__(self, tokens: int, channels: int):
+        self.tokens = tokens
+        self.channels = channels
+
+    def compute_physical_shape(self, args, kwargs, output_sharding=None):
+        return (
+            [(self.tokens, self.channels)],
+            [args[0].dtype],
+            [args[0].device],
+        )
+
+    def kernel(self, args, kwargs):
+        from max.graph import TensorType
+
+        source = args[0]
+        out_type = TensorType(
+            dtype=source.dtype,
+            shape=(self.tokens, self.channels),
+            device=source.device,
+        )
+        result = call_custom_kernel("moe_dispatch", str(KERNEL_DIR), source, out_type)
+        return [result]
 
 
 def compute_moe_dispatch_gpu(
@@ -40,33 +83,16 @@ def compute_moe_dispatch_gpu(
 
     try:
         import nabla as nb
-        from nabla.ops import UnaryOperation
 
-        class MoEDispatchOp(UnaryOperation):
-            @property
-            def name(self) -> str:
-                return "moe_dispatch"
+        eo32 = expert_outputs.astype(np.float32)
+        rw32 = routing_weights.astype(np.float32)
+        t, c, _ = eo32.shape
 
-            def compute_physical_shape(self, args, kwargs, output_sharding=None):
-                eo = args[0]
-                t, c, _ = eo.shape
-                return [(t, c)], [eo.dtype], [eo.device]
+        packed = _pack_moe(eo32, rw32)
+        tensor = nb.Tensor.from_dlpack(packed)
 
-            def kernel(self, args, kwargs):
-                from max.graph import TensorType
-
-                expert_out, routing_w = args[0], args[1]
-                t, c, _ = int(expert_out.shape[0]), int(expert_out.shape[1]), int(expert_out.shape[2])
-                out_type = TensorType(dtype=expert_out.dtype, shape=(t, c), device=expert_out.device)
-                result = call_custom_kernel(
-                    "moe_dispatch", str(KERNEL_DIR), [expert_out, routing_w], out_type
-                )
-                return [result]
-
-        eo_tensor = nb.Tensor.from_dlpack(expert_outputs.astype(np.float32))
-        rw_tensor = nb.Tensor.from_dlpack(routing_weights.astype(np.float32))
-        op = MoEDispatchOp()
-        result = op([eo_tensor, rw_tensor], {})[0]
+        op = MoEDispatchOp(tokens=t, channels=c)
+        result = op([tensor], {})[0]
         return result.to_numpy()
     except Exception as exc:
         logger.warning("MoE dispatch Mojo failed (%s) — numpy fallback", exc)
@@ -78,6 +104,4 @@ def compute_moe_dispatch_numpy(
     routing_weights: np.ndarray,
 ) -> np.ndarray:
     """Pure numpy fallback for MoE dispatch."""
-    # expert_outputs: (T, C, E), routing_weights: (T, E)
-    # output: (T, C) = sum_e(weight[t,e] * expert_out[t,:,e])
     return np.einsum("tce,te->tc", expert_outputs, routing_weights)

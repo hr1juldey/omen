@@ -1,15 +1,14 @@
 """GPU-accelerated MoE expert dispatch for Nabla.
 
 Fuses top-k expert selection + weighted combination into single kernel.
-Replaces Python for-loops over experts with parallel GPU scatter-add.
+Packs expert_outputs + routing_weights into single flat tensor to avoid
+the MAX framework multi-input custom kernel data transfer bug.
 
-Inputs:
-  expert_outputs (tokens, channels, num_experts) - all expert outputs stacked
-  routing_weights (tokens, num_experts) - sparse weight matrix (top-k nonzero)
-Output:
-  combined (tokens, channels) - weighted sum of expert outputs
-
-Replaces the double Python loop in omen.model.moe ExpertGroup.forward().
+Input:  combined flat tensor layout:
+          [0:3] = [T, C, E] metadata
+          [3 : 3+T*C*E] = expert_outputs flattened (T, C, E)
+          [3+T*C*E : end] = routing_weights flattened (T, E)
+Output: (T, C) — weighted sum of expert outputs
 """
 
 import compiler
@@ -25,29 +24,44 @@ struct MoEDispatch:
     """Weighted combination of expert outputs via routing weights.
 
     For each (token, channel), accumulates weighted expert outputs.
-    routing_weights is sparse: nonzero only for top-k selected experts.
     """
 
     @staticmethod
     def execute[target: StaticString](
         output: OutputTensor,
-        expert_outputs: InputTensor[dtype = output.dtype, rank = 3, static_spec = _],
-        routing_weights: InputTensor[dtype = output.dtype, rank = 2, static_spec = _],
+        combined: InputTensor[dtype = output.dtype, rank = 1, static_spec = _],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter
         def combine[W: Int](idx: IndexList[output.rank]) -> SIMD[output.dtype, W]:
+            var T = Int(combined.load[1](IndexList[1](0)))
+            var C = Int(combined.load[1](IndexList[1](1)))
+            var E = Int(combined.load[1](IndexList[1](2)))
+            var eo_off = 3
+            var rw_off = 3 + T * C * E
+
             var token = Int(idx[0])
-            var ch = Int(idx[1])
-            var acc = SIMD[output.dtype, W](0.0)
+            var ch_start = Int(idx[1])
 
-            # Iterate all experts — unselected ones have weight=0, so
-            # multiply-accumulate is safe and avoids dynamic indexing
-            comptime for e in range(MAX_EXPERTS):
-                var w = routing_weights.load[1](IndexList[2](token, e))
-                var e_out = expert_outputs.load[1](IndexList[3](token, ch, e))
-                acc = acc + w * e_out
+            var result = SIMD[output.dtype, W](0.0)
+            comptime for lane in range(W):
+                var ch = ch_start + lane
+                var acc = SIMD[output.dtype, 1](0.0)
 
-            return acc
+                comptime for e in range(MAX_EXPERTS):
+                    if e < E:
+                        var w = combined.load[1](
+                            IndexList[1](rw_off + token * E + e)
+                        )
+                        var e_out = combined.load[1](
+                            IndexList[1](
+                                eo_off + token * C * E + ch * E + e
+                            )
+                        )
+                        acc = acc + w * e_out
+
+                result[lane] = acc
+
+            return result
 
         foreach[combine, target=target](output, ctx)
