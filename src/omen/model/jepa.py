@@ -69,6 +69,10 @@ class OmenJEPA(nn.Module):
     def encode(self, scene_graph, rgba):
         """Encode scene graph + render into fused latent."""
         scene_latent = self.scene_encoder(scene_graph)
+        return self._encode_with_scene_latent(scene_latent, rgba)
+
+    def _encode_with_scene_latent(self, scene_latent, rgba):
+        """Encode render with pre-computed scene latent (for tile reuse)."""
         render_latent = self.render_encoder(rgba)
         fused = self.fusion(render_latent, scene_latent)
         return fused, scene_latent

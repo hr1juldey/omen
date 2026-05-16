@@ -1,7 +1,7 @@
 """Pure loss function for functional value_and_grad differentiation."""
 
 
-def compute_training_loss(params, model, noisy, gt, scene_graph, config):
+def compute_training_loss(params, model, noisy, gt, scene_latent, config):
     """Pure loss function compatible with ``nb.value_and_grad``.
 
     Args:
@@ -9,7 +9,8 @@ def compute_training_loss(params, model, noisy, gt, scene_graph, config):
         model: OmenJEPA instance (used for encode/decode/loss).
         noisy: Noisy render input ``(B, H, W, C)``.
         gt: Ground-truth render ``(B, H, W, C)``.
-        scene_graph: Scene metadata tensor.
+        scene_latent: Pre-encoded scene latent ``(B, latent_dim)``.
+            For backward compat, accepts raw scene_graph dict (encodes internally).
         config: OmenConfig instance.
 
     Returns:
@@ -17,8 +18,13 @@ def compute_training_loss(params, model, noisy, gt, scene_graph, config):
     """
     model.load_state_dict(params)
 
-    predicted_latent, _ = model.encode(scene_graph, noisy)
-    target_latent, _ = model.encode(scene_graph, gt)
+    # Backward compat: if scene_latent is a dict, encode it
+    if isinstance(scene_latent, dict):
+        predicted_latent, _ = model.encode(scene_latent, noisy)
+        target_latent, _ = model.encode(scene_latent, gt)
+    else:
+        predicted_latent, _ = model._encode_with_scene_latent(scene_latent, noisy)
+        target_latent, _ = model._encode_with_scene_latent(scene_latent, gt)
 
     noisy_rgb = noisy[:, :, :, :3]
     predicted_noise = model.decode(predicted_latent, noisy_rgb)

@@ -88,3 +88,27 @@ def select_tier_for_budget(height: int, width: int) -> str:
         if estimate_frame_memory(height, width, tier) <= free:
             return tier
     return "fast"
+
+
+def estimate_tile_memory(tile_size: int = 512) -> int:
+    """Estimate GPU memory (MB) for single tile training step."""
+    px = tile_size * tile_size
+    rgba_mb = px * 16 / MB  # (B, H, W, 4) float32
+    latent_mb = 1024 * 4 / MB  # Scene latent (1, 1024)
+    grad_mb = rgba_mb * 2  # Forward + backward activations
+    opt_mb = MODEL_WEIGHTS_MB * 2  # AdamW m/v moments
+    total = int(rgba_mb + latent_mb + grad_mb + opt_mb + MODEL_WEIGHTS_MB)
+    return total
+
+
+def can_fit_tiles(num_tiles: int = 1, tile_size: int = 512) -> dict:
+    """Check if N tiles fit in available GPU memory."""
+    tile_mb = estimate_tile_memory(tile_size)
+    info = get_gpu_memory_info()
+    sufficient = info["free_mb"] >= tile_mb or info["backend"] == "none"
+    return {
+        "sufficient": sufficient,
+        "per_tile_mb": tile_mb,
+        "free_mb": info["free_mb"],
+        "num_tiles": num_tiles,
+    }

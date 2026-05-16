@@ -6,6 +6,7 @@ import os
 import numpy as np
 
 from omen.config import OmenConfig
+from omen.training.tile import Tile, extract_tiles
 from omen.training.trainer.gradient import clip_grad_norm_pytree
 from omen.training.trainer.loss import compute_training_loss
 from omen.training.trainer.optimizers import create_functional_optimizers
@@ -72,6 +73,100 @@ class OmenTrainer:
             "iteration": self.iteration,
             "z_score": z_score,
         }
+
+    def train_step_tiled(
+        self, noisy_full, gt_full, scene_graph, tile_size=512, z_score=0.0
+    ):
+        """Tile-based training: encode scene once, train per-tile."""
+        self.model.train()
+        scene_latent = self._encode_scene_once(scene_graph)
+
+        noisy_tiles = extract_tiles(noisy_full, tile_size)
+        gt_tiles = extract_tiles(gt_full, tile_size)
+
+        total_loss = 0.0
+        for tile_noisy, tile_gt in zip(noisy_tiles, gt_tiles):
+            total_loss += self._train_single_tile(
+                tile_noisy, tile_gt, scene_latent, z_score
+            )
+
+        avg_loss = total_loss / len(noisy_tiles)
+        self.iteration += 1
+        return {
+            "total_loss": avg_loss,
+            "num_tiles": len(noisy_tiles),
+            "iteration": self.iteration,
+            "z_score": z_score,
+        }
+
+    def _encode_scene_once(self, scene_graph):
+        """Encode scene graph into latent (once per full render)."""
+        self.model.eval()
+        scene_latent = self.model.scene_encoder(scene_graph)
+        self.model.train()
+        return scene_latent
+
+    def _train_single_tile(self, tile_noisy, tile_gt, scene_latent, z_score):
+        """Train on one tile with GPU OOM fallback."""
+        noisy_tensor = self._tile_to_tensor(tile_noisy.data)
+        gt_tensor = self._tile_to_tensor(tile_gt.data)
+
+        try:
+            return self._run_tile_gpu(
+                noisy_tensor, gt_tensor, scene_latent, z_score
+            )
+        except (RuntimeError, Exception) as exc:
+            err = str(exc).lower()
+            if "out of memory" in err or "cuda" in err:
+                logger.warning("GPU OOM, falling back to CPU: %s", exc)
+                return self._run_tile_cpu(
+                    noisy_tensor, gt_tensor, scene_latent, z_score
+                )
+            raise
+
+    def _run_tile_gpu(self, noisy, gt, scene_latent, z_score):
+        """Run tile on GPU, silently fall back if .cuda() unavailable."""
+        try:
+            noisy = noisy.cuda()
+            gt = gt.cuda()
+            if hasattr(scene_latent, "cuda"):
+                scene_latent = scene_latent.cuda()
+        except Exception:
+            pass
+        return self._run_tile(noisy, gt, scene_latent, z_score)
+
+    def _run_tile_cpu(self, noisy, gt, scene_latent, z_score):
+        """Run tile on CPU."""
+        if hasattr(noisy, "cpu"):
+            noisy = noisy.cpu()
+        if hasattr(gt, "cpu"):
+            gt = gt.cpu()
+        return self._run_tile(noisy, gt, scene_latent, z_score)
+
+    def _run_tile(self, noisy, gt, scene_latent, z_score):
+        """Core training step for one tile."""
+        params = self.model.state_dict()
+        total_loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
+            params, self.model, noisy, gt, scene_latent, self.config
+        )
+
+        loss_val = float(total_loss.to_numpy().sum())
+        realized_grads = self._realize_grads(grads, params)
+        clipped_grads = clip_grad_norm_pytree(realized_grads, DEFAULT_GRADIENT_CLIP)
+        new_params = self._apply_optimizer_updates(params, clipped_grads, z_score)
+        self.model.load_state_dict(new_params)
+        return loss_val
+
+    def _tile_to_tensor(self, tile_data):
+        """Convert numpy tile to nabla tensor (1, H, W, 4)."""
+        arr = tile_data.astype(np.float32)
+        if arr.ndim == 2:
+            arr = arr[:, :, np.newaxis]
+        h, w, c = arr.shape
+        if c == 3:
+            alpha = np.ones((h, w, 1), dtype=np.float32)
+            arr = np.concatenate([arr, alpha], axis=-1)
+        return nb.Tensor.from_dlpack(arr[np.newaxis])
 
     def _realize_grads(self, grads, params):
         """Realize lazy gradient tensors to numpy-backed.
