@@ -103,6 +103,9 @@ class OmenTrainer:
             total_loss += self._train_single_tile(
                 tile_noisy, tile_gt, sg_tensor, z_score
             )
+            # Each value_and_grad compiles a 6-8GB graph entry.
+            # Without clearing, N tiles × 6GB = RAM bomb.
+            nb.GRAPH.clear_all()
 
         avg_loss = total_loss / len(noisy_tiles)
         self.iteration += 1
@@ -136,17 +139,20 @@ class OmenTrainer:
         return result
 
     def _train_single_tile(self, tile_noisy, tile_gt, scene_latent, z_score):
-        """Train on one tile — CPU-first, GPU when available."""
+        """Train on one tile — GPU when available, CPU fallback."""
         noisy_tensor = self._tile_to_tensor(tile_noisy.data)
         gt_tensor = self._tile_to_tensor(tile_gt.data)
 
         if self._gpu_available:
             try:
-                noisy_tensor = noisy_tensor.cuda()
-                gt_tensor = gt_tensor.cuda()
-                logger.debug("Tile on GPU")
+                from max.driver import Accelerator
+
+                gpu = Accelerator()
+                noisy_tensor = nb.ops.transfer_to(noisy_tensor, gpu)
+                gt_tensor = nb.ops.transfer_to(gt_tensor, gpu)
+                logger.debug("Tile on GPU via transfer_to")
             except Exception:
-                logger.warning("GPU tensor transfer failed, using CPU")
+                logger.warning("GPU transfer failed, using CPU")
 
         return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
 

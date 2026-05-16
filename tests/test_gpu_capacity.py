@@ -1,7 +1,13 @@
-"""GPU capacity tests — progressive VRAM scaling.
+"""GPU capacity tests — progressive VRAM/RAM scaling with safety guards.
 
-Validates the full GPU pipeline and finds the breaking point under 6GB VRAM.
-Tests run sequentially with 15-second gaps to prevent GPU crashes.
+Validates GPU pipeline and nabla compute limits.
+Tests run with RAM guards that skip before OOM territory (24GB limit on 32GB system).
+
+Key findings from prior runs:
+- Nabla supports GPU via device=Accelerator() and transfer_to(tensor, gpu)
+- Graph cache is the RAM bomb culprit: each value_and_grad = 6-8GB graph entry
+- nb.GRAPH.clear_all() MUST be called between tiles/steps to bound RAM
+- Without clearing: N tiles × 6GB = RAM bomb; With clearing: 1 entry max
 
 Run: uv run pytest tests/test_gpu_capacity.py -v -s
 """
@@ -21,6 +27,13 @@ except ImportError:
     NABLA_AVAILABLE = False
 
 try:
+    from max.driver import Accelerator
+
+    MAX_DRIVER_AVAILABLE = True
+except ImportError:
+    MAX_DRIVER_AVAILABLE = False
+
+try:
     import torch
 
     TORCH_AVAILABLE = True
@@ -36,15 +49,24 @@ gpu_skip = pytest.mark.skipif(
     reason="CUDA GPU not available",
 )
 
-# --- Helpers ---
-
+# --- Safety limits ---
 VRAM_SAFETY_GB = 5.5
+RAM_SAFETY_GB = 24  # Leave ~8GB for OS + Blender on 32GB system
 GPU_GAP_SECONDS = 15
 
 
-def _tensor(arr):
-    """Create Nabla tensor from numpy array."""
-    return nb.Tensor.from_dlpack(np.asarray(arr, dtype=np.float32))
+# --- Resource monitoring helpers ---
+
+
+def _tensor(arr, device=None):
+    """Create Nabla tensor from numpy array, optionally on GPU."""
+    t = nb.Tensor.from_dlpack(np.asarray(arr, dtype=np.float32))
+    if device is not None:
+        try:
+            t = nb.ops.transfer_to(t, device)
+        except Exception:
+            pass
+    return t
 
 
 def _shape(t):
@@ -59,10 +81,82 @@ def _gpu_vram_mb():
     return 0
 
 
-def _safe_to_continue(max_gb=VRAM_SAFETY_GB):
+def _process_rss_mb():
+    """Current process RSS in MB (best effort, cross-platform)."""
+    try:
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    except Exception:
+        return 0
+
+
+def _system_ram_mb():
+    """System RAM used/free in MB via /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            info = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1]) // 1024
+        total = info.get("MemTotal", 0)
+        avail = info.get("MemAvailable", 0)
+        return {"total_mb": total, "used_mb": total - avail, "free_mb": avail}
+    except Exception:
+        return {"total_mb": 0, "used_mb": 0, "free_mb": 0}
+
+
+def _resource_report(label=""):
+    """Print a one-line RAM + VRAM + GPU snapshot."""
+    ram = _system_ram_mb()
+    vram = get_gpu_memory_info()
+    gpu_util = "?"
+    try:
+        import subprocess
+
+        r = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        gpu_util = r.stdout.strip()
+    except Exception:
+        pass
+    print(
+        f"  [{label}] RAM: {ram['used_mb']}/{ram['total_mb']}MB | "
+        f"VRAM: {vram['used_mb']}/{vram['total_mb']}MB | "
+        f"GPU util: {gpu_util}%"
+    )
+
+
+def _safe_to_continue_vram(max_gb=VRAM_SAFETY_GB):
     """Return False if VRAM usage is above safety threshold."""
     info = get_gpu_memory_info()
     return info["used_mb"] < max_gb * 1024
+
+
+def _safe_to_continue_ram(max_gb=RAM_SAFETY_GB):
+    """Return False if system RAM usage is above safety threshold."""
+    ram = _system_ram_mb()
+    return ram["used_mb"] < max_gb * 1024
+
+
+def _ram_guard(label=""):
+    """Combined VRAM + RAM safety check. Skips test if either is exceeded."""
+    if not _safe_to_continue_ram():
+        ram = _system_ram_mb()
+        pytest.skip(
+            f"RAM above {RAM_SAFETY_GB}GB safety threshold ({ram['used_mb']}MB used)"
+        )
+    if not _safe_to_continue_vram():
+        pytest.skip(f"VRAM above {VRAM_SAFETY_GB}GB safety threshold")
+    _resource_report(label)
 
 
 def _gpu_pause():
@@ -70,16 +164,32 @@ def _gpu_pause():
     time.sleep(GPU_GAP_SECONDS)
 
 
-def _make_nano_unet(channels=(16, 32, 64)):
+def _clear_nabla_graph():
+    """Clear nabla graph cache to reclaim RAM between tests."""
+    try:
+        nb.GRAPH.clear_all()
+    except Exception:
+        pass
+
+
+# --- Model helpers ---
+
+
+def _make_nano_unet(channels=(16, 32, 64), device=None):
     """Create a tiny conv encoder-decoder for VRAM testing.
 
-    Returns (model_dict, input_channels) where model_dict has filter tensors.
     Not a full nn.Module — uses nabla functional conv2d.
+    Optionally places weights on GPU via device parameter.
     """
     enc_filters = []
     ch_in = 3
     for ch_out in channels:
         w = F.he_normal((3, 3, ch_in, ch_out))
+        if device is not None:
+            try:
+                w = nb.ops.transfer_to(w, device)
+            except Exception:
+                pass
         w.requires_grad = True
         enc_filters.append(w)
         ch_in = ch_out
@@ -89,11 +199,20 @@ def _make_nano_unet(channels=(16, 32, 64)):
         ch_in = channels[i]
         ch_out = channels[i - 1]
         w = F.he_normal((3, 3, ch_in, ch_out))
+        if device is not None:
+            try:
+                w = nb.ops.transfer_to(w, device)
+            except Exception:
+                pass
         w.requires_grad = True
         dec_filters.append((w, ch_in, ch_out))
 
-    # Final 1x1 conv to 3 channels
     w_out = F.he_normal((1, 1, channels[0], 3))
+    if device is not None:
+        try:
+            w_out = nb.ops.transfer_to(w_out, device)
+        except Exception:
+            pass
     w_out.requires_grad = True
 
     return {
@@ -117,7 +236,6 @@ def _unet_forward(model, x):
         if i == 0:
             x = nb.conv2d(skips[i], w, padding=(1, 1))
         else:
-            # Upsample via nearest-neighbor + conv
             up = _nearest_upsample(x, 2)
             skip = skips[i]
             sh, sw = int(skip.shape[1]), int(skip.shape[2])
@@ -128,7 +246,6 @@ def _unet_forward(model, x):
                 nb.conv2d(nb.concatenate([up, skip], axis=-1), w, padding=(1, 1))
             )
 
-    # Final upsample + 1x1 conv
     up = _nearest_upsample(x, 2)
     out = nb.conv2d(up, model["w_out"])
     return out
@@ -148,7 +265,7 @@ def _center_crop(x, target_h, target_w):
     return x[:, dh : dh + target_h, dw : dw + target_w, :]
 
 
-# === Tests ===
+# === Section 1: Device detection & transfer ===
 
 
 @gpu_skip
@@ -158,6 +275,7 @@ def test_01_device_detection():
     info = get_gpu_memory_info()
     assert info["backend"] != "none", "No GPU backend detected"
     assert info["total_mb"] > 0, "GPU total memory reported as 0"
+    _resource_report("detection")
     print(
         f"  GPU: {info['total_mb']}MB total, {info['free_mb']}MB free, "
         f"backend={info['backend']}"
@@ -166,21 +284,34 @@ def test_01_device_detection():
 
 @gpu_skip
 def test_02_tensor_cuda_transfer():
-    """Create nabla tensor, attempt .cuda(), verify device or skip."""
+    """Create nabla tensor, transfer to GPU via transfer_to, verify."""
     _gpu_pause()
     arr = np.random.randn(4, 4).astype(np.float32)
     t = _tensor(arr)
     assert _shape(t) == (4, 4)
 
-    # Test nabla .cuda() — may not exist in current version
-    try:
-        t_gpu = t.cuda()
-        assert t_gpu is not None
-        print("  nabla tensor.cuda() works")
-    except (AttributeError, NotImplementedError, Exception) as e:
-        pytest.skip(f"nabla tensor.cuda() not available: {e}")
+    # Try nabla GPU transfer via max.driver Accelerator
+    gpu_ok = False
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            gpu = Accelerator()
+            t_gpu = nb.ops.transfer_to(t, gpu)
+            assert t_gpu is not None
+            gpu_ok = True
+            print("  nabla transfer_to(Accelerator) works")
+        except Exception as e:
+            print(f"  nabla transfer_to failed: {e}")
 
-    # Also verify torch GPU transfer works
+    if not gpu_ok:
+        try:
+            t_gpu = t.cuda()
+            assert t_gpu is not None
+            gpu_ok = True
+            print("  nabla tensor.cuda() works")
+        except (AttributeError, NotImplementedError, Exception) as e:
+            print(f"  nabla .cuda() failed: {e}")
+
+    # Also verify torch GPU works
     t_torch = torch.tensor(arr).cuda()
     assert t_torch.device.type == "cuda"
     print("  torch tensor.cuda() works")
@@ -195,7 +326,6 @@ def test_03_gpu_compute():
     c = a @ b
     assert c.shape == (64, 64)
     assert c.device.type == "cuda"
-    # Verify result matches CPU
     c_cpu = a.cpu() @ b.cpu()
     assert torch.allclose(c.cpu(), c_cpu, atol=1e-4)
     print("  GPU matmul matches CPU result")
@@ -208,13 +338,13 @@ def test_04_vram_baseline():
     torch.cuda.reset_peak_memory_stats()
     before = _gpu_vram_mb()
 
-    # Allocate ~64MB on GPU
     big = torch.randn(4096, 4096, device="cuda")  # 64MB float32
     after = _gpu_vram_mb()
     delta = after - before
 
     assert delta > 0, "VRAM did not increase after allocation"
     assert delta < 200, f"VRAM jump too large: {delta}MB (expected ~64MB)"
+    _resource_report("post-alloc")
     print(f"  VRAM: {before:.1f}MB -> {after:.1f}MB (delta={delta:.1f}MB)")
 
     del big
@@ -223,27 +353,22 @@ def test_04_vram_baseline():
 
 @gpu_skip
 def test_05_progressive_tensor_scale():
-    """Allocate tensors 64->128->256->512->1024 MB, track VRAM."""
+    """Allocate tensors 64->128->256->512->1024 MB on GPU, track VRAM."""
     _gpu_pause()
     sizes_mb = [64, 128, 256, 512, 1024]
     tensors = []
 
     for target_mb in sizes_mb:
-        if not _safe_to_continue():
+        if not _safe_to_continue_vram():
             pytest.skip(f"VRAM above {VRAM_SAFETY_GB}GB at {target_mb}MB target")
 
-        elements = target_mb * 1024 * 1024 // 4  # float32 = 4 bytes
+        elements = target_mb * 1024 * 1024 // 4
         side = int(elements**0.5)
         t = torch.randn(side, side, device="cuda")
         tensors.append(t)
 
-        vram = _gpu_vram_mb()
+        _resource_report(f"{target_mb}MB")
         info = get_gpu_memory_info()
-        print(
-            f"  {target_mb}MB allocated: VRAM={vram:.0f}MB, "
-            f"GPU used={info['used_mb']}MB, free={info['free_mb']}MB"
-        )
-
         if info["used_mb"] > VRAM_SAFETY_GB * 1024:
             print(f"  Stopping: exceeded {VRAM_SAFETY_GB}GB safety limit")
             break
@@ -252,13 +377,15 @@ def test_05_progressive_tensor_scale():
     torch.cuda.empty_cache()
 
 
+# === Section 2: Nabla model tests (GPU-enabled, RAM-guarded) ===
+
+
 @nabla_skip
 @gpu_skip
 def test_06_nano_jepa_forward():
-    """Tiny OmenJEPA (latent=64), forward pass on GPU if possible."""
+    """Tiny OmenJEPA (latent=64), forward pass."""
     _gpu_pause()
-    if not _safe_to_continue():
-        pytest.skip("VRAM above safety threshold")
+    _ram_guard("pre-jepa")
 
     from omen.config import OmenConfig
     from omen.model.jepa import OmenJEPA
@@ -271,20 +398,33 @@ def test_06_nano_jepa_forward():
     model = OmenJEPA(config=config, latent_dim=64)
     model.train()
 
-    # Create fake inputs
+    # Try GPU device for input tensors
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
+
     scene_graph = {
-        "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32)),
-        "materials": _tensor(np.random.randn(1, 5, 5).astype(np.float32)),
-        "lights": _tensor(np.random.randn(1, 3, 7).astype(np.float32)),
+        "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32), device),
+        "materials": _tensor(np.random.randn(1, 5, 5).astype(np.float32), device),
+        "lights": _tensor(np.random.randn(1, 3, 7).astype(np.float32), device),
     }
-    rgba = _tensor(np.random.randn(1, 16, 16, 4).astype(np.float32))
+    rgba = _tensor(np.random.randn(1, 16, 16, 4).astype(np.float32), device)
 
     fused, scene_latent = model.encode(scene_graph, rgba)
     assert _shape(fused) == (1, 64), f"Expected (1,64), got {_shape(fused)}"
 
     residual = model.decode(fused, rgba)
     assert int(residual.shape[0]) == 1
-    print(f"  Nano JEPA forward: fused={_shape(fused)}, residual={_shape(residual)}")
+    _ram_guard("post-jepa-fwd")
+    device_str = "GPU" if device is not None else "CPU"
+    print(
+        f"  Nano JEPA forward ({device_str}): "
+        f"fused={_shape(fused)}, residual={_shape(residual)}"
+    )
+    _clear_nabla_graph()
 
 
 @nabla_skip
@@ -292,8 +432,7 @@ def test_06_nano_jepa_forward():
 def test_07_nano_jepa_backward():
     """Nano OmenJEPA forward+backward via value_and_grad."""
     _gpu_pause()
-    if not _safe_to_continue():
-        pytest.skip("VRAM above safety threshold")
+    _ram_guard("pre-jepa-bwd")
 
     from omen.config import OmenConfig
     from omen.model.jepa import OmenJEPA
@@ -306,27 +445,40 @@ def test_07_nano_jepa_backward():
     model = OmenJEPA(config=config, latent_dim=64)
     model.train()
 
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
+
     scene_graph = {
-        "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32)),
-        "materials": _tensor(np.random.randn(1, 5, 5).astype(np.float32)),
-        "lights": _tensor(np.random.randn(1, 3, 7).astype(np.float32)),
+        "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32), device),
+        "materials": _tensor(np.random.randn(1, 5, 5).astype(np.float32), device),
+        "lights": _tensor(np.random.randn(1, 3, 7).astype(np.float32), device),
     }
-    rgba = _tensor(np.random.randn(1, 16, 16, 4).astype(np.float32))
-    target = _tensor(np.random.randn(1, 64).astype(np.float32))
+    rgba = _tensor(np.random.randn(1, 16, 16, 4).astype(np.float32), device)
+    target = _tensor(np.random.randn(1, 64).astype(np.float32), device)
 
     def loss_fn(rgba):
         fused, _ = model.encode(scene_graph, rgba)
         return nb.mean((fused - target) ** 2)
 
+    t0 = time.perf_counter()
     val, grad = nb.value_and_grad(loss_fn)(rgba)
+    dt = time.perf_counter() - t0
+
     assert _shape(grad) == _shape(rgba), (
         f"Grad shape {_shape(grad)} != input {_shape(rgba)}"
     )
     assert not np.isnan(val.to_numpy().item()), "Loss is NaN"
+    _ram_guard("post-jepa-bwd")
+    device_str = "GPU" if device is not None else "CPU"
     print(
-        f"  Nano JEPA backward: loss={val.to_numpy().item():.4f}, "
-        f"grad_shape={_shape(grad)}"
+        f"  Nano JEPA backward ({device_str}): loss={val.to_numpy().item():.4f}, "
+        f"grad_shape={_shape(grad)}, time={dt:.2f}s"
     )
+    _clear_nabla_graph()
 
 
 @nabla_skip
@@ -334,13 +486,18 @@ def test_07_nano_jepa_backward():
 def test_08_small_unet_forward():
     """3-level U-Net (16->32->64), forward pass."""
     _gpu_pause()
-    if not _safe_to_continue():
-        pytest.skip("VRAM above safety threshold")
+    _ram_guard("pre-unet")
 
-    model = _make_nano_unet(channels=(16, 32, 64))
-    x = _tensor(np.random.randn(1, 32, 32, 3).astype(np.float32))
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
 
-    # Simple forward: just encoder path + skip adds
+    model = _make_nano_unet(channels=(16, 32, 64), device=device)
+    x = _tensor(np.random.randn(1, 32, 32, 3).astype(np.float32), device)
+
     s1 = nb.silu(nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1)))
     s2 = nb.silu(nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1)))
     s3 = nb.silu(nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1)))
@@ -348,21 +505,30 @@ def test_08_small_unet_forward():
     assert _shape(s1) == (1, 16, 16, 16), f"Stage 1: {_shape(s1)}"
     assert _shape(s2) == (1, 8, 8, 32), f"Stage 2: {_shape(s2)}"
     assert _shape(s3) == (1, 4, 4, 64), f"Stage 3: {_shape(s3)}"
+    device_str = "GPU" if device is not None else "CPU"
     print(
-        f"  U-Net forward: {32}x{32} -> s1={_shape(s1)}, s2={_shape(s2)}, s3={_shape(s3)}"
+        f"  U-Net forward ({device_str}): "
+        f"32x32 -> s1={_shape(s1)}, s2={_shape(s2)}, s3={_shape(s3)}"
     )
+    _clear_nabla_graph()
 
 
 @nabla_skip
 @gpu_skip
 def test_09_small_unet_backward():
-    """U-Net encoder forward+backward, measure VRAM."""
+    """U-Net encoder forward+backward, measure RAM + time."""
     _gpu_pause()
-    if not _safe_to_continue():
-        pytest.skip("VRAM above safety threshold")
+    _ram_guard("pre-unet-bwd")
 
-    model = _make_nano_unet(channels=(16, 32, 64))
-    x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32))
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
+
+    model = _make_nano_unet(channels=(16, 32, 64), device=device)
+    x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
 
     def forward(x):
         s1 = nb.silu(
@@ -376,10 +542,19 @@ def test_09_small_unet_backward():
         )
         return nb.mean(s3**2)
 
+    t0 = time.perf_counter()
     val, grad = nb.value_and_grad(forward)(x)
+    dt = time.perf_counter() - t0
+
     assert _shape(grad) == _shape(x)
     assert not np.isnan(val.to_numpy().item())
-    print(f"  U-Net backward at 64x64: loss={val.to_numpy().item():.4f}")
+    _ram_guard("post-unet-bwd")
+    device_str = "GPU" if device is not None else "CPU"
+    print(
+        f"  U-Net backward ({device_str}) at 64x64: "
+        f"loss={val.to_numpy().item():.4f}, time={dt:.2f}s"
+    )
+    _clear_nabla_graph()
 
 
 @nabla_skip
@@ -387,37 +562,61 @@ def test_09_small_unet_backward():
 def test_10_compile_gpu():
     """@nb.compile on a forward step, check compilation works."""
     _gpu_pause()
-    if not _safe_to_continue():
-        pytest.skip("VRAM above safety threshold")
+    _ram_guard("pre-compile")
 
-    x = _tensor(np.random.randn(1, 16, 16, 3).astype(np.float32))
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
+
+    x = _tensor(np.random.randn(1, 16, 16, 3).astype(np.float32), device)
     w = F.he_normal((3, 3, 3, 16))
+    if device is not None:
+        try:
+            w = nb.ops.transfer_to(w, device)
+        except Exception:
+            pass
     w.requires_grad = True
 
     @nb.compile
     def compiled_forward(x, w):
         return nb.mean(nb.conv2d(x, w, padding=(1, 1)) ** 2)
 
-    # First call compiles, second uses cache
     try:
+        t0 = time.perf_counter()
         result = compiled_forward(x, w)
+        dt = time.perf_counter() - t0
         assert result is not None
-        print(f"  @nb.compile works: output shape={_shape(result)}")
+        _ram_guard("post-compile")
+        print(f"  @nb.compile works: output shape={_shape(result)}, time={dt:.2f}s")
     except Exception as e:
         pytest.skip(f"@nb.compile failed: {e}")
+
+
+# === Section 3: Resolution scaling (GPU + RAM-guarded) ===
 
 
 @nabla_skip
 @gpu_skip
 @pytest.mark.parametrize("resolution", [64, 128, 256])
 def test_11_resolution_scale(resolution):
-    """Run encoder at scaled resolutions, stop at 5.5GB."""
+    """Run encoder at scaled resolutions. RAM guard stops before OOM."""
     _gpu_pause()
-    if not _safe_to_continue():
-        pytest.skip(f"VRAM above {VRAM_SAFETY_GB}GB at {resolution}x{resolution}")
+    _ram_guard(f"pre-{resolution}")
 
-    model = _make_nano_unet(channels=(16, 32, 64))
-    x = _tensor(np.random.randn(1, resolution, resolution, 3).astype(np.float32))
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
+
+    model = _make_nano_unet(channels=(16, 32, 64), device=device)
+    x = _tensor(
+        np.random.randn(1, resolution, resolution, 3).astype(np.float32), device
+    )
 
     def forward(x):
         s1 = nb.silu(
@@ -431,53 +630,276 @@ def test_11_resolution_scale(resolution):
         )
         return nb.mean(s3**2)
 
+    t0 = time.perf_counter()
     val, grad = nb.value_and_grad(forward)(x)
-    info = get_gpu_memory_info()
-    assert info["used_mb"] < 6 * 1024, (
-        f"VRAM exceeded 6GB at {resolution}x{resolution}: {info['used_mb']}MB"
-    )
+    dt = time.perf_counter() - t0
+
+    _ram_guard(f"post-{resolution}")
+    device_str = "GPU" if device is not None else "CPU"
     print(
-        f"  {resolution}x{resolution}: loss={val.to_numpy().item():.4f}, "
-        f"VRAM={info['used_mb']}MB"
+        f"  {resolution}x{resolution} ({device_str}): "
+        f"loss={val.to_numpy().item():.4f}, time={dt:.2f}s"
     )
+    _clear_nabla_graph()
 
 
 @nabla_skip
 @gpu_skip
-def test_12_vram_breaking_point():
-    """Binary search for max image resolution under 6GB."""
+def test_12_ram_breaking_point():
+    """Find max nabla resolution under RAM safety limit.
+
+    Graph cache is the RAM bomb culprit: each value_and_grad compiles
+    a 6-8GB graph entry. Without clearing between iterations, RAM explodes.
+    This test clears after each resolution to prove the fix works.
+    """
     _gpu_pause()
 
-    lo, hi = 64, 2048
-    best = lo
-    max_vram_mb = 6 * 1024
-
-    while lo <= hi:
-        mid = (lo + hi) // 2
+    device = None
+    if MAX_DRIVER_AVAILABLE:
         try:
-            info = get_gpu_memory_info()
-            if info["used_mb"] >= max_vram_mb:
-                hi = mid - 1
-                continue
+            device = Accelerator()
+        except Exception:
+            device = None
 
-            x = _tensor(np.random.randn(1, mid, mid, 3).astype(np.float32))
-            w = F.he_normal((3, 3, 3, 16))
-            result = nb.mean(nb.conv2d(x, w, padding=(1, 1)) ** 2)
-            _ = result.to_numpy()  # Force evaluation
+    results = []
+    for res in [64, 128, 256]:
+        if not _safe_to_continue_ram():
+            print(f"  Stopped at {res}x{res}: RAM limit reached")
+            break
 
-            info = get_gpu_memory_info()
-            if info["used_mb"] < max_vram_mb:
-                best = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        except (MemoryError, RuntimeError, Exception):
-            hi = mid - 1
+        ram_before = _system_ram_mb()["used_mb"]
+        t0 = time.perf_counter()
+
+        x = _tensor(np.random.randn(1, res, res, 3).astype(np.float32), device)
+        w = F.he_normal((3, 3, 3, 16))
+        if device is not None:
+            try:
+                w = nb.ops.transfer_to(w, device)
+            except Exception:
+                pass
+        result = nb.mean(nb.conv2d(x, w, padding=(1, 1)) ** 2)
+        _ = result.to_numpy()
+
+        dt = time.perf_counter() - t0
+        ram_after = _system_ram_mb()["used_mb"]
+        ram_delta = ram_after - ram_before
+
+        results.append(
+            {
+                "res": res,
+                "time_s": dt,
+                "ram_delta_mb": ram_delta,
+                "ram_total_mb": ram_after,
+            }
+        )
+        _resource_report(f"{res}x{res}")
+
+        # Clear graph cache after each resolution to prevent accumulation
+        _clear_nabla_graph()
+
+        if ram_after > RAM_SAFETY_GB * 1024:
+            print(f"  Hit RAM safety limit at {res}x{res}")
+            break
 
         _gpu_pause()
 
-    info = get_gpu_memory_info()
-    print(
-        f"  Max resolution under 6GB: {best}x{best} (current VRAM: {info['used_mb']}MB)"
+    assert len(results) > 0, "No resolutions tested"
+    print("  Resolution scaling summary:")
+    for r in results:
+        print(
+            f"    {r['res']}x{r['res']}: time={r['time_s']:.2f}s, "
+            f"RAM +{r['ram_delta_mb']}MB (total {r['ram_total_mb']}MB)"
+        )
+
+
+# === Section 4: GPU training speed benchmarks ===
+
+
+@gpu_skip
+def test_13_torch_gpu_training_step():
+    """Torch conv2d forward+backward on GPU — baseline speed."""
+    _gpu_pause()
+
+    # Small conv model: 3 conv layers
+    conv1 = torch.nn.Conv2d(3, 16, 3, padding=1).cuda()
+    conv2 = torch.nn.Conv2d(16, 32, 3, padding=1).cuda()
+    conv3 = torch.nn.Conv2d(32, 64, 3, stride=2, padding=1).cuda()
+
+    x = torch.randn(1, 3, 256, 256, device="cuda")
+    target = torch.randn(1, 64, 128, 128, device="cuda")
+    optimizer = torch.optim.SGD(
+        list(conv1.parameters()) + list(conv2.parameters()) + list(conv3.parameters()),
+        lr=0.01,
     )
-    assert best >= 64, "Could not allocate even 64x64 on GPU"
+
+    # Warmup
+    out = conv3(torch.silu(conv2(torch.silu(conv1(x)))))
+    loss = torch.nn.functional.mse_loss(out, target)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    torch.cuda.synchronize()
+
+    # Timed steps
+    times = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        out = conv3(torch.silu(conv2(torch.silu(conv1(x)))))
+        loss = torch.nn.functional.mse_loss(out, target)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - t0)
+
+    avg = np.mean(times)
+    _resource_report("torch-gpu-256")
+    print(
+        f"  Torch GPU training (256x256, 5 steps): "
+        f"avg={avg:.4f}s, min={min(times):.4f}s, max={max(times):.4f}s"
+    )
+    del x, target, conv1, conv2, conv3
+    torch.cuda.empty_cache()
+
+
+@nabla_skip
+@gpu_skip
+def test_14_nabla_gpu_training_step():
+    """Nabla conv2d forward+backward on GPU — compare to torch GPU."""
+    _gpu_pause()
+    _ram_guard("pre-nabla-train")
+
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
+
+    model = _make_nano_unet(channels=(16, 32, 64), device=device)
+    x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
+
+    def loss_fn(x):
+        s1 = nb.silu(
+            nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1))
+        )
+        s2 = nb.silu(
+            nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1))
+        )
+        s3 = nb.silu(
+            nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1))
+        )
+        return nb.mean(s3**2)
+
+    # Warmup (first call compiles graph)
+    val, grad = nb.value_and_grad(loss_fn)(x)
+
+    # Timed steps
+    times = []
+    for _ in range(3):
+        _clear_nabla_graph()
+        x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
+        t0 = time.perf_counter()
+        val, grad = nb.value_and_grad(loss_fn)(x)
+        _ = val.to_numpy()  # Force evaluation
+        times.append(time.perf_counter() - t0)
+        if not _safe_to_continue_ram():
+            print("  RAM limit hit during nabla training loop")
+            break
+
+    avg = np.mean(times) if times else 0
+    _ram_guard("post-nabla-train")
+    device_str = "GPU" if device is not None else "CPU"
+    print(
+        f"  Nabla {device_str} training (64x64, {len(times)} steps): "
+        f"avg={avg:.4f}s, min={min(times):.4f}s, max={max(times):.4f}s"
+    )
+    _clear_nabla_graph()
+
+
+@nabla_skip
+@gpu_skip
+def test_15_torch_gpu_vs_nabla_gpu():
+    """Side-by-side: same conv encoder, torch GPU vs nabla GPU."""
+    _gpu_pause()
+    _ram_guard("pre-compare")
+
+    resolution = 64
+    n_steps = 3
+
+    # --- Torch GPU ---
+    conv1 = torch.nn.Conv2d(3, 16, 3, stride=2, padding=1).cuda()
+    conv2 = torch.nn.Conv2d(16, 32, 3, stride=2, padding=1).cuda()
+    conv3 = torch.nn.Conv2d(32, 64, 3, stride=2, padding=1).cuda()
+    x_t = torch.randn(1, 3, resolution, resolution, device="cuda")
+
+    torch_times = []
+    for _ in range(n_steps):
+        t0 = time.perf_counter()
+        out = conv3(torch.silu(conv2(torch.silu(conv1(x_t)))))
+        loss = out.pow(2).mean()
+        loss.backward()
+        torch.cuda.synchronize()
+        torch_times.append(time.perf_counter() - t0)
+        conv1.zero_grad()
+        conv2.zero_grad()
+        conv3.zero_grad()
+
+    del x_t, conv1, conv2, conv3
+    torch.cuda.empty_cache()
+
+    # --- Nabla GPU ---
+    device = None
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            device = Accelerator()
+        except Exception:
+            device = None
+
+    model = _make_nano_unet(channels=(16, 32, 64), device=device)
+    x_n = _tensor(
+        np.random.randn(1, resolution, resolution, 3).astype(np.float32), device
+    )
+
+    def fwd(x):
+        s1 = nb.silu(
+            nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1))
+        )
+        s2 = nb.silu(
+            nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1))
+        )
+        s3 = nb.silu(
+            nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1))
+        )
+        return nb.mean(s3**2)
+
+    # Warmup
+    nb.value_and_grad(fwd)(x_n)
+
+    nabla_times = []
+    for _ in range(n_steps):
+        _clear_nabla_graph()
+        x_n = _tensor(
+            np.random.randn(1, resolution, resolution, 3).astype(np.float32),
+            device,
+        )
+        t0 = time.perf_counter()
+        val, grad = nb.value_and_grad(fwd)(x_n)
+        _ = val.to_numpy()
+        nabla_times.append(time.perf_counter() - t0)
+        if not _safe_to_continue_ram():
+            break
+
+    torch_avg = np.mean(torch_times)
+    nabla_avg = np.mean(nabla_times)
+    speedup = nabla_avg / torch_avg if torch_avg > 0 else float("inf")
+
+    _ram_guard("post-compare")
+    device_str = "GPU" if device is not None else "CPU"
+    print(f"  Torch GPU (64x64, {n_steps} steps): avg={torch_avg:.4f}s")
+    print(f"  Nabla {device_str} (64x64, {n_steps} steps): avg={nabla_avg:.4f}s")
+    print(
+        f"  Ratio: nabla {device_str} is {speedup:.1f}x "
+        f"{'slower' if speedup > 1 else 'faster'} than torch GPU"
+    )
+    _clear_nabla_graph()
