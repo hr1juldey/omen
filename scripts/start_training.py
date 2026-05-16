@@ -7,10 +7,6 @@ import logging
 import os
 import time
 
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-logger = logging.getLogger("omen.train_cli")
-
 from omen.config import OmenConfig
 from omen.gpu_budget import can_fit_tiles, get_gpu_memory_info
 from omen.model.jepa import OmenJEPA
@@ -18,8 +14,13 @@ from omen.scenes import SCENE_REGISTRY
 from omen.training.online_gen import TrainingDataGenerator
 from omen.training.trainer.core import OmenTrainer
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+logger = logging.getLogger("omen.train_cli")
+
 ANIMATION_TYPES = ("camera_orbit", "mesh", "material", "light")
-CKPT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".cache", "checkpoints")
+CKPT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), ".cache", "checkpoints"
+)
 
 
 def _find_latest_checkpoint(ckpt_dir):
@@ -44,7 +45,7 @@ def _system_ram_mb():
         return 0
 
 
-RAM_LIMIT_GB = 24  # Leave ~8GB for OS on 32GB system
+DEFAULT_RAM_LIMIT_GB = 24  # Leave ~8GB for OS on 32GB system
 
 
 def _train_on_data(
@@ -57,6 +58,7 @@ def _train_on_data(
     step_idx,
     steps_per_frame=1,
     checkpoint_every=0,
+    ram_limit_gb=DEFAULT_RAM_LIMIT_GB,
 ):
     """Run tiled training step(s) and log results.
 
@@ -66,9 +68,9 @@ def _train_on_data(
     """
     # RAM guard — abort before OOM kills the process
     ram_mb = _system_ram_mb()
-    if ram_mb > RAM_LIMIT_GB * 1024:
+    if ram_mb > ram_limit_gb * 1024:
         raise MemoryError(
-            f"RAM {ram_mb}MB exceeds {RAM_LIMIT_GB}GB limit — stopping before OOM"
+            f"RAM {ram_mb}MB exceeds {ram_limit_gb}GB limit — stopping before OOM"
         )
 
     all_metrics = []
@@ -161,13 +163,12 @@ def main():
     parser.add_argument(
         "--ram-limit",
         type=int,
-        default=RAM_LIMIT_GB,
-        help=f"Abort if system RAM exceeds this many GB (default: {RAM_LIMIT_GB})",
+        default=DEFAULT_RAM_LIMIT_GB,
+        help=f"Abort if system RAM exceeds this many GB (default: {DEFAULT_RAM_LIMIT_GB})",
     )
     args = parser.parse_args()
 
-    # Update RAM limit from CLI
-    RAM_LIMIT_GB = args.ram_limit
+    ram_limit_gb = args.ram_limit
 
     # Log file handler
     if args.log_file:
@@ -214,7 +215,7 @@ def main():
         resolution=(w, h), gt_spp=512, noisy_spp=4, save_images=args.save_images
     )
 
-    ckpt_kw = {"checkpoint_every": args.checkpoint_every}
+    ckpt_kw = {"checkpoint_every": args.checkpoint_every, "ram_limit_gb": ram_limit_gb}
     losses = []
 
     if args.scenes == "all":
@@ -237,7 +238,15 @@ def main():
         logger.warning("Loss unchanged — check gradient flow.")
 
 
-def _run_static(trainer, gen, builder, args, losses, checkpoint_every=0):
+def _run_static(
+    trainer,
+    gen,
+    builder,
+    args,
+    losses,
+    checkpoint_every=0,
+    ram_limit_gb=DEFAULT_RAM_LIMIT_GB,
+):
     """Static camera training — single or multi-camera."""
     logger.info(
         "Mode: static | Camera: %s | Steps: %d",
@@ -256,11 +265,21 @@ def _run_static(trainer, gen, builder, args, losses, checkpoint_every=0):
                 step_idx,
                 steps_per_frame=args.steps_per_frame,
                 checkpoint_every=checkpoint_every,
+                ram_limit_gb=ram_limit_gb,
             )
             losses.append(metrics["total_loss"])
 
 
-def _run_multi_scene(trainer, gen, args, losses, w, h, checkpoint_every=0):
+def _run_multi_scene(
+    trainer,
+    gen,
+    args,
+    losses,
+    w,
+    h,
+    checkpoint_every=0,
+    ram_limit_gb=DEFAULT_RAM_LIMIT_GB,
+):
     """Curriculum training — master one scene completely, then move to next.
 
     Per scene: static cameras -> all animation types.
@@ -295,6 +314,7 @@ def _run_multi_scene(trainer, gen, args, losses, w, h, checkpoint_every=0):
                     step_idx,
                     steps_per_frame=args.steps_per_frame,
                     checkpoint_every=checkpoint_every,
+                    ram_limit_gb=ram_limit_gb,
                 )
                 losses.append(metrics["total_loss"])
 
@@ -324,6 +344,7 @@ def _run_multi_scene(trainer, gen, args, losses, w, h, checkpoint_every=0):
                     0,
                     steps_per_frame=args.steps_per_frame,
                     checkpoint_every=checkpoint_every,
+                    ram_limit_gb=ram_limit_gb,
                 )
                 losses.append(metrics["total_loss"])
 
@@ -333,7 +354,17 @@ def _run_multi_scene(trainer, gen, args, losses, w, h, checkpoint_every=0):
         logger.info("[%s] Mastered. Checkpoint saved. Cache flushed.", scene_name)
 
 
-def _run_animation(trainer, gen, builder, args, losses, w, h, checkpoint_every=0):
+def _run_animation(
+    trainer,
+    gen,
+    builder,
+    args,
+    losses,
+    w,
+    h,
+    checkpoint_every=0,
+    ram_limit_gb=DEFAULT_RAM_LIMIT_GB,
+):
     """Animation training — sequential frames with temporal variation."""
     from omen.scenes import get_animation_generator
 
@@ -357,6 +388,7 @@ def _run_animation(trainer, gen, builder, args, losses, w, h, checkpoint_every=0
                 0,
                 steps_per_frame=args.steps_per_frame,
                 checkpoint_every=checkpoint_every,
+                ram_limit_gb=ram_limit_gb,
             )
             losses.append(metrics["total_loss"])
         return
@@ -379,6 +411,7 @@ def _run_animation(trainer, gen, builder, args, losses, w, h, checkpoint_every=0
             step_idx,
             steps_per_frame=args.steps_per_frame,
             checkpoint_every=checkpoint_every,
+            ram_limit_gb=ram_limit_gb,
         )
         losses.append(metrics["total_loss"])
         step_idx += 1
