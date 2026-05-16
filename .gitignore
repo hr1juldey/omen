@@ -16,3 +16,4 @@ wheels/
 .playwright-mcp
 .modular_1000
 logs/
+.cache/

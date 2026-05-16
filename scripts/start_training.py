@@ -19,7 +19,7 @@ from omen.training.online_gen import TrainingDataGenerator
 from omen.training.trainer.core import OmenTrainer
 
 ANIMATION_TYPES = ("camera_orbit", "mesh", "material", "light")
-CKPT_DIR = os.path.expanduser("~/.cache/omen/checkpoints")
+CKPT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".cache", "checkpoints")
 
 
 def _find_latest_checkpoint(ckpt_dir):
