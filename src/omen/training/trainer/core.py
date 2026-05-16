@@ -67,7 +67,39 @@ class OmenTrainer:
         )
 
         self._compiled_step = None
+        self._gpu = None
+        if self._gpu_available:
+            try:
+                from max.driver import Accelerator
+
+                self._gpu = Accelerator()
+                self._transfer_model_to_gpu(self._gpu)
+                logger.info("Model weights transferred to GPU")
+            except Exception as e:
+                logger.warning("GPU model transfer failed, using CPU: %s", e)
+                self._gpu = None
+
         self._init_compiled_step()
+
+    def _transfer_model_to_gpu(self, gpu):
+        """Transfer all model weights to GPU so state_dict returns GPU tensors."""
+        for name, param in self.model.state_dict().items():
+            transferred = nb.ops.transfer_to(param, gpu)
+            # Replace the parameter in the model's internal storage
+            parts = name.split(".")
+            obj = self.model
+            for part in parts[:-1]:
+                if part.isdigit():
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+            leaf_name = parts[-1]
+            if hasattr(obj, "weight") and leaf_name == "weight":
+                obj.weight = transferred
+            elif hasattr(obj, "bias") and leaf_name == "bias":
+                obj.bias = transferred
+            elif hasattr(obj, leaf_name):
+                setattr(obj, leaf_name, transferred)
 
     def _init_compiled_step(self):
         """Create compiled forward+backward step for graph cache reuse.
@@ -169,18 +201,36 @@ class OmenTrainer:
             result[section_key] = converted
         return result
 
+    def _transfer_scene_latent_to_gpu(self, scene_latent):
+        """Transfer scene_latent tensors to GPU."""
+        if not isinstance(scene_latent, dict) or self._gpu is None:
+            return scene_latent
+        result = {}
+        for section_key, section in scene_latent.items():
+            if isinstance(section, dict):
+                converted = {}
+                for k, v in section.items():
+                    if nb.is_tensor(v):
+                        converted[k] = nb.ops.transfer_to(v, self._gpu)
+                    else:
+                        converted[k] = v
+                result[section_key] = converted
+            elif nb.is_tensor(section):
+                result[section_key] = nb.ops.transfer_to(section, self._gpu)
+            else:
+                result[section_key] = section
+        return result
+
     def _train_single_tile(self, tile_noisy, tile_gt, scene_latent, z_score):
         """Train on one tile — GPU when available, CPU fallback."""
         noisy_tensor = self._tile_to_tensor(tile_noisy.data)
         gt_tensor = self._tile_to_tensor(tile_gt.data)
 
-        if self._gpu_available:
+        if self._gpu is not None:
             try:
-                from max.driver import Accelerator
-
-                gpu = Accelerator()
-                noisy_tensor = nb.ops.transfer_to(noisy_tensor, gpu)
-                gt_tensor = nb.ops.transfer_to(gt_tensor, gpu)
+                noisy_tensor = nb.ops.transfer_to(noisy_tensor, self._gpu)
+                gt_tensor = nb.ops.transfer_to(gt_tensor, self._gpu)
+                scene_latent = self._transfer_scene_latent_to_gpu(scene_latent)
                 logger.debug("Tile on GPU via transfer_to")
             except Exception:
                 logger.warning("GPU transfer failed, using CPU")
