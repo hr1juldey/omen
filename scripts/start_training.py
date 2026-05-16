@@ -64,12 +64,14 @@ def _train_on_data(
     steps_per_frame=1,
     checkpoint_every=0,
     ram_limit_gb=DEFAULT_RAM_LIMIT_GB,
+    flush_graph=False,
 ):
     """Run tiled training step(s) and log results.
 
-    Graph cache is flushed after EVERY frame — each frame is a different
-    camera view so the compiled graph isn't reusable anyway.  Within a frame,
-    all tiles share the same shapes and reuse one cached graph entry.
+    With ``@nb.compile``, the compiled graph depends on tensor shapes only —
+    not pixel values — so it's reusable across ALL frames at the same
+    resolution.  Set ``flush_graph=True`` only when switching scenes (different
+    model architecture) or if RAM is critically high.
     """
     # RAM guard — abort before OOM kills the process
     ram_mb = _system_ram_mb()
@@ -110,9 +112,10 @@ def _train_on_data(
         if checkpoint_every > 0 and trainer.iteration % checkpoint_every == 0:
             trainer.save_checkpoint_rotating(CKPT_DIR)
 
-    # Flush nabla graph cache after this frame — next frame is a new view.
-    # All tiles within this frame shared one cached graph (same shapes).
-    trainer.flush_graph_cache()
+    # Only flush graph cache when explicitly requested (scene transitions).
+    # With @nb.compile, the graph is shape-dependent and reusable across frames.
+    if flush_graph:
+        trainer.flush_graph_cache()
     return all_metrics[-1]
 
 
