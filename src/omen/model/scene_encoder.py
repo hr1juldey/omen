@@ -20,7 +20,7 @@ try:
 except ImportError:
     NABLA_AVAILABLE = False
 
-from omen.kernels.activations import silu_gpu
+from omen.kernels.activations import sigmoid_gpu, silu_gpu
 from omen.kernels.conv2d import conv2d_safe
 
 logger = logging.getLogger("omen.model.scene_encoder")
@@ -201,6 +201,6 @@ class CrossAttentionFusion(nn.Module):
             fused: (batch, latent_dim)
         """
         # Learned gate: how much scene info to mix in
-        g = nb.sigmoid(self.gate(render_latent))
+        g = sigmoid_gpu(self.gate(render_latent))
         fused = self.norm(render_latent + g * scene_latent)
         return fused

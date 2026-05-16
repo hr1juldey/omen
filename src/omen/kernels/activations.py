@@ -1,11 +1,16 @@
-"""GPU-safe activation functions — pure nabla decomposition.
+"""GPU-safe activation functions — pure nabla ops with scalar-free VJPs.
 
-Two nabla bugs block GPU backward passes:
-1. nb.silu VJP creates `sub(1.0, sig_x)` — Python scalar → CPU tensor → device mismatch
-2. UnaryOperation subclass hits `TensorValue.num_shards` AttributeError during graph tracing
+Nabla ops whose VJPs create `sub(1.0, ...)` fail on GPU backward because
+`ensure_tensor(1.0)` creates a CPU constant → MAX compiler rejects mixed devices.
+Affected: sigmoid, tanh, silu, gelu, relu.
 
-Fix: decompose silu into pure nabla ops (multiply + sigmoid). Nabla's autodiff
-computes the backward via chain rule through each op individually, bypassing both bugs.
+Safe ops (verified GPU backward): exp, mul, add, div, neg, softmax.
+
+GPU-safe sigmoid:  1.0 / (1.0 + exp(-x))  — numerically stable, no overflow
+  - neg VJP:   -cotangent                 — no scalar
+  - exp VJP:   cotangent * exp(x)         — no scalar
+  - add VJP:   pass-through               — no scalar
+  - div VJP:   mul + neg                   — no scalar
 """
 
 import logging
@@ -20,12 +25,24 @@ except ImportError:
     NABLA_AVAILABLE = False
 
 
-def silu_gpu(x):
-    """GPU-safe SiLU activation via pure nabla decomposition.
+def sigmoid_gpu(x):
+    """GPU-safe sigmoid via exp — scalar-free backward, numerically stable.
 
-    x * sigmoid(x) — no custom op, no UnaryOperation, no scalar constants.
+    sigmoid(x) = 1.0 / (1.0 + exp(-x))
+    Stable: no overflow for large positive x (exp(-x) → 0).
+    Avoids nb.sigmoid whose VJP creates sub(1.0, output) → CPU scalar.
+    """
+    if not NABLA_AVAILABLE:
+        raise ImportError("Nabla required for sigmoid_gpu")
+    return 1.0 / (1.0 + nb.exp(nb.neg(x)))
+
+
+def silu_gpu(x):
+    """GPU-safe SiLU via exp-based sigmoid — scalar-free backward.
+
+    silu(x) = x * sigmoid_gpu(x)
     Drop-in replacement for nb.silu that works on GPU backward passes.
     """
     if not NABLA_AVAILABLE:
         raise ImportError("Nabla required for silu_gpu")
-    return x * nb.sigmoid(x)
+    return x * sigmoid_gpu(x)

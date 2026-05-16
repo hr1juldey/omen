@@ -16,7 +16,7 @@ try:
 except ImportError:
     NABLA_AVAILABLE = False
 
-from omen.kernels.activations import silu_gpu
+from omen.kernels.activations import sigmoid_gpu, silu_gpu
 from omen.kernels.conv2d import conv2d_safe
 from omen.model.mla_skip import MLASkipPair
 
@@ -96,7 +96,7 @@ class Decoder(nn.Module):
         e4 = silu_gpu(conv2d_safe(s3, self.e4, stride=(2, 2), padding=(1, 1)))
 
         # Bottleneck: gated JEPA latent injection
-        gate = nb.sigmoid(self.lat_gate(latent))
+        gate = sigmoid_gpu(self.lat_gate(latent))
         l_feat = gate * self.lat_proj(latent)
         bn = e4 * nb.reshape(l_feat, (int(latent.shape[0]), 1, 1, 256))
 
