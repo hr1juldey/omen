@@ -6,7 +6,6 @@ import logging
 import os
 import time
 
-import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 logger = logging.getLogger("omen.train_cli")
@@ -21,20 +20,34 @@ from omen.training.trainer.core import OmenTrainer
 ANIMATION_TYPES = ("camera_orbit", "mesh", "material", "light")
 
 
-def _train_on_data(trainer, gen, noisy, gt, sg, tile_size, step_idx):
-    """Run one tiled training step and log results."""
-    t0 = time.perf_counter()
-    metrics = trainer.train_step_tiled(noisy, gt, sg, tile_size=tile_size)
-    dt = time.perf_counter() - t0
-    logger.info(
-        "Step %d: loss=%.6f tiles=%d iter=%d (%.1fs)",
-        step_idx + 1,
-        metrics["total_loss"],
-        metrics["num_tiles"],
-        metrics["iteration"],
-        dt,
-    )
-    return metrics
+def _train_on_data(trainer, gen, noisy, gt, sg, tile_size, step_idx, steps_per_frame=1):
+    """Run tiled training step(s) and log results."""
+    all_metrics = []
+    for sub_idx in range(steps_per_frame):
+        t0 = time.perf_counter()
+        metrics = trainer.train_step_tiled(noisy, gt, sg, tile_size=tile_size)
+        dt = time.perf_counter() - t0
+        if steps_per_frame > 1:
+            logger.info(
+                "Frame step %d/%d: loss=%.6f tiles=%d iter=%d (%.1fs)",
+                sub_idx + 1,
+                steps_per_frame,
+                metrics["total_loss"],
+                metrics["num_tiles"],
+                metrics["iteration"],
+                dt,
+            )
+        else:
+            logger.info(
+                "Step %d: loss=%.6f tiles=%d iter=%d (%.1fs)",
+                step_idx + 1,
+                metrics["total_loss"],
+                metrics["num_tiles"],
+                metrics["iteration"],
+                dt,
+            )
+        all_metrics.append(metrics)
+    return all_metrics[-1]
 
 
 def main():
@@ -51,10 +64,28 @@ def main():
         help="Train on animation frames instead of static views",
     )
     parser.add_argument("--save-images", action="store_true")
+    parser.add_argument(
+        "--steps-per-frame",
+        type=int,
+        default=1,
+        help="Optimizer steps per rendered frame",
+    )
+    parser.add_argument("--lr-warmup", type=int, default=0, help="Linear warmup steps")
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=1000,
+        help="Total steps for cosine decay schedule",
+    )
+    parser.add_argument(
+        "--scenes",
+        choices=["single", "all"],
+        default="single",
+        help="Train on single scene or all scenes",
+    )
     args = parser.parse_args()
 
     w, h = map(int, args.resolution.split("x"))
-    builder = SCENE_REGISTRY[args.scene]
 
     # GPU check
     gpu_info = get_gpu_memory_info()
@@ -69,22 +100,25 @@ def main():
     # Setup
     config = OmenConfig.v1_dense()
     model = OmenJEPA(config=config)
-    trainer = OmenTrainer(model, config=config)
-    gen = TrainingDataGenerator(
-        resolution=(w, h), gt_spp=256, noisy_spp=4, save_images=args.save_images
+    trainer = OmenTrainer(
+        model,
+        config=config,
+        warmup_steps=args.lr_warmup,
+        total_steps=args.total_steps,
     )
-
-    logger.info(
-        "Scene: %s | Resolution: %dx%d | Tiles: %d",
-        args.scene, w, h, args.tile_size,
+    gen = TrainingDataGenerator(
+        resolution=(w, h), gt_spp=512, noisy_spp=4, save_images=args.save_images
     )
 
     losses = []
 
-    # Animation mode: train on sequential frames
-    if args.animation:
+    if args.scenes == "all":
+        _run_multi_scene(trainer, gen, args, losses, w, h)
+    elif args.animation:
+        builder = SCENE_REGISTRY[args.scene]
         _run_animation(trainer, gen, builder, args, losses, w, h)
     else:
+        builder = SCENE_REGISTRY[args.scene]
         _run_static(trainer, gen, builder, args, losses)
 
     # Save checkpoint
@@ -92,7 +126,7 @@ def main():
     trainer.save_checkpoint(ckpt_path)
 
     logger.info("Done. Loss: %.6f -> %.6f", losses[0], losses[-1])
-    unique = len(set(f"{l:.4f}" for l in losses))
+    unique = len(set(f"{loss:.4f}" for loss in losses))
     if unique > 1:
         logger.info("Loss changed across %d unique values — model is learning.", unique)
     else:
@@ -102,35 +136,96 @@ def main():
 def _run_static(trainer, gen, builder, args, losses):
     """Static camera training — single or multi-camera."""
     logger.info(
-        "Mode: static | Camera: %s | Steps: %d", args.camera, args.steps,
+        "Mode: static | Camera: %s | Steps: %d",
+        args.camera,
+        args.steps,
     )
     for step_idx in range(args.steps):
         for step_data in gen.train_step(builder, camera=args.camera):
-            _train_on_data(
-                trainer, gen,
-                step_data["noisy_image"], step_data["gt_image"],
-                step_data["scene_graph"], args.tile_size, step_idx,
+            metrics = _train_on_data(
+                trainer,
+                gen,
+                step_data["noisy_image"],
+                step_data["gt_image"],
+                step_data["scene_graph"],
+                args.tile_size,
+                step_idx,
+                steps_per_frame=args.steps_per_frame,
             )
-            losses.append(trainer.iteration)
+            losses.append(metrics["total_loss"])
+
+
+def _run_multi_scene(trainer, gen, args, losses, w, h):
+    """Multi-scene training — round-robin through all scenes."""
+    scene_names = sorted(SCENE_REGISTRY.keys())
+    logger.info("Mode: multi-scene | Scenes: %s | Steps: %d", scene_names, args.steps)
+    step_idx = 0
+    while step_idx < args.steps:
+        for scene_name in scene_names:
+            if step_idx >= args.steps:
+                break
+            builder = SCENE_REGISTRY[scene_name]
+            logger.info("Scene %d/%d: %s", step_idx + 1, args.steps, scene_name)
+            for step_data in gen.train_step(builder, camera=args.camera):
+                metrics = _train_on_data(
+                    trainer,
+                    gen,
+                    step_data["noisy_image"],
+                    step_data["gt_image"],
+                    step_data["scene_graph"],
+                    args.tile_size,
+                    step_idx,
+                    steps_per_frame=args.steps_per_frame,
+                )
+                losses.append(metrics["total_loss"])
+            step_idx += 1
 
 
 def _run_animation(trainer, gen, builder, args, losses, w, h):
     """Animation training — sequential frames with temporal variation."""
-    from omen.scenes import cornell_animations
+    from omen.scenes import get_animation_generator
 
-    logger.info("Mode: animation | Type: %s", args.animation)
+    logger.info("Mode: animation | Scene: %s | Type: %s", args.scene, args.animation)
 
     # Build base scene to get scene_graph (shared across all frames)
     _, sg = builder(resolution=(w, h))
-    animations = cornell_animations(base_resolution=(w, h))
+    animations = get_animation_generator(args.scene, base_resolution=(w, h))
+    if animations is None:
+        logger.warning(
+            "No animation generator for scene '%s', falling back to multi-camera",
+            args.scene,
+        )
+        for step_data in gen.train_step(builder, camera="all"):
+            metrics = _train_on_data(
+                trainer,
+                gen,
+                step_data["noisy_image"],
+                step_data["gt_image"],
+                step_data["scene_graph"],
+                args.tile_size,
+                0,
+                steps_per_frame=args.steps_per_frame,
+            )
+            losses.append(metrics["total_loss"])
+        return
+    if args.animation not in animations:
+        avail = list(animations.keys())
+        raise ValueError(
+            f"No animation '{args.animation}' for scene '{args.scene}'. Available: {avail}"
+        )
     frames = animations[args.animation]
 
     step_idx = 0
     for step_data in gen.train_animation(frames, sg):
         metrics = _train_on_data(
-            trainer, gen,
-            step_data["noisy_image"], step_data["gt_image"],
-            sg, args.tile_size, step_idx,
+            trainer,
+            gen,
+            step_data["noisy_image"],
+            step_data["gt_image"],
+            sg,
+            args.tile_size,
+            step_idx,
+            steps_per_frame=args.steps_per_frame,
         )
         losses.append(metrics["total_loss"])
         step_idx += 1

@@ -602,7 +602,6 @@ def cornell_animations(
     Returns dict mapping animation name → generator of mi.Scene objects.
     Each generator yields one mi.Scene per frame.
     """
-    import types as _types  # noqa: F811 — avoid clash if needed
 
     W, H, D = 5.5, 5.5, 5.5
     white = [0.725, 0.71, 0.68]
@@ -1351,7 +1350,6 @@ def shaderball_animations(base_resolution: tuple[int, int] = (1920, 1080)) -> di
 
     # 4.8 Light: 8-frame area light rotation
     def _light_frames():
-        import math
         for i in range(8):
             angle = 180 * i / 7
             d = _base()
@@ -1533,6 +1531,25 @@ SCENE_REGISTRY["veach"] = build_veach_ajar
 SCENE_REGISTRY["shaderball"] = build_shaderball
 SCENE_REGISTRY["studio"] = build_studio_product
 SCENE_REGISTRY["foggy"] = build_foggy_corridor
+
+# Animation generators per scene
+ANIMATION_REGISTRY: dict[str, callable] = {
+    "cornell": cornell_animations,
+    "veach": veach_animations,
+    "shaderball": shaderball_animations,
+    "studio": studio_animations,
+    "foggy": foggy_animations,
+}
+
+
+def get_animation_generator(
+    scene_name: str, base_resolution: tuple[int, int] = (1920, 1080),
+) -> dict | None:
+    """Return animation dict for a scene, or None if no generator exists."""
+    gen_fn = ANIMATION_REGISTRY.get(scene_name)
+    if gen_fn is None:
+        return None
+    return gen_fn(base_resolution=base_resolution)
 
 
 # ===========================================================================

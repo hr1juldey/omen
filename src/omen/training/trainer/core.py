@@ -1,12 +1,13 @@
 """OmenTrainer: functional value_and_grad + per-component AdamW."""
 
 import logging
+import math
 import os
 
 import numpy as np
 
 from omen.config import OmenConfig
-from omen.training.tile import Tile, extract_tiles
+from omen.training.tile import extract_tiles
 from omen.training.trainer.gradient import clip_grad_norm_pytree
 from omen.training.trainer.loss import compute_training_loss
 from omen.training.trainer.optimizers import create_functional_optimizers
@@ -34,7 +35,13 @@ class OmenTrainer:
     """
 
     def __init__(
-        self, model, config=None, lr=DEFAULT_LR, weight_decay=DEFAULT_WEIGHT_DECAY
+        self,
+        model,
+        config=None,
+        lr=DEFAULT_LR,
+        weight_decay=DEFAULT_WEIGHT_DECAY,
+        warmup_steps=0,
+        total_steps=1000,
     ):
         if not NABLA_AVAILABLE:
             raise ImportError("Nabla required for training")
@@ -43,12 +50,15 @@ class OmenTrainer:
         self.config = config or OmenConfig()
         self.weight_decay = weight_decay
         self.iteration = 0
+        self._warmup_steps = warmup_steps
+        self._total_steps = total_steps
 
         errors = self.config.validate()
         if errors:
             raise ValueError(f"Invalid config: {'; '.join(errors)}")
 
         from omen.gpu_budget import get_gpu_memory_info
+
         gpu_info = get_gpu_memory_info()
         self._gpu_available = gpu_info["backend"] != "none"
 
@@ -183,13 +193,28 @@ class OmenTrainer:
                 realized[name] = nb.Tensor.from_dlpack(g.to_numpy())
         return realized
 
-    def _compute_lr(self, component_name, z_score=0.0):
-        """Compute learning rate with optional surprise modulation."""
+    def _compute_scheduled_lr(self, component_name, z_score=0.0):
+        """Compute LR with warmup + cosine decay + optional surprise modulation."""
         base_lr = self._components[component_name]["lr"]
+        min_lr = base_lr * 0.01
+        step = self.iteration
+
+        if self._warmup_steps > 0 and step < self._warmup_steps:
+            scheduled = base_lr * (step / self._warmup_steps)
+        elif step >= self._total_steps:
+            scheduled = min_lr
+        else:
+            progress = (step - self._warmup_steps) / max(
+                self._total_steps - self._warmup_steps, 1
+            )
+            scheduled = min_lr + 0.5 * (base_lr - min_lr) * (
+                1 + math.cos(math.pi * progress)
+            )
+
         if not self.config.training.surprise_lr_modulation or z_score <= 0:
-            return base_lr
+            return scheduled
         scale = self.config.training.surprise_lr_scale
-        return base_lr * (1.0 + scale * min(z_score, 5.0))
+        return scheduled * (1.0 + scale * min(z_score, 5.0))
 
     def _apply_optimizer_updates(self, params, grads, z_score):
         """Per-component ``adamw_update`` with surprise-modulated LRs."""
@@ -198,7 +223,7 @@ class OmenTrainer:
             names = comp["param_names"]
             subset_p = {n: params[n] for n in names}
             subset_g = {n: grads[n] for n in names}
-            lr = self._compute_lr(name, z_score)
+            lr = self._compute_scheduled_lr(name, z_score)
 
             updated_p, new_state = adamw_update(
                 subset_p,

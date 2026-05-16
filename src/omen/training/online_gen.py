@@ -14,6 +14,7 @@ import numpy as np
 
 try:
     import mitsuba as mi
+
     MITSUBA_AVAILABLE = True
 except ImportError:
     MITSUBA_AVAILABLE = False
@@ -67,7 +68,7 @@ class TrainingDataGenerator:
     def __init__(
         self,
         resolution: tuple[int, int] = (1920, 1080),
-        gt_spp: int = 256,
+        gt_spp: int = 512,
         noisy_spp: int = 4,
         save_images: bool = False,
         output_dir: str = "./debug/",
@@ -75,7 +76,9 @@ class TrainingDataGenerator:
         if not MITSUBA_AVAILABLE:
             raise ImportError("Mitsuba required for TrainingDataGenerator")
         available = set(mi.variants())
-        variant = next(v for v in ("cuda_ad_rgb", "llvm_ad_rgb", "scalar_rgb") if v in available)
+        variant = next(
+            v for v in ("cuda_ad_rgb", "llvm_ad_rgb", "scalar_rgb") if v in available
+        )
         mi.set_variant(variant)
         logger.info("Mitsuba variant: %s", variant)
         self.resolution = resolution
@@ -84,9 +87,13 @@ class TrainingDataGenerator:
         self.save_images = save_images
         self.output_dir = output_dir
         self._step = 0
-        logger.info("Init: res=%s, gt_spp=%d, noisy_spp=%d", resolution, gt_spp, noisy_spp)
+        logger.info(
+            "Init: res=%s, gt_spp=%d, noisy_spp=%d", resolution, gt_spp, noisy_spp
+        )
 
-    def train_step(self, scene_builder, camera: str = "default", seed: int | None = None):
+    def train_step(
+        self, scene_builder, camera: str = "default", seed: int | None = None
+    ):
         """Render one GT + noisy pair. Yields step_data dict."""
         if seed is None:
             seed = self._step
@@ -138,7 +145,10 @@ class TrainingDataGenerator:
         """Generate N pairs for replay buffer. Returns list of step_data."""
         scene, sg = scene_builder(resolution=self.resolution)
         sg_str = json.dumps(
-            {k: v.tolist() if isinstance(v, np.ndarray) else str(v) for k, v in sg.items()},
+            {
+                k: v.tolist() if isinstance(v, np.ndarray) else str(v)
+                for k, v in sg.items()
+            },
             sort_keys=True,
         )
         scene_hash = hashlib.md5(sg_str.encode()).hexdigest()[:12]
