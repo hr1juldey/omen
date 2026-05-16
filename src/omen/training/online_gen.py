@@ -74,7 +74,10 @@ class TrainingDataGenerator:
     ):
         if not MITSUBA_AVAILABLE:
             raise ImportError("Mitsuba required for TrainingDataGenerator")
-        mi.set_variant("scalar_rgb")
+        available = set(mi.variants())
+        variant = next(v for v in ("cuda_ad_rgb", "llvm_ad_rgb", "scalar_rgb") if v in available)
+        mi.set_variant(variant)
+        logger.info("Mitsuba variant: %s", variant)
         self.resolution = resolution
         self.gt_spp = gt_spp
         self.noisy_spp = noisy_spp
@@ -109,6 +112,26 @@ class TrainingDataGenerator:
             data = _step_dict(gt, noisy, sg, seed, camera_idx=cam_idx)
             if self.save_images:
                 _save_debug(data, self.output_dir, self._step)
+            yield data
+
+    def train_animation(self, animation_frames, scene_graph):
+        """Train on animation frames — camera motion, mesh, material, light.
+
+        Args:
+            animation_frames: iterable of mi.Scene objects (from
+                ``cornell_animations()`` generators).
+            scene_graph: shared scene graph dict for the animation.
+        """
+        for frame_idx, scene in enumerate(animation_frames):
+            seed = self._step * 100 + frame_idx
+            self._step += 1
+            t0 = time.perf_counter()
+            gt, noisy = _render_pair(scene, self.gt_spp, self.noisy_spp, seed)
+            dt = time.perf_counter() - t0
+            logger.info("Anim frame %d: rendered in %.2fs", frame_idx, dt)
+            data = _step_dict(gt, noisy, scene_graph, seed, frame_idx=frame_idx)
+            if self.save_images:
+                _save_debug(data, self.output_dir, self._step, suffix=f"_f{frame_idx}")
             yield data
 
     def generate_batch(self, scene_builder, count: int = 10, replay_buffer=None):

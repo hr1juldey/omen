@@ -1,6 +1,5 @@
 """OmenTrainer: functional value_and_grad + per-component AdamW."""
 
-import gc
 import logging
 import os
 
@@ -94,33 +93,15 @@ class OmenTrainer:
             total_loss += self._train_single_tile(
                 tile_noisy, tile_gt, sg_tensor, z_score
             )
-            gc.collect()
 
         avg_loss = total_loss / len(noisy_tiles)
         self.iteration += 1
-
-        # Release nabla compiled graphs to bound RAM (~6-8GB per entry)
-        self._clear_graph_cache()
-
         return {
             "total_loss": avg_loss,
             "num_tiles": len(noisy_tiles),
             "iteration": self.iteration,
             "z_score": z_score,
         }
-
-    def _clear_graph_cache(self):
-        """Clear nabla compiled graph cache to bound RAM usage.
-
-        Each cache entry holds ~6-8GB.  Fixed tile sizes produce at most
-        1-2 entries per step, but leaving them across steps accumulates.
-        Clearing between ``train_step_tiled`` calls ensures predictable RAM.
-        """
-        try:
-            nb.GRAPH.clear_all()
-        except (AttributeError, Exception):
-            pass
-        gc.collect()
 
     def _to_nabla_scene_graph(self, scene_graph):
         """Convert scene_graph numpy arrays to batched nabla tensors.
