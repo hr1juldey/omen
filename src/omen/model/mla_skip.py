@@ -18,6 +18,8 @@ try:
 except ImportError:
     NABLA_AVAILABLE = False
 
+from omen.kernels.activations import silu_gpu
+
 logger = logging.getLogger("omen.model.mla_skip")
 
 COMPRESS_RATIO = 16
@@ -40,7 +42,7 @@ class MLASkipCompress(nn.Module):
         Returns:
             compressed: (B, H, W, C//16) compressed skip latent
         """
-        return nb.silu(self.down(skip_features))
+        return silu_gpu(self.down(skip_features))
 
 
 class MLASkipReconstruct(nn.Module):

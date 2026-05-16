@@ -3,9 +3,12 @@
 try:
     import nabla as nb
     from nabla import nn
+
     NABLA_AVAILABLE = True
 except ImportError:
     NABLA_AVAILABLE = False
+
+from omen.kernels.activations import silu_gpu
 
 
 class ExpertFFN(nn.Module):
@@ -18,7 +21,7 @@ class ExpertFFN(nn.Module):
         self.w2 = nn.Linear(hidden, channels)
 
     def forward(self, x):
-        return self.w2(nb.silu(self.w1(x)))
+        return self.w2(silu_gpu(self.w1(x)))
 
 
 class SharedExpert(nn.Module):

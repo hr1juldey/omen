@@ -42,6 +42,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from omen.gpu_budget import get_gpu_memory_info
+from omen.kernels.activations import silu_gpu
 
 # --- Skip markers ---
 nabla_skip = pytest.mark.skipif(not NABLA_AVAILABLE, reason="Nabla not available")
@@ -65,8 +66,9 @@ def _tensor(arr, device=None):
     if device is not None:
         try:
             t = nb.ops.transfer_to(t, device)
-        except Exception:
-            pass
+            print(f"    [transfer] tensor {tuple(int(d) for d in t.shape)} -> GPU OK")
+        except Exception as e:
+            print(f"    [transfer] FAILED: {e} — staying on CPU")
     return t
 
 
@@ -177,10 +179,36 @@ def _get_device():
     """Get Accelerator device if available, else None (CPU)."""
     if MAX_DRIVER_AVAILABLE:
         try:
-            return Accelerator()
-        except Exception:
+            dev = Accelerator()
+            print(f"    [device] Accelerator() = {dev}")
+            return dev
+        except Exception as e:
+            print(f"    [device] Accelerator() FAILED: {e}")
             return None
+    print("    [device] max.driver not available, using CPU")
     return None
+
+
+def _transfer_model_to_device(model, device):
+    """Transfer all model weights to device. Returns model (mutated in-place)."""
+    if device is None:
+        return model
+    state = model.state_dict()
+    new_state = {}
+    transferred = 0
+    failed = 0
+    for k, v in state.items():
+        try:
+            new_state[k] = nb.ops.transfer_to(v, device)
+            transferred += 1
+        except Exception as e:
+            if failed == 0:
+                print(f"    [model-transfer] FAILED on '{k}': {e}")
+            new_state[k] = v
+            failed += 1
+    model.load_state_dict(new_state)
+    print(f"    [model-transfer] {transferred}/{transferred + failed} weights -> GPU")
+    return model
 
 
 # --- Model helpers ---
@@ -194,13 +222,18 @@ def _make_nano_unet(channels=(16, 32, 64), device=None):
     """
     enc_filters = []
     ch_in = 3
+    gpu_ok = 0
+    gpu_fail = 0
     for ch_out in channels:
         w = F.he_normal((3, 3, ch_in, ch_out))
         if device is not None:
             try:
                 w = nb.ops.transfer_to(w, device)
-            except Exception:
-                pass
+                gpu_ok += 1
+            except Exception as e:
+                if gpu_fail == 0:
+                    print(f"    [unet-transfer] enc filter FAILED: {e}")
+                gpu_fail += 1
         w.requires_grad = True
         enc_filters.append(w)
         ch_in = ch_out
@@ -213,8 +246,11 @@ def _make_nano_unet(channels=(16, 32, 64), device=None):
         if device is not None:
             try:
                 w = nb.ops.transfer_to(w, device)
-            except Exception:
-                pass
+                gpu_ok += 1
+            except Exception as e:
+                if gpu_fail == 0:
+                    print(f"    [unet-transfer] dec filter FAILED: {e}")
+                gpu_fail += 1
         w.requires_grad = True
         dec_filters.append((w, ch_in, ch_out))
 
@@ -222,9 +258,15 @@ def _make_nano_unet(channels=(16, 32, 64), device=None):
     if device is not None:
         try:
             w_out = nb.ops.transfer_to(w_out, device)
-        except Exception:
-            pass
+            gpu_ok += 1
+        except Exception as e:
+            print(f"    [unet-transfer] w_out FAILED: {e}")
+            gpu_fail += 1
     w_out.requires_grad = True
+
+    if device is not None:
+        total = gpu_ok + gpu_fail
+        print(f"    [unet-transfer] {gpu_ok}/{total} filters -> GPU")
 
     return {
         "enc_filters": enc_filters,
@@ -238,7 +280,7 @@ def _unet_forward(model, x):
     """Forward pass through nano U-Net. Returns output tensor."""
     skips = []
     for w in model["enc_filters"]:
-        x = nb.silu(nb.conv2d(x, w, stride=(2, 2), padding=(1, 1)))
+        x = silu_gpu(nb.conv2d(x, w, stride=(2, 2), padding=(1, 1)))
         skips.append(x)
 
     # Decoder (reverse, skip connections via add)
@@ -253,7 +295,7 @@ def _unet_forward(model, x):
             uh, uw = int(up.shape[1]), int(up.shape[2])
             if uh != sh or uw != sw:
                 skip = _center_crop(skip, uh, uw)
-            x = nb.silu(
+            x = silu_gpu(
                 nb.conv2d(nb.concatenate([up, skip], axis=-1), w, padding=(1, 1))
             )
 
@@ -410,6 +452,7 @@ def test_06_nano_jepa_forward():
     model.train()
 
     device = _get_device()
+    _transfer_model_to_device(model, device)
 
     scene_graph = {
         "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32), device),
@@ -451,6 +494,7 @@ def test_07_nano_jepa_backward():
     model.train()
 
     device = _get_device()
+    _transfer_model_to_device(model, device)
 
     scene_graph = {
         "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32), device),
@@ -462,7 +506,8 @@ def test_07_nano_jepa_backward():
 
     def loss_fn(rgba):
         fused, _ = model.encode(scene_graph, rgba)
-        return nb.mean((fused - target) ** 2)
+        diff = fused - target
+        return nb.mean(diff * diff)
 
     t0 = time.perf_counter()
     val, grad = nb.value_and_grad(loss_fn)(rgba)
@@ -493,9 +538,9 @@ def test_08_small_unet_forward():
     model = _make_nano_unet(channels=(16, 32, 64), device=device)
     x = _tensor(np.random.randn(1, 32, 32, 3).astype(np.float32), device)
 
-    s1 = nb.silu(nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1)))
-    s2 = nb.silu(nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1)))
-    s3 = nb.silu(nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1)))
+    s1 = silu_gpu(nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1)))
+    s2 = silu_gpu(nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1)))
+    s3 = silu_gpu(nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1)))
 
     assert _shape(s1) == (1, 16, 16, 16), f"Stage 1: {_shape(s1)}"
     assert _shape(s2) == (1, 8, 8, 32), f"Stage 2: {_shape(s2)}"
@@ -521,16 +566,16 @@ def test_09_small_unet_backward():
     x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
 
     def forward(x):
-        s1 = nb.silu(
+        s1 = silu_gpu(
             nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1))
         )
-        s2 = nb.silu(
+        s2 = silu_gpu(
             nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1))
         )
-        s3 = nb.silu(
+        s3 = silu_gpu(
             nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1))
         )
-        return nb.mean(s3**2)
+        return nb.mean(s3 * s3)
 
     t0 = time.perf_counter()
     val, grad = nb.value_and_grad(forward)(x)
@@ -567,7 +612,8 @@ def test_10_compile_gpu():
 
     @nb.compile
     def compiled_forward(x, w):
-        return nb.mean(nb.conv2d(x, w, padding=(1, 1)) ** 2)
+        c = nb.conv2d(x, w, padding=(1, 1))
+        return nb.mean(c * c)
 
     try:
         t0 = time.perf_counter()
@@ -599,16 +645,16 @@ def test_11_resolution_scale(resolution):
     )
 
     def forward(x):
-        s1 = nb.silu(
+        s1 = silu_gpu(
             nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1))
         )
-        s2 = nb.silu(
+        s2 = silu_gpu(
             nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1))
         )
-        s3 = nb.silu(
+        s3 = silu_gpu(
             nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1))
         )
-        return nb.mean(s3**2)
+        return nb.mean(s3 * s3)
 
     t0 = time.perf_counter()
     val, grad = nb.value_and_grad(forward)(x)
@@ -652,7 +698,8 @@ def test_12_ram_breaking_point():
                 w = nb.ops.transfer_to(w, device)
             except Exception:
                 pass
-        result = nb.mean(nb.conv2d(x, w, padding=(1, 1)) ** 2)
+        c = nb.conv2d(x, w, padding=(1, 1))
+        result = nb.mean(c * c)
         _ = result.to_numpy()
 
         dt = time.perf_counter() - t0
@@ -708,7 +755,7 @@ def test_13_torch_gpu_training_step():
     )
 
     # Warmup
-    out = conv3(torch.silu(conv2(torch.silu(conv1(x)))))
+    out = conv3(torch.nn.functional.silu(conv2(torch.nn.functional.silu(conv1(x)))))
     loss = torch.nn.functional.mse_loss(out, target)
     loss.backward()
     optimizer.step()
@@ -719,7 +766,7 @@ def test_13_torch_gpu_training_step():
     times = []
     for _ in range(5):
         t0 = time.perf_counter()
-        out = conv3(torch.silu(conv2(torch.silu(conv1(x)))))
+        out = conv3(torch.nn.functional.silu(conv2(torch.nn.functional.silu(conv1(x)))))
         loss = torch.nn.functional.mse_loss(out, target)
         loss.backward()
         optimizer.step()
@@ -750,16 +797,16 @@ def test_14_nabla_gpu_training_step():
     x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
 
     def loss_fn(x):
-        s1 = nb.silu(
+        s1 = silu_gpu(
             nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1))
         )
-        s2 = nb.silu(
+        s2 = silu_gpu(
             nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1))
         )
-        s3 = nb.silu(
+        s3 = silu_gpu(
             nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1))
         )
-        return nb.mean(s3**2)
+        return nb.mean(s3 * s3)
 
     # @nb.compile: graph compiled ONCE in warmup, reused on every call (cache hit)
     @nb.compile
@@ -811,7 +858,9 @@ def test_15_torch_gpu_vs_nabla_gpu():
     torch_times = []
     for _ in range(n_steps):
         t0 = time.perf_counter()
-        out = conv3(torch.silu(conv2(torch.silu(conv1(x_t)))))
+        out = conv3(
+            torch.nn.functional.silu(conv2(torch.nn.functional.silu(conv1(x_t))))
+        )
         loss = out.pow(2).mean()
         loss.backward()
         torch.cuda.synchronize()
@@ -832,16 +881,16 @@ def test_15_torch_gpu_vs_nabla_gpu():
     )
 
     def fwd(x):
-        s1 = nb.silu(
+        s1 = silu_gpu(
             nb.conv2d(x, model["enc_filters"][0], stride=(2, 2), padding=(1, 1))
         )
-        s2 = nb.silu(
+        s2 = silu_gpu(
             nb.conv2d(s1, model["enc_filters"][1], stride=(2, 2), padding=(1, 1))
         )
-        s3 = nb.silu(
+        s3 = silu_gpu(
             nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1))
         )
-        return nb.mean(s3**2)
+        return nb.mean(s3 * s3)
 
     @nb.compile
     def compiled_fwd_bwd(x):
@@ -879,3 +928,117 @@ def test_15_torch_gpu_vs_nabla_gpu():
         f"{'slower' if speedup > 1 else 'faster'} than torch GPU"
     )
     _clear_nabla_graph()
+
+
+# === Section 5: silu_gpu custom op — GPU backward stress test ===
+
+
+@nabla_skip
+@gpu_skip
+def test_16_silu_gpu_forward_backward():
+    """Custom SiluGPU op: forward + backward on GPU with scalar-free VJP."""
+    _gpu_pause()
+    _ram_guard("pre-silu-gpu")
+
+    from omen.kernels.activations import silu_gpu
+
+    device = _get_device()
+    x = _tensor(np.random.randn(1, 32, 32, 16).astype(np.float32), device)
+
+    # Forward
+    out = silu_gpu(x)
+    out_np = out.to_numpy()
+    assert out_np.shape == (1, 32, 32, 16)
+    assert not np.isnan(out_np).any(), "silu_gpu forward produced NaN"
+
+    # Backward via value_and_grad
+    def loss_fn(x):
+        return nb.mean(silu_gpu(x) * silu_gpu(x))
+
+    val, grad = nb.value_and_grad(loss_fn)(x)
+    val_np = val.to_numpy()
+    grad_np = grad.to_numpy()
+    assert not np.isnan(val_np).item(), "silu_gpu backward loss is NaN"
+    assert not np.isnan(grad_np).any(), "silu_gpu backward grad has NaN"
+    assert grad_np.shape == (1, 32, 32, 16)
+
+    _ram_guard("post-silu-gpu")
+    device_str = "GPU" if device is not None else "CPU"
+    print(
+        f"  silu_gpu forward+backward ({device_str}): "
+        f"loss={val_np.item():.4f}, grad_shape={grad_np.shape}"
+    )
+    _clear_nabla_graph()
+
+
+@nabla_skip
+@gpu_skip
+def test_17_silu_gpu_training_loop():
+    """Sustained GPU training loop with silu_gpu — 10 steps, RAM-guarded."""
+    _gpu_pause()
+    _ram_guard("pre-silu-train")
+
+    from omen.kernels.activations import silu_gpu
+
+    device = _get_device()
+
+    # 4-layer conv model on GPU with silu_gpu
+    filters = []
+    for ch_in, ch_out in [(3, 16), (16, 32), (32, 64), (64, 128)]:
+        w = F.he_normal((3, 3, ch_in, ch_out))
+        if device is not None:
+            w = nb.ops.transfer_to(w, device)
+        w.requires_grad = True
+        filters.append(w)
+
+    def loss_fn(x):
+        s = x
+        for w in filters:
+            conv_out = nb.conv2d(s, w, stride=(2, 2), padding=(1, 1))
+            s = silu_gpu(conv_out)
+        return nb.mean(s * s)
+
+    # Step 1: compile + execute
+    x = _tensor(np.random.randn(1, 128, 128, 3).astype(np.float32), device)
+    print("  Step 1 (compile+exec)...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    val, grad = nb.value_and_grad(loss_fn)(x)
+    val_np = val.to_numpy()
+    grad_np = grad.to_numpy()
+    dt = time.perf_counter() - t0
+    assert not np.isnan(val_np).item(), f"Step 1 NaN loss: {val_np.item()}"
+    assert not np.isnan(grad_np).any(), "Step 1 NaN grads"
+    print(
+        f"{dt:.1f}s loss={val_np.item():.1f} grad_nan={np.isnan(grad_np).any()}",
+        flush=True,
+    )
+    nb.GRAPH.clear_all()
+
+    # Steps 2-10: sustained
+    times = []
+    for i in range(9):
+        if not _safe_to_continue_ram():
+            print(f"  RAM limit at step {i + 2}, stopping")
+            break
+        x = _tensor(np.random.randn(1, 128, 128, 3).astype(np.float32), device)
+        t0 = time.perf_counter()
+        val, grad = nb.value_and_grad(loss_fn)(x)
+        val_np = val.to_numpy()
+        grad_np = grad.to_numpy()
+        dt = time.perf_counter() - t0
+        times.append(dt)
+        assert not np.isnan(val_np).item(), f"Step {i + 2} NaN loss"
+        assert not np.isnan(grad_np).any(), f"Step {i + 2} NaN grads"
+        print(
+            f"  Step {i + 2}: {dt:.2f}s loss={val_np.item():.1f} grad_nan=False",
+            flush=True,
+        )
+        nb.GRAPH.clear_all()
+
+    _ram_guard("post-silu-train")
+    device_str = "GPU" if device is not None else "CPU"
+    avg = np.mean(times) if times else 0
+    print(
+        f"  silu_gpu training ({device_str}, 128x128, {len(times) + 1} steps): "
+        f"avg={avg:.2f}s"
+    )

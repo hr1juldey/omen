@@ -10,16 +10,17 @@ Output: latent vector of shape (batch, 192)
 """
 
 import logging
-import numpy as np
 
 try:
     import nabla as nb
     from nabla import nn
     import nabla.nn.functional as F
+
     NABLA_AVAILABLE = True
 except ImportError:
     NABLA_AVAILABLE = False
 
+from omen.kernels.activations import silu_gpu
 from omen.kernels.conv2d import conv2d_safe
 
 logger = logging.getLogger("omen.model.scene_encoder")
@@ -159,9 +160,17 @@ class RenderFeatureEncoder(nn.Module):
             latent: (batch, latent_dim)
         """
         # conv2d_safe: NHWC input, HWIO filter
-        x = nb.silu(conv2d_safe(rgba, self.conv1_filter, stride=2, padding=1, bias=self.conv1_bias))
-        x = nb.silu(conv2d_safe(x, self.conv2_filter, stride=2, padding=1, bias=self.conv2_bias))
-        x = nb.silu(conv2d_safe(x, self.conv3_filter, stride=2, padding=1, bias=self.conv3_bias))
+        x = silu_gpu(
+            conv2d_safe(
+                rgba, self.conv1_filter, stride=2, padding=1, bias=self.conv1_bias
+            )
+        )
+        x = silu_gpu(
+            conv2d_safe(x, self.conv2_filter, stride=2, padding=1, bias=self.conv2_bias)
+        )
+        x = silu_gpu(
+            conv2d_safe(x, self.conv3_filter, stride=2, padding=1, bias=self.conv3_bias)
+        )
 
         # Global average pool over spatial dims (H, W) -> (B, 128)
         x = x.mean(axis=(1, 2))
