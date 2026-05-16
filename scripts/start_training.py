@@ -7,11 +7,6 @@ import logging
 import os
 import time
 
-# Set nabla default device to GPU before importing nabla-transitive modules.
-# This ensures VJP scalar constants (e.g., mul(2.0, output)) are created on
-# GPU, avoiding device mismatch during backward pass.
-os.environ.setdefault("NABLA_DEFAULT_DEVICE", "gpu")
-
 from omen.config import OmenConfig
 from omen.gpu_budget import can_fit_tiles, get_gpu_memory_info
 from omen.model.jepa import OmenJEPA

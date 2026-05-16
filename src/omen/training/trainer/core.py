@@ -67,26 +67,6 @@ class OmenTrainer:
         )
 
         self._compiled_step = None
-        self._gpu = None
-        if self._gpu_available:
-            try:
-                from max.driver import Accelerator
-
-                self._gpu = Accelerator()
-                # NABLA_DEFAULT_DEVICE=gpu (set in start_training.py) ensures
-                # all tensor creation — including VJP scalar constants —
-                # targets GPU.  We still transfer model weights explicitly
-                # since they were created before the env-var takes full effect.
-                cpu_params = self.model.state_dict()
-                gpu_params = {
-                    name: nb.ops.transfer_to(param, self._gpu)
-                    for name, param in cpu_params.items()
-                }
-                self.model.load_state_dict(gpu_params)
-                logger.info("Transferred %d params to GPU", len(gpu_params))
-            except Exception as e:
-                logger.warning("GPU model transfer failed, using CPU: %s", e)
-                self._gpu = None
 
         self._init_compiled_step()
 
@@ -174,8 +154,6 @@ class OmenTrainer:
         Adds leading batch dim (``[np.newaxis]``) to match what
         :class:`SceneGraphEncoder` expects — ``vertices (B, N, 3)``,
         ``params (B, M, D)``.
-
-        When GPU is available, tensors are transferred to GPU immediately.
         """
         if not isinstance(scene_graph, dict):
             return scene_graph
@@ -184,26 +162,20 @@ class OmenTrainer:
             converted = {}
             for k, v in section.items():
                 if isinstance(v, np.ndarray):
-                    t = nb.Tensor.from_dlpack(v.astype(np.float32)[np.newaxis])
-                    if self._gpu is not None:
-                        t = nb.ops.transfer_to(t, self._gpu)
-                    converted[k] = t
+                    converted[k] = nb.Tensor.from_dlpack(
+                        v.astype(np.float32)[np.newaxis]
+                    )
                 else:
                     converted[k] = v
             result[section_key] = converted
         return result
 
     def _train_single_tile(self, tile_noisy, tile_gt, scene_latent, z_score):
-        """Train on one tile — GPU when available, CPU fallback."""
+        """Train on one tile."""
         noisy_tensor = self._tile_to_tensor(tile_noisy.data)
         gt_tensor = self._tile_to_tensor(tile_gt.data)
 
-        if self._gpu is not None:
-            try:
-                noisy_tensor = nb.ops.transfer_to(noisy_tensor, self._gpu)
-                gt_tensor = nb.ops.transfer_to(gt_tensor, self._gpu)
-            except Exception:
-                logger.warning("GPU transfer failed, using CPU")
+        return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
 
         return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
 
