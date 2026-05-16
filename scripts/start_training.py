@@ -2,6 +2,7 @@
 """CLI entry point for tiled GPU training on Mitsuba scenes."""
 
 import argparse
+import glob
 import logging
 import os
 import time
@@ -18,9 +19,26 @@ from omen.training.online_gen import TrainingDataGenerator
 from omen.training.trainer.core import OmenTrainer
 
 ANIMATION_TYPES = ("camera_orbit", "mesh", "material", "light")
+CKPT_DIR = os.path.expanduser("~/.cache/omen/checkpoints")
 
 
-def _train_on_data(trainer, gen, noisy, gt, sg, tile_size, step_idx, steps_per_frame=1):
+def _find_latest_checkpoint(ckpt_dir):
+    """Find newest step_*.omen checkpoint, return path or None."""
+    files = sorted(glob.glob(os.path.join(ckpt_dir, "step_*.omen.npz")))
+    return files[-1] if files else None
+
+
+def _train_on_data(
+    trainer,
+    gen,
+    noisy,
+    gt,
+    sg,
+    tile_size,
+    step_idx,
+    steps_per_frame=1,
+    checkpoint_every=0,
+):
     """Run tiled training step(s) and log results."""
     all_metrics = []
     for sub_idx in range(steps_per_frame):
@@ -47,6 +65,9 @@ def _train_on_data(trainer, gen, noisy, gt, sg, tile_size, step_idx, steps_per_f
                 dt,
             )
         all_metrics.append(metrics)
+        # Periodic checkpoint
+        if checkpoint_every > 0 and trainer.iteration % checkpoint_every == 0:
+            trainer.save_checkpoint_rotating(CKPT_DIR)
     return all_metrics[-1]
 
 
@@ -83,7 +104,33 @@ def main():
         default="single",
         help="Train on single scene or all scenes",
     )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=50,
+        help="Save checkpoint every N optimizer steps (0=disabled)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from latest checkpoint",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Write logs to this file in addition to stdout",
+    )
     args = parser.parse_args()
+
+    # Log file handler
+    if args.log_file:
+        log_dir = os.path.dirname(args.log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        fh = logging.FileHandler(args.log_file)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
+        logging.getLogger().addHandler(fh)
+        logger.info("Logging to %s", args.log_file)
 
     w, h = map(int, args.resolution.split("x"))
 
@@ -106,24 +153,34 @@ def main():
         warmup_steps=args.lr_warmup,
         total_steps=args.total_steps,
     )
+
+    # Resume from checkpoint
+    if args.resume:
+        latest = _find_latest_checkpoint(CKPT_DIR)
+        if latest:
+            trainer.load_checkpoint(latest.replace(".npz", ""))
+            logger.info("Resumed from %s (iter %d)", latest, trainer.iteration)
+        else:
+            logger.warning("--resume set but no checkpoint found in %s", CKPT_DIR)
+
     gen = TrainingDataGenerator(
         resolution=(w, h), gt_spp=512, noisy_spp=4, save_images=args.save_images
     )
 
+    ckpt_kw = {"checkpoint_every": args.checkpoint_every}
     losses = []
 
     if args.scenes == "all":
-        _run_multi_scene(trainer, gen, args, losses, w, h)
+        _run_multi_scene(trainer, gen, args, losses, w, h, **ckpt_kw)
     elif args.animation:
         builder = SCENE_REGISTRY[args.scene]
-        _run_animation(trainer, gen, builder, args, losses, w, h)
+        _run_animation(trainer, gen, builder, args, losses, w, h, **ckpt_kw)
     else:
         builder = SCENE_REGISTRY[args.scene]
-        _run_static(trainer, gen, builder, args, losses)
+        _run_static(trainer, gen, builder, args, losses, **ckpt_kw)
 
-    # Save checkpoint
-    ckpt_path = os.path.expanduser("~/.cache/omen/checkpoints/latest.omen")
-    trainer.save_checkpoint(ckpt_path)
+    # Final checkpoint
+    trainer.save_checkpoint(os.path.join(CKPT_DIR, "latest.omen"))
 
     logger.info("Done. Loss: %.6f -> %.6f", losses[0], losses[-1])
     unique = len(set(f"{loss:.4f}" for loss in losses))
@@ -133,7 +190,7 @@ def main():
         logger.warning("Loss unchanged — check gradient flow.")
 
 
-def _run_static(trainer, gen, builder, args, losses):
+def _run_static(trainer, gen, builder, args, losses, checkpoint_every=0):
     """Static camera training — single or multi-camera."""
     logger.info(
         "Mode: static | Camera: %s | Steps: %d",
@@ -151,15 +208,16 @@ def _run_static(trainer, gen, builder, args, losses):
                 args.tile_size,
                 step_idx,
                 steps_per_frame=args.steps_per_frame,
+                checkpoint_every=checkpoint_every,
             )
             losses.append(metrics["total_loss"])
 
 
-def _run_multi_scene(trainer, gen, args, losses, w, h):
+def _run_multi_scene(trainer, gen, args, losses, w, h, checkpoint_every=0):
     """Curriculum training — master one scene completely, then move to next.
 
-    Per scene: static cameras → all animation types.
-    Graph cache flushed between scenes.
+    Per scene: static cameras -> all animation types.
+    Graph cache flushed between scenes. Checkpoint saved on scene transitions.
     """
     from omen.scenes import get_animation_generator
 
@@ -189,6 +247,7 @@ def _run_multi_scene(trainer, gen, args, losses, w, h):
                     args.tile_size,
                     step_idx,
                     steps_per_frame=args.steps_per_frame,
+                    checkpoint_every=checkpoint_every,
                 )
                 losses.append(metrics["total_loss"])
 
@@ -196,6 +255,8 @@ def _run_multi_scene(trainer, gen, args, losses, w, h):
         animations = get_animation_generator(scene_name, base_resolution=(w, h))
         if animations is None:
             logger.info("[%s] No animations, skipping to next scene", scene_name)
+            # Scene checkpoint before flush
+            trainer.save_checkpoint_rotating(CKPT_DIR)
             trainer.flush_graph_cache()
             continue
 
@@ -215,21 +276,22 @@ def _run_multi_scene(trainer, gen, args, losses, w, h):
                     args.tile_size,
                     0,
                     steps_per_frame=args.steps_per_frame,
+                    checkpoint_every=checkpoint_every,
                 )
                 losses.append(metrics["total_loss"])
 
-        # Scene mastered — flush cache before next scene
+        # Scene mastered — checkpoint then flush cache before next scene
+        trainer.save_checkpoint_rotating(CKPT_DIR)
         trainer.flush_graph_cache()
-        logger.info("[%s] Mastered. Cache flushed.", scene_name)
+        logger.info("[%s] Mastered. Checkpoint saved. Cache flushed.", scene_name)
 
 
-def _run_animation(trainer, gen, builder, args, losses, w, h):
+def _run_animation(trainer, gen, builder, args, losses, w, h, checkpoint_every=0):
     """Animation training — sequential frames with temporal variation."""
     from omen.scenes import get_animation_generator
 
     logger.info("Mode: animation | Scene: %s | Type: %s", args.scene, args.animation)
 
-    # Build base scene to get scene_graph (shared across all frames)
     _, sg = builder(resolution=(w, h))
     animations = get_animation_generator(args.scene, base_resolution=(w, h))
     if animations is None:
@@ -247,6 +309,7 @@ def _run_animation(trainer, gen, builder, args, losses, w, h):
                 args.tile_size,
                 0,
                 steps_per_frame=args.steps_per_frame,
+                checkpoint_every=checkpoint_every,
             )
             losses.append(metrics["total_loss"])
         return
@@ -268,6 +331,7 @@ def _run_animation(trainer, gen, builder, args, losses, w, h):
             args.tile_size,
             step_idx,
             steps_per_frame=args.steps_per_frame,
+            checkpoint_every=checkpoint_every,
         )
         losses.append(metrics["total_loss"])
         step_idx += 1

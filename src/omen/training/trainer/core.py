@@ -258,6 +258,18 @@ class OmenTrainer:
         np.savez_compressed(path, **save_data)
         logger.info("Checkpoint saved: %s (iter %d)", path, self.iteration)
 
+    def save_checkpoint_rotating(self, base_dir, keep=3):
+        """Save checkpoint with rotation — keeps last N, deletes older."""
+        import glob
+
+        os.makedirs(base_dir, exist_ok=True)
+        path = os.path.join(base_dir, f"step_{self.iteration}.omen")
+        self.save_checkpoint(path)
+        # Delete oldest checkpoints beyond keep limit
+        existing = sorted(glob.glob(os.path.join(base_dir, "step_*.omen.npz")))
+        while len(existing) > keep:
+            os.remove(existing.pop(0))
+
     def load_checkpoint(self, path):
         """Load model state dict and config from disk."""
         npz_path = path if path.endswith(".npz") else path + ".npz"

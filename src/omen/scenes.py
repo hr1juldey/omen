@@ -21,13 +21,19 @@ mi.set_variant("scalar_rgb")
 # ---------------------------------------------------------------------------
 
 
-def _tf(translate=None, scale=None, rotate=None):
-    """Build a ScalarTransform4f from translate/scale/rotate kwargs."""
+def _tf(translate=None, scale=None, rotate=None, **extra_rotations):
+    """Build a ScalarTransform4f from translate/scale/rotations.
+
+    Supports multiple rotations via extra keyword args (rotate2, rotate3, ...).
+    """
     t = mi.ScalarTransform4f()
     if translate is not None:
         t = t @ mi.ScalarTransform4f.translate(translate)
     if rotate is not None:
         axis, angle = rotate
+        t = t @ mi.ScalarTransform4f.rotate(axis, angle)
+    for _key in sorted(extra_rotations):
+        axis, angle = extra_rotations[_key]
         t = t @ mi.ScalarTransform4f.rotate(axis, angle)
     if scale is not None:
         t = t @ mi.ScalarTransform4f.scale(scale)
