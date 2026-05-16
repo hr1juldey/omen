@@ -66,6 +66,36 @@ class OmenTrainer:
             self.model, self.config, self.weight_decay
         )
 
+        self._compiled_step = None
+        self._init_compiled_step()
+
+    def _init_compiled_step(self):
+        """Create compiled forward+backward step for graph cache reuse.
+
+        Following nabla's official examples (Transformer, CNN), the entire
+        ``value_and_grad`` call is wrapped in ``@nb.compile`` so the graph
+        is compiled ONCE and reused for every tile.  Same tile size means
+        same input shapes means cache hit — no accumulation, no RAM bomb.
+
+        Falls back to eager mode (with ``clear_all``) if compile fails.
+        """
+        try:
+            model = self.model
+            config = self.config
+
+            @nb.compile
+            def _compiled_fwd_bwd(params, noisy, gt, scene_latent):
+                loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
+                    params, model, noisy, gt, scene_latent, config
+                )
+                return grads, loss
+
+            self._compiled_step = _compiled_fwd_bwd
+            logger.info("Compiled training step ready (graph will be cached)")
+        except Exception as e:
+            logger.warning("@nb.compile not available, using eager mode: %s", e)
+            self._compiled_step = None
+
     def train_step(self, noisy, ground_truth, scene_graph, z_score=0.0):
         """Single training step via ``nb.value_and_grad``."""
         self.model.train()
@@ -103,9 +133,10 @@ class OmenTrainer:
             total_loss += self._train_single_tile(
                 tile_noisy, tile_gt, sg_tensor, z_score
             )
-            # Each value_and_grad compiles a 6-8GB graph entry.
-            # Without clearing, N tiles × 6GB = RAM bomb.
-            nb.GRAPH.clear_all()
+            # Compiled mode: graph cached once, reused per tile (same shapes).
+            # Eager fallback: each call leaks a 6-8GB graph entry, must clear.
+            if self._compiled_step is None:
+                nb.GRAPH.clear_all()
 
         avg_loss = total_loss / len(noisy_tiles)
         self.iteration += 1
@@ -157,11 +188,20 @@ class OmenTrainer:
         return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
 
     def _run_tile(self, noisy, gt, scene_latent, z_score):
-        """Core training step for one tile."""
+        """Core training step for one tile.
+
+        Uses ``@nb.compile`` when available so the forward+backward graph
+        is compiled once and reused (no graph cache accumulation).
+        Falls back to eager ``value_and_grad`` when compile is unavailable.
+        """
         params = self.model.state_dict()
-        total_loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
-            params, self.model, noisy, gt, scene_latent, self.config
-        )
+
+        if self._compiled_step is not None:
+            grads, total_loss = self._compiled_step(params, noisy, gt, scene_latent)
+        else:
+            total_loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
+                params, self.model, noisy, gt, scene_latent, self.config
+            )
 
         loss_val = float(total_loss.to_numpy().sum())
         realized_grads = self._realize_grads(grads, params)

@@ -5,9 +5,10 @@ Tests run with RAM guards that skip before OOM territory (24GB limit on 32GB sys
 
 Key findings from prior runs:
 - Nabla supports GPU via device=Accelerator() and transfer_to(tensor, gpu)
-- Graph cache is the RAM bomb culprit: each value_and_grad = 6-8GB graph entry
-- nb.GRAPH.clear_all() MUST be called between tiles/steps to bound RAM
-- Without clearing: N tiles × 6GB = RAM bomb; With clearing: 1 entry max
+- Graph cache is the RAM bomb culprit: each eager value_and_grad = 6-8GB graph entry
+- @nb.compile fixes it: graph compiled ONCE, reused on cache hit (same shapes)
+- clear_all() is a wasteful fallback — destroys cached graph, forces recompilation
+- Proper pattern (from nabla examples): @nb.compile on the entire train step
 
 Run: uv run pytest tests/test_gpu_capacity.py -v -s
 """
@@ -170,6 +171,16 @@ def _clear_nabla_graph():
         nb.GRAPH.clear_all()
     except Exception:
         pass
+
+
+def _get_device():
+    """Get Accelerator device if available, else None (CPU)."""
+    if MAX_DRIVER_AVAILABLE:
+        try:
+            return Accelerator()
+        except Exception:
+            return None
+    return None
 
 
 # --- Model helpers ---
@@ -398,13 +409,7 @@ def test_06_nano_jepa_forward():
     model = OmenJEPA(config=config, latent_dim=64)
     model.train()
 
-    # Try GPU device for input tensors
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     scene_graph = {
         "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32), device),
@@ -445,12 +450,7 @@ def test_07_nano_jepa_backward():
     model = OmenJEPA(config=config, latent_dim=64)
     model.train()
 
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     scene_graph = {
         "geometry": _tensor(np.random.randn(1, 10, 6).astype(np.float32), device),
@@ -488,12 +488,7 @@ def test_08_small_unet_forward():
     _gpu_pause()
     _ram_guard("pre-unet")
 
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     model = _make_nano_unet(channels=(16, 32, 64), device=device)
     x = _tensor(np.random.randn(1, 32, 32, 3).astype(np.float32), device)
@@ -520,12 +515,7 @@ def test_09_small_unet_backward():
     _gpu_pause()
     _ram_guard("pre-unet-bwd")
 
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     model = _make_nano_unet(channels=(16, 32, 64), device=device)
     x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
@@ -564,12 +554,7 @@ def test_10_compile_gpu():
     _gpu_pause()
     _ram_guard("pre-compile")
 
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     x = _tensor(np.random.randn(1, 16, 16, 3).astype(np.float32), device)
     w = F.he_normal((3, 3, 3, 16))
@@ -606,12 +591,7 @@ def test_11_resolution_scale(resolution):
     _gpu_pause()
     _ram_guard(f"pre-{resolution}")
 
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     model = _make_nano_unet(channels=(16, 32, 64), device=device)
     x = _tensor(
@@ -654,12 +634,7 @@ def test_12_ram_breaking_point():
     """
     _gpu_pause()
 
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     results = []
     for res in [64, 128, 256]:
@@ -765,16 +740,11 @@ def test_13_torch_gpu_training_step():
 @nabla_skip
 @gpu_skip
 def test_14_nabla_gpu_training_step():
-    """Nabla conv2d forward+backward on GPU — compare to torch GPU."""
+    """Nabla conv2d forward+backward — compiled train step on GPU."""
     _gpu_pause()
     _ram_guard("pre-nabla-train")
 
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    device = _get_device()
 
     model = _make_nano_unet(channels=(16, 32, 64), device=device)
     x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
@@ -791,16 +761,21 @@ def test_14_nabla_gpu_training_step():
         )
         return nb.mean(s3**2)
 
-    # Warmup (first call compiles graph)
-    val, grad = nb.value_and_grad(loss_fn)(x)
+    # @nb.compile: graph compiled ONCE in warmup, reused on every call (cache hit)
+    @nb.compile
+    def compiled_fwd_bwd(x):
+        val, grad = nb.value_and_grad(loss_fn)(x)
+        return val, grad
 
-    # Timed steps
+    # Warmup (compiles graph — first call is slow)
+    val, grad = compiled_fwd_bwd(x)
+
+    # Timed steps (cache hit — same shapes, no recompilation, no RAM accumulation)
     times = []
     for _ in range(3):
-        _clear_nabla_graph()
         x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
         t0 = time.perf_counter()
-        val, grad = nb.value_and_grad(loss_fn)(x)
+        val, grad = compiled_fwd_bwd(x)
         _ = val.to_numpy()  # Force evaluation
         times.append(time.perf_counter() - t0)
         if not _safe_to_continue_ram():
@@ -811,7 +786,7 @@ def test_14_nabla_gpu_training_step():
     _ram_guard("post-nabla-train")
     device_str = "GPU" if device is not None else "CPU"
     print(
-        f"  Nabla {device_str} training (64x64, {len(times)} steps): "
+        f"  Nabla {device_str} compiled training (64x64, {len(times)} steps): "
         f"avg={avg:.4f}s, min={min(times):.4f}s, max={max(times):.4f}s"
     )
     _clear_nabla_graph()
@@ -820,7 +795,7 @@ def test_14_nabla_gpu_training_step():
 @nabla_skip
 @gpu_skip
 def test_15_torch_gpu_vs_nabla_gpu():
-    """Side-by-side: same conv encoder, torch GPU vs nabla GPU."""
+    """Side-by-side: same conv encoder, torch GPU vs nabla GPU (compiled)."""
     _gpu_pause()
     _ram_guard("pre-compare")
 
@@ -848,13 +823,8 @@ def test_15_torch_gpu_vs_nabla_gpu():
     del x_t, conv1, conv2, conv3
     torch.cuda.empty_cache()
 
-    # --- Nabla GPU ---
-    device = None
-    if MAX_DRIVER_AVAILABLE:
-        try:
-            device = Accelerator()
-        except Exception:
-            device = None
+    # --- Nabla GPU (compiled) ---
+    device = _get_device()
 
     model = _make_nano_unet(channels=(16, 32, 64), device=device)
     x_n = _tensor(
@@ -873,18 +843,22 @@ def test_15_torch_gpu_vs_nabla_gpu():
         )
         return nb.mean(s3**2)
 
-    # Warmup
-    nb.value_and_grad(fwd)(x_n)
+    @nb.compile
+    def compiled_fwd_bwd(x):
+        val, grad = nb.value_and_grad(fwd)(x)
+        return val, grad
+
+    # Warmup (compile)
+    compiled_fwd_bwd(x_n)
 
     nabla_times = []
     for _ in range(n_steps):
-        _clear_nabla_graph()
         x_n = _tensor(
             np.random.randn(1, resolution, resolution, 3).astype(np.float32),
             device,
         )
         t0 = time.perf_counter()
-        val, grad = nb.value_and_grad(fwd)(x_n)
+        val, grad = compiled_fwd_bwd(x_n)
         _ = val.to_numpy()
         nabla_times.append(time.perf_counter() - t0)
         if not _safe_to_continue_ram():
@@ -897,7 +871,9 @@ def test_15_torch_gpu_vs_nabla_gpu():
     _ram_guard("post-compare")
     device_str = "GPU" if device is not None else "CPU"
     print(f"  Torch GPU (64x64, {n_steps} steps): avg={torch_avg:.4f}s")
-    print(f"  Nabla {device_str} (64x64, {n_steps} steps): avg={nabla_avg:.4f}s")
+    print(
+        f"  Nabla {device_str} compiled (64x64, {n_steps} steps): avg={nabla_avg:.4f}s"
+    )
     print(
         f"  Ratio: nabla {device_str} is {speedup:.1f}x "
         f"{'slower' if speedup > 1 else 'faster'} than torch GPU"
