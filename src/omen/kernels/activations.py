@@ -1,10 +1,11 @@
-"""GPU-safe activation functions with scalar-free backward passes.
+"""GPU-safe activation functions — pure nabla decomposition.
 
-Nabla's built-in silu/sigmoid VJP rules create Python scalar constants
-(`sub(1.0, sig_x)`) that become CPU tensors during GPU backward — causing
-device mismatch. These custom ops avoid that by using tensor-only identities.
+Two nabla bugs block GPU backward passes:
+1. nb.silu VJP creates `sub(1.0, sig_x)` — Python scalar → CPU tensor → device mismatch
+2. UnaryOperation subclass hits `TensorValue.num_shards` AttributeError during graph tracing
 
-Key identity: σ(-x) = 1 - σ(x) — computed without any Python scalar.
+Fix: decompose silu into pure nabla ops (multiply + sigmoid). Nabla's autodiff
+computes the backward via chain rule through each op individually, bypassing both bugs.
 """
 
 import logging
@@ -13,46 +14,18 @@ logger = logging.getLogger("omen.kernels.activations")
 
 try:
     import nabla as nb
-    from nabla.ops import UnaryOperation
 
     NABLA_AVAILABLE = True
 except ImportError:
-    UnaryOperation = object
     NABLA_AVAILABLE = False
 
 
-class SiluGPU(UnaryOperation):
-    """GPU-safe SiLU: x * σ(x) with scalar-free derivative.
-
-    Forward: x * sigmoid(x)
-    Backward: cotangent * (σ(x) + x * σ(x) * σ(-x))
-
-    The σ(-x) = 1 - σ(x) identity avoids the `sub(1.0, sig_x)` that
-    nabla's built-in silu VJP uses — no Python scalar constants.
-    """
-
-    @property
-    def name(self) -> str:
-        return "silu_gpu"
-
-    def kernel(self, args, kwargs):
-        x = args[0]
-        sig = nb.sigmoid(x)
-        return [x * sig]
-
-    def _derivative(self, primal, output):
-        sig = nb.sigmoid(primal)
-        sig_neg = nb.sigmoid(-primal)  # = 1 - σ(x), no scalar
-        return sig + primal * sig * sig_neg
-
-
 def silu_gpu(x):
-    """GPU-safe SiLU activation (scalar-free backward).
+    """GPU-safe SiLU activation via pure nabla decomposition.
 
+    x * sigmoid(x) — no custom op, no UnaryOperation, no scalar constants.
     Drop-in replacement for nb.silu that works on GPU backward passes.
-    Falls back to nb.silu when nabla is unavailable.
     """
     if not NABLA_AVAILABLE:
         raise ImportError("Nabla required for silu_gpu")
-    op = SiluGPU()
-    return op([x], {})[0]
+    return x * nb.sigmoid(x)
