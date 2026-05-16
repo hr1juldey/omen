@@ -14,6 +14,7 @@ Run: uv run pytest tests/test_gpu_capacity.py -v -s
 """
 
 import gc
+import os
 import time
 
 import numpy as np
@@ -55,7 +56,7 @@ gpu_skip = pytest.mark.skipif(
 # --- Safety limits ---
 VRAM_SAFETY_GB = 5.5
 RAM_SAFETY_GB = 24  # Leave ~8GB for OS + Blender on 32GB system
-GPU_GAP_SECONDS = 15
+GPU_GAP_SECONDS = 3
 
 
 # --- Resource monitoring helpers ---
@@ -633,7 +634,7 @@ def test_10_compile_gpu():
     @nb.compile
     def compiled_forward(x, w):
         c = nb.conv2d(x, w, padding=(1, 1))
-        return nb.mean(c * c)
+        return (c * c).sum()  # .sum() not .mean() — mean VJP broken on GPU
 
     try:
         t0 = time.perf_counter()
@@ -674,7 +675,7 @@ def test_11_resolution_scale(resolution):
         s3 = silu_gpu(
             nb.conv2d(s2, model["enc_filters"][2], stride=(2, 2), padding=(1, 1))
         )
-        return nb.mean(s3 * s3)
+        return (s3 * s3).sum()  # .sum() not .mean() — mean VJP broken on GPU
 
     t0 = time.perf_counter()
     val, grad = nb.value_and_grad(forward)(x)
@@ -754,211 +755,283 @@ def test_12_ram_breaking_point():
         )
 
 
-# === Section 4: Nabla GPU training (pure nabla, no torch) ===
+# === Section 4: Real nabla training (weight updates, loss convergence) ===
+
+
+def _conv_out(h, k=3, s=2, p=1):
+    """Conv2d output spatial dim: (H + 2P - K) / S + 1."""
+    return (h + 2 * p - k) // s + 1
+
+
+def _target_shape(in_h, num_layers, out_channels):
+    """Compute encoder output shape without allocating tensors."""
+    h = in_h
+    for _ in range(num_layers):
+        h = _conv_out(h)
+    return (1, h, h, out_channels)
+
+
+def _he_init(rows, cols):
+    """He normal init for 2D weight matrix: std = sqrt(2 / fan_in)."""
+    return np.random.randn(rows, cols).astype(np.float32) * np.sqrt(2.0 / rows)
+
+
+def _make_filters(specs):
+    """Create conv filter list from (ch_in, ch_out) specs."""
+    return [F.he_normal((3, 3, ci, co)) for ci, co in specs]
+
+
+def _sgd_update(weights, grads, lr):
+    """Functional SGD — numpy break prevents graph chain / RAM bomb."""
+    new = []
+    for w, g in zip(weights, grads):
+        new.append(nb.Tensor.from_dlpack(w.to_numpy() - lr * g.to_numpy()))
+    return new
 
 
 @nabla_skip
 @gpu_skip
-def test_13_nabla_gpu_compiled_training():
-    """Nabla compiled forward+backward on GPU — 5 steps, graph reused."""
+def test_13_real_gpu_sgd_training():
+    """Real GPU training: 3-layer MLP with matmul + silu_gpu, SGD weight updates.
+
+    Uses matmul (not conv2d) — conv2d backward hits cuDNN conv_transpose
+    allocation bug in current nabla/MAX. matmul backward is pure BLAS.
+    3 explicit weight args (dict params and *varargs break compilation).
+    Dimensions kept moderate — large GEMM dims (12288+) exceed MAX
+    warp shuffle limits on GPU backward (.sum() reduction).
+    """
     _reset_state()
     _gpu_pause()
-    _ram_guard("pre-nabla-compiled")
+    _ram_guard("pre-gpu-sgd")
 
-    device = _get_device()
-
-    filters = []
-    for ch_in, ch_out in [(3, 16), (16, 32), (32, 64)]:
-        w = F.he_normal((3, 3, ch_in, ch_out))
-        if device is not None:
-            w = nb.ops.transfer_to(w, device)
-        w.requires_grad = True
-        filters.append(w)
-
-    def loss_fn(x):
-        s = x
-        for w in filters:
-            s = silu_gpu(nb.conv2d(s, w, stride=(2, 2), padding=(1, 1)))
-        return (s * s).sum()
-
-    # @nb.compile: graph compiled ONCE, reused on cache hit (same shapes)
-    @nb.compile
-    def compiled_fwd_bwd(x):
-        val, grad = nb.value_and_grad(loss_fn)(x)
-        return val, grad
-
-    # Warmup (compiles graph — first call is slow, ~30s)
-    x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
-    val, grad = compiled_fwd_bwd(x)
-    _ = val.to_numpy()
-    _ = grad.to_numpy()  # Force backward realization
-    print("  Warmup complete (graph compiled + cached)")
-
-    # Timed steps (cache hit — same shapes, no recompilation)
-    times = []
-    for step in range(5):
-        x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
-        t0 = time.perf_counter()
-        val, grad = compiled_fwd_bwd(x)
-        val_np = val.to_numpy()
-        grad_np = grad.to_numpy()
-        dt = time.perf_counter() - t0
-        times.append(dt)
-        assert not np.isnan(val_np).item()
-        assert not np.isnan(grad_np).any()
-        print(f"  Step {step + 1}: {dt:.4f}s loss={val_np.item():.2f}", flush=True)
-        if not _safe_to_continue_ram():
-            break
-
-    avg = np.mean(times) if times else 0
-    _ram_guard("post-compiled")
-    device_str = "GPU" if device is not None else "CPU"
-    print(
-        f"  Nabla {device_str} compiled (64x64, {len(times)} steps): "
-        f"avg={avg:.4f}s, min={min(times):.4f}s"
-    )
-    _clear_nabla_graph()
-
-
-@nabla_skip
-@gpu_skip
-def test_14_nabla_gpu_training_with_updates():
-    """Nabla GPU training with SGD weight updates — 10 steps."""
-    _reset_state()
-    _gpu_pause()
-    _ram_guard("pre-train-updates")
-
-    device = _get_device()
+    gpu = _get_device()
     lr = 0.001
+    dims = [512, 256, 128, 64]  # 3-layer, proven to compile on GPU
 
-    # 3-layer conv model on GPU
-    filters = []
-    for ch_in, ch_out in [(3, 16), (16, 32), (32, 64)]:
-        w = F.he_normal((3, 3, ch_in, ch_out))
-        if device is not None:
-            w = nb.ops.transfer_to(w, device)
-        w.requires_grad = True
-        filters.append(w)
+    w0 = nb.Tensor.from_dlpack(_he_init(dims[0], dims[1]))
+    w1 = nb.Tensor.from_dlpack(_he_init(dims[1], dims[2]))
+    w2 = nb.Tensor.from_dlpack(_he_init(dims[2], dims[3]))
+    if gpu is not None:
+        w0 = nb.ops.transfer_to(w0, gpu)
+        w1 = nb.ops.transfer_to(w1, gpu)
+        w2 = nb.ops.transfer_to(w2, gpu)
 
-    @nb.compile
-    def fwd_bwd(x, w0, w1, w2):
-        ws = [w0, w1, w2]
+    x_fixed = _tensor(np.random.randn(1, dims[0]).astype(np.float32), gpu)
+    target = _tensor(np.random.randn(1, dims[-1]).astype(np.float32), gpu)
 
-        def loss_fn(x):
-            s = x
-            for w in ws:
-                s = silu_gpu(nb.conv2d(s, w, stride=(2, 2), padding=(1, 1)))
-            return (s * s).sum()
+    def loss_fn(w0, w1, w2):
+        s = silu_gpu(nb.matmul(x_fixed, w0))
+        s = silu_gpu(nb.matmul(s, w1))
+        s = nb.matmul(s, w2)
+        diff = s - target
+        return (diff * diff).sum()
 
-        return nb.value_and_grad(loss_fn, argnums=0)(x)
-
-    # Warmup
-    x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
-    val, grad = fwd_bwd(x, *filters)
-    _ = val.to_numpy()
-    print("  Warmup done")
-
+    total_params = sum(dims[i] * dims[i + 1] for i in range(len(dims) - 1))
     losses = []
     times = []
     for step in range(10):
-        x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
-        t0 = time.perf_counter()
-
-        # Forward + backward (compiled, graph reused)
-        val, grad_x = fwd_bwd(x, *filters)
-        val_np = val.to_numpy()
-        losses.append(val_np.item())
-
-        # SGD update: w = w - lr * grad_w
-        # (grads w.r.t. weights require separate value_and_grad — skip for now,
-        #  this tests sustained GPU compute with varying inputs)
-        dt = time.perf_counter() - t0
-        times.append(dt)
-        print(
-            f"  Step {step + 1}: {dt:.4f}s loss={val_np.item():.2f}",
-            flush=True,
-        )
         if not _safe_to_continue_ram():
             break
 
-    _ram_guard("post-train-updates")
-    device_str = "GPU" if device is not None else "CPU"
+        t0 = time.perf_counter()
+        val, (g0, g1, g2) = nb.value_and_grad(loss_fn, argnums=(0, 1, 2))(w0, w1, w2)
+        loss_val = float(val.to_numpy())
+        nb.realize_all(g0, g1, g2)
+
+        # SGD update + transfer back to GPU
+        new_ws = []
+        for w, g in zip([w0, w1, w2], [g0, g1, g2]):
+            new_w = nb.Tensor.from_dlpack(w.to_numpy() - lr * g.to_numpy())
+            if gpu is not None:
+                new_w = nb.ops.transfer_to(new_w, gpu)
+            new_ws.append(new_w)
+        w0, w1, w2 = new_ws
+
+        dt = time.perf_counter() - t0
+        losses.append(loss_val)
+        times.append(dt)
+
+        assert not np.isnan(loss_val), f"Step {step} NaN loss"
+        _resource_report(f"gpu-sgd-{step}")
+        print(
+            f"  Step {step + 1}: {dt:.2f}s loss={loss_val:.2f} "
+            f"vram={get_gpu_memory_info()['used_mb']:.0f}MB",
+            flush=True,
+        )
+        _clear_nabla_graph()
+
+    assert len(losses) >= 3, f"Only {len(losses)} steps completed"
+    unique = len(set(f"{v:.4f}" for v in losses))
+    assert unique > 1, f"Losses identical — no training: {losses}"
+
+    _ram_guard("post-gpu-sgd")
+    device_str = "GPU" if gpu is not None else "CPU"
     print(
-        f"  Nabla {device_str} training w/ updates (64x64, {len(times)} steps): "
-        f"avg={np.mean(times):.4f}s, loss {losses[0]:.1f} -> {losses[-1]:.1f}"
+        f"  Real GPU SGD ({device_str}, {total_params / 1000:.0f}K params, "
+        f"{len(losses)} steps): loss {losses[0]:.1f} -> {losses[-1]:.1f}, "
+        f"avg={np.mean(times):.2f}s/step"
     )
-    _clear_nabla_graph()
 
 
 @nabla_skip
 @gpu_skip
-def test_15_nabla_gpu_sustained_stress():
-    """Sustained GPU stress: 20 steps, 128x128, 3-layer conv + silu_gpu."""
+def test_14_real_model_training():
+    """Real OmenJEPA training with AdamW — full model, proper loss, weight updates.
+
+    Uses OmenTrainer.train_step() which does:
+    - value_and_grad w.r.t. all model params (dict, ~139 params)
+    - Per-component AdamW updates with scheduled LRs
+    - JEPA + decoder loss objectives
+
+    CPU mode: model uses mean()/LayerNorm internally (GPU VJP broken).
+    """
     _reset_state()
     _gpu_pause()
-    _ram_guard("pre-stress")
+    _ram_guard("pre-model-train")
 
-    device = _get_device()
+    from omen.config import OmenConfig
+    from omen.model.jepa import OmenJEPA
+    from omen.training.trainer.core import OmenTrainer
 
-    filters = []
-    for ch_in, ch_out in [(3, 16), (16, 32), (32, 64)]:
-        w = F.he_normal((3, 3, ch_in, ch_out))
-        if device is not None:
-            w = nb.ops.transfer_to(w, device)
-        w.requires_grad = True
-        filters.append(w)
+    config = OmenConfig.v1_dense()
+    config.components.ar_predictor = False
+    config.components.scene_delta_encoder = False
+    config.components.episodic_correction = False
 
-    def loss_fn(x):
-        s = x
-        for w in filters:
-            s = silu_gpu(nb.conv2d(s, w, stride=(2, 2), padding=(1, 1)))
-        return (s * s).sum()
+    model = OmenJEPA(config=config, latent_dim=64)
+    trainer = OmenTrainer(model, config=config, total_steps=10)
 
-    @nb.compile
-    def compiled_step(x):
-        val, grad = nb.value_and_grad(loss_fn)(x)
-        return val, grad
-
-    # Warmup (compile — takes ~30s)
-    x = _tensor(np.random.randn(1, 128, 128, 3).astype(np.float32), device)
-    val, grad = compiled_step(x)
-    _ = val.to_numpy()
-    _ = grad.to_numpy()
-    print("  Warmup done, graph compiled and cached")
-
-    # Sustained run — 20 steps back-to-back
-    times = []
-    for step in range(20):
-        if not _safe_to_continue_ram():
-            print(f"  RAM limit at step {step}, stopping")
-            break
-        x = _tensor(np.random.randn(1, 128, 128, 3).astype(np.float32), device)
-        t0 = time.perf_counter()
-        val, grad = compiled_step(x)
-        val_np = val.to_numpy()
-        grad_np = grad.to_numpy()
-        dt = time.perf_counter() - t0
-        times.append(dt)
-        assert not np.isnan(val_np).item(), f"Step {step} NaN loss"
-        assert not np.isnan(grad_np).any(), f"Step {step} NaN grad"
-        if step % 5 == 0:
-            _resource_report(f"stress-{step}")
-            print(
-                f"  Step {step}: {dt:.4f}s loss={val_np.item():.2f}", flush=True
+    # Synthetic scene data (no Mitsuba needed)
+    scene_graph = {
+        "geometry": {
+            "vertices": nb.Tensor.from_dlpack(
+                np.random.randn(1, 10, 6).astype(np.float32)
             )
+        },
+        "materials": {
+            "params": nb.Tensor.from_dlpack(np.random.randn(1, 5, 5).astype(np.float32))
+        },
+        "lights": {
+            "params": nb.Tensor.from_dlpack(np.random.randn(1, 3, 7).astype(np.float32))
+        },
+    }
+    noisy = nb.Tensor.from_dlpack(np.random.randn(1, 32, 32, 4).astype(np.float32))
+    gt = nb.Tensor.from_dlpack(np.random.randn(1, 32, 32, 4).astype(np.float32))
 
-    _ram_guard("post-stress")
-    device_str = "GPU" if device is not None else "CPU"
-    avg = np.mean(times) if times else 0
-    total = sum(times)
+    losses = []
+    times = []
+    for step in range(5):
+        if not _safe_to_continue_ram():
+            break
+
+        t0 = time.perf_counter()
+        metrics = trainer.train_step(noisy, gt, scene_graph)
+        dt = time.perf_counter() - t0
+
+        assert np.isfinite(metrics["total_loss"]), f"Step {step} non-finite loss"
+        assert metrics["iteration"] == step + 1
+        losses.append(metrics["total_loss"])
+        times.append(dt)
+        print(
+            f"  Step {step + 1}: {dt:.2f}s loss={metrics['total_loss']:.4f} "
+            f"iter={metrics['iteration']}",
+            flush=True,
+        )
+        _clear_nabla_graph()
+
+    # Training happened: losses changed across steps (AdamW updates params)
+    assert len(losses) >= 2, f"Only {len(losses)} steps completed"
+    unique = len(set(f"{v:.6f}" for v in losses))
+    assert unique > 1, f"Losses identical — no training: {losses}"
+
+    _ram_guard("post-model-train")
     print(
-        f"  Sustained {device_str} stress (128x128, {len(times)} steps): "
-        f"avg={avg:.4f}s/step, total={total:.1f}s"
+        f"  Real model training (CPU, 32x32, {len(losses)} steps): "
+        f"loss {losses[0]:.2f} -> {losses[-1]:.2f}, "
+        f"avg={np.mean(times):.2f}s/step"
     )
-    _clear_nabla_graph()
 
 
-# === Section 5: silu_gpu GPU backward verification ===
+@nabla_skip
+@gpu_skip
+def test_15_sustained_gpu_training():
+    """Sustained GPU training: 3-layer MLP, 30 steps with SGD on GPU.
+
+    Long training run for sustained GPU compute load.
+    Same proven dims as test_13 — many steps instead of larger model
+    (MAX compiler limits prevent >3 layers or >1024 dims on GPU backward).
+    """
+    _reset_state()
+    _gpu_pause()
+    _ram_guard("pre-sustained-gpu")
+
+    gpu = _get_device()
+    lr = 0.001
+    dims = [512, 256, 128, 64]
+
+    w0 = nb.Tensor.from_dlpack(_he_init(dims[0], dims[1]))
+    w1 = nb.Tensor.from_dlpack(_he_init(dims[1], dims[2]))
+    w2 = nb.Tensor.from_dlpack(_he_init(dims[2], dims[3]))
+    if gpu is not None:
+        w0 = nb.ops.transfer_to(w0, gpu)
+        w1 = nb.ops.transfer_to(w1, gpu)
+        w2 = nb.ops.transfer_to(w2, gpu)
+
+    x_fixed = _tensor(np.random.randn(1, dims[0]).astype(np.float32), gpu)
+    target = _tensor(np.random.randn(1, dims[-1]).astype(np.float32), gpu)
+
+    def loss_fn(w0, w1, w2):
+        s = silu_gpu(nb.matmul(x_fixed, w0))
+        s = silu_gpu(nb.matmul(s, w1))
+        s = nb.matmul(s, w2)
+        diff = s - target
+        return (diff * diff).sum()
+
+    losses = []
+    times = []
+    for step in range(30):
+        if not _safe_to_continue_ram():
+            break
+
+        t0 = time.perf_counter()
+        val, (g0, g1, g2) = nb.value_and_grad(loss_fn, argnums=(0, 1, 2))(w0, w1, w2)
+        loss_val = float(val.to_numpy())
+        nb.realize_all(g0, g1, g2)
+
+        new_ws = []
+        for w, g in zip([w0, w1, w2], [g0, g1, g2]):
+            new_w = nb.Tensor.from_dlpack(w.to_numpy() - lr * g.to_numpy())
+            if gpu is not None:
+                new_w = nb.ops.transfer_to(new_w, gpu)
+            new_ws.append(new_w)
+        w0, w1, w2 = new_ws
+
+        dt = time.perf_counter() - t0
+        losses.append(loss_val)
+        times.append(dt)
+
+        assert not np.isnan(loss_val)
+        if step % 10 == 0:
+            _resource_report(f"sustained-{step}")
+            print(
+                f"  Step {step}: {dt:.2f}s loss={loss_val:.2f} "
+                f"vram={get_gpu_memory_info()['used_mb']:.0f}MB",
+                flush=True,
+            )
+        _clear_nabla_graph()
+
+    _ram_guard("post-sustained-gpu")
+    device_str = "GPU" if gpu is not None else "CPU"
+    avg = np.mean(times) if times else 0
+    total_params = sum(dims[i] * dims[i + 1] for i in range(len(dims) - 1))
+    print(
+        f"  Sustained {device_str} ({total_params / 1000:.0f}K params, "
+        f"{len(losses)} steps): loss {losses[0]:.1f} -> {losses[-1]:.1f}, "
+        f"avg={avg:.2f}s/step, total={sum(times):.1f}s"
+    )
+
+
+# === Section 5: Verification + Checkpoint ===
 
 
 @nabla_skip
@@ -972,13 +1045,11 @@ def test_16_silu_gpu_forward_backward():
     device = _get_device()
     x = _tensor(np.random.randn(1, 32, 32, 16).astype(np.float32), device)
 
-    # Forward
     out = silu_gpu(x)
     out_np = out.to_numpy()
     assert out_np.shape == (1, 32, 32, 16)
     assert not np.isnan(out_np).any(), "silu_gpu forward produced NaN"
 
-    # Backward via value_and_grad — MUST realize gradient
     def loss_fn(x):
         return (silu_gpu(x) * silu_gpu(x)).sum()
 
@@ -992,7 +1063,7 @@ def test_16_silu_gpu_forward_backward():
     _ram_guard("post-silu-gpu")
     device_str = "GPU" if device is not None else "CPU"
     print(
-        f"  silu_gpu forward+backward ({device_str}): "
+        f"  silu_gpu fwd+bwd ({device_str}): "
         f"loss={val_np.item():.4f}, grad_shape={grad_np.shape}"
     )
     _clear_nabla_graph()
@@ -1000,70 +1071,83 @@ def test_16_silu_gpu_forward_backward():
 
 @nabla_skip
 @gpu_skip
-def test_17_silu_gpu_training_loop():
-    """Sustained GPU training loop with silu_gpu — 10 steps, gradient realized."""
+def test_17_checkpoint_save_load():
+    """Train model 3 steps, save checkpoint, load into fresh model, verify + continue."""
     _reset_state()
     _gpu_pause()
-    _ram_guard("pre-silu-train")
+    _ram_guard("pre-checkpoint")
 
-    device = _get_device()
+    import tempfile
 
-    # 3-layer conv model (smaller than before to fit VRAM)
-    filters = []
-    for ch_in, ch_out in [(3, 16), (16, 32), (32, 64)]:
-        w = F.he_normal((3, 3, ch_in, ch_out))
-        if device is not None:
-            w = nb.ops.transfer_to(w, device)
-        w.requires_grad = True
-        filters.append(w)
+    from omen.config import OmenConfig
+    from omen.model.jepa import OmenJEPA
+    from omen.training.trainer.core import OmenTrainer
 
-    def loss_fn(x):
-        s = x
-        for w in filters:
-            s = silu_gpu(nb.conv2d(s, w, stride=(2, 2), padding=(1, 1)))
-        return (s * s).sum()
+    config = OmenConfig.v1_dense()
+    config.components.ar_predictor = False
+    config.components.scene_delta_encoder = False
+    config.components.episodic_correction = False
 
-    @nb.compile
-    def compiled_step(x):
-        val, grad = nb.value_and_grad(loss_fn)(x)
-        return val, grad
+    model = OmenJEPA(config=config, latent_dim=64)
+    trainer = OmenTrainer(model, config=config, total_steps=10)
 
-    # Step 1: compile + execute
-    x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
-    print("  Step 1 (compile+exec)...", end=" ", flush=True)
-    t0 = time.perf_counter()
-    val, grad = compiled_step(x)
-    val_np = val.to_numpy()
-    grad_np = grad.to_numpy()
-    dt = time.perf_counter() - t0
-    assert not np.isnan(val_np).item(), f"Step 1 NaN loss: {val_np.item()}"
-    assert not np.isnan(grad_np).any(), "Step 1 NaN grads"
-    print(f"{dt:.1f}s loss={val_np.item():.1f}", flush=True)
+    scene_graph = {
+        "geometry": {
+            "vertices": nb.Tensor.from_dlpack(
+                np.random.randn(1, 10, 6).astype(np.float32)
+            )
+        },
+        "materials": {
+            "params": nb.Tensor.from_dlpack(np.random.randn(1, 5, 5).astype(np.float32))
+        },
+        "lights": {
+            "params": nb.Tensor.from_dlpack(np.random.randn(1, 3, 7).astype(np.float32))
+        },
+    }
+    noisy = nb.Tensor.from_dlpack(np.random.randn(1, 32, 32, 4).astype(np.float32))
+    gt = nb.Tensor.from_dlpack(np.random.randn(1, 32, 32, 4).astype(np.float32))
 
-    # Steps 2-10: sustained (graph cached, no recompilation)
-    times = []
-    for i in range(9):
-        if not _safe_to_continue_ram():
-            print(f"  RAM limit at step {i + 2}, stopping")
-            break
-        x = _tensor(np.random.randn(1, 64, 64, 3).astype(np.float32), device)
-        t0 = time.perf_counter()
-        val, grad = compiled_step(x)
-        val_np = val.to_numpy()
-        grad_np = grad.to_numpy()
-        dt = time.perf_counter() - t0
-        times.append(dt)
-        assert not np.isnan(val_np).item(), f"Step {i + 2} NaN loss"
-        assert not np.isnan(grad_np).any(), f"Step {i + 2} NaN grads"
-        print(
-            f"  Step {i + 2}: {dt:.4f}s loss={val_np.item():.2f}", flush=True
+    # Train 3 steps
+    for i in range(3):
+        trainer.train_step(noisy, gt, scene_graph)
+        _clear_nabla_graph()
+
+    assert trainer.iteration == 3
+    trained_params = {k: v.to_numpy().copy() for k, v in model.state_dict().items()}
+
+    # Save checkpoint
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = os.path.join(tmpdir, "test_step_3.omen")
+        trainer.save_checkpoint(ckpt_path)
+        print(f"  Checkpoint saved: {ckpt_path}")
+
+        # Load into fresh model + trainer
+        model2 = OmenJEPA(config=config, latent_dim=64)
+        trainer2 = OmenTrainer(model2, config=config, total_steps=10)
+        trainer2.load_checkpoint(ckpt_path)
+
+        assert trainer2.iteration == 3, (
+            f"Expected iteration 3, got {trainer2.iteration}"
         )
 
-    _ram_guard("post-silu-train")
-    device_str = "GPU" if device is not None else "CPU"
-    avg = np.mean(times) if times else 0
-    print(
-        f"  silu_gpu training ({device_str}, 64x64, {len(times) + 1} steps): "
-        f"avg={avg:.4f}s"
-    )
-    _clear_nabla_graph()
+        # Verify all params match
+        loaded_params = model2.state_dict()
+        mismatches = 0
+        for k in trained_params:
+            loaded_np = loaded_params[k].to_numpy()
+            if not np.allclose(trained_params[k], loaded_np, atol=1e-6):
+                mismatches += 1
+        assert mismatches == 0, f"{mismatches} params mismatched after load"
+
+        # Continue training from loaded checkpoint
+        metrics = trainer2.train_step(noisy, gt, scene_graph)
+        assert metrics["iteration"] == 4
+        assert np.isfinite(metrics["total_loss"])
+        _clear_nabla_graph()
+
+        print(
+            f"  Checkpoint verified: iter={trainer2.iteration}, "
+            f"continued loss={metrics['total_loss']:.4f}"
+        )
+
+    _ram_guard("post-checkpoint")
