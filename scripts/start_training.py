@@ -68,6 +68,9 @@ def _train_on_data(
         # Periodic checkpoint
         if checkpoint_every > 0 and trainer.iteration % checkpoint_every == 0:
             trainer.save_checkpoint_rotating(CKPT_DIR)
+    # Flush nabla graph cache after all sub-steps on this frame
+    if steps_per_frame > 1:
+        trainer.flush_graph_cache()
     return all_metrics[-1]
 
 
