@@ -1,5 +1,6 @@
 """OmenTrainer: functional value_and_grad + per-component AdamW."""
 
+import gc
 import logging
 import os
 
@@ -48,6 +49,10 @@ class OmenTrainer:
         if errors:
             raise ValueError(f"Invalid config: {'; '.join(errors)}")
 
+        from omen.gpu_budget import get_gpu_memory_info
+        gpu_info = get_gpu_memory_info()
+        self._gpu_available = gpu_info["backend"] != "none"
+
         self._components = create_functional_optimizers(
             self.model, self.config, self.weight_decay
         )
@@ -79,7 +84,7 @@ class OmenTrainer:
     ):
         """Tile-based training: encode scene once, train per-tile."""
         self.model.train()
-        scene_latent = self._encode_scene_once(scene_graph)
+        sg_tensor = self._to_nabla_scene_graph(scene_graph)
 
         noisy_tiles = extract_tiles(noisy_full, tile_size)
         gt_tiles = extract_tiles(gt_full, tile_size)
@@ -87,11 +92,16 @@ class OmenTrainer:
         total_loss = 0.0
         for tile_noisy, tile_gt in zip(noisy_tiles, gt_tiles):
             total_loss += self._train_single_tile(
-                tile_noisy, tile_gt, scene_latent, z_score
+                tile_noisy, tile_gt, sg_tensor, z_score
             )
+            gc.collect()
 
         avg_loss = total_loss / len(noisy_tiles)
         self.iteration += 1
+
+        # Release nabla compiled graphs to bound RAM (~6-8GB per entry)
+        self._clear_graph_cache()
+
         return {
             "total_loss": avg_loss,
             "num_tiles": len(noisy_tiles),
@@ -99,49 +109,55 @@ class OmenTrainer:
             "z_score": z_score,
         }
 
-    def _encode_scene_once(self, scene_graph):
-        """Encode scene graph into latent (once per full render)."""
-        self.model.eval()
-        scene_latent = self.model.scene_encoder(scene_graph)
-        self.model.train()
-        return scene_latent
+    def _clear_graph_cache(self):
+        """Clear nabla compiled graph cache to bound RAM usage.
+
+        Each cache entry holds ~6-8GB.  Fixed tile sizes produce at most
+        1-2 entries per step, but leaving them across steps accumulates.
+        Clearing between ``train_step_tiled`` calls ensures predictable RAM.
+        """
+        try:
+            nb.GRAPH.clear_all()
+        except (AttributeError, Exception):
+            pass
+        gc.collect()
+
+    def _to_nabla_scene_graph(self, scene_graph):
+        """Convert scene_graph numpy arrays to batched nabla tensors.
+
+        Adds leading batch dim (``[np.newaxis]``) to match what
+        :class:`SceneGraphEncoder` expects — ``vertices (B, N, 3)``,
+        ``params (B, M, D)``.
+        """
+        if not isinstance(scene_graph, dict):
+            return scene_graph
+        result = {}
+        for section_key, section in scene_graph.items():
+            converted = {}
+            for k, v in section.items():
+                if isinstance(v, np.ndarray):
+                    converted[k] = nb.Tensor.from_dlpack(
+                        v.astype(np.float32)[np.newaxis]
+                    )
+                else:
+                    converted[k] = v
+            result[section_key] = converted
+        return result
 
     def _train_single_tile(self, tile_noisy, tile_gt, scene_latent, z_score):
-        """Train on one tile with GPU OOM fallback."""
+        """Train on one tile — CPU-first, GPU when available."""
         noisy_tensor = self._tile_to_tensor(tile_noisy.data)
         gt_tensor = self._tile_to_tensor(tile_gt.data)
 
-        try:
-            return self._run_tile_gpu(
-                noisy_tensor, gt_tensor, scene_latent, z_score
-            )
-        except (RuntimeError, Exception) as exc:
-            err = str(exc).lower()
-            if "out of memory" in err or "cuda" in err:
-                logger.warning("GPU OOM, falling back to CPU: %s", exc)
-                return self._run_tile_cpu(
-                    noisy_tensor, gt_tensor, scene_latent, z_score
-                )
-            raise
+        if self._gpu_available:
+            try:
+                noisy_tensor = noisy_tensor.cuda()
+                gt_tensor = gt_tensor.cuda()
+                logger.debug("Tile on GPU")
+            except Exception:
+                logger.warning("GPU tensor transfer failed, using CPU")
 
-    def _run_tile_gpu(self, noisy, gt, scene_latent, z_score):
-        """Run tile on GPU, silently fall back if .cuda() unavailable."""
-        try:
-            noisy = noisy.cuda()
-            gt = gt.cuda()
-            if hasattr(scene_latent, "cuda"):
-                scene_latent = scene_latent.cuda()
-        except Exception:
-            pass
-        return self._run_tile(noisy, gt, scene_latent, z_score)
-
-    def _run_tile_cpu(self, noisy, gt, scene_latent, z_score):
-        """Run tile on CPU."""
-        if hasattr(noisy, "cpu"):
-            noisy = noisy.cpu()
-        if hasattr(gt, "cpu"):
-            gt = gt.cpu()
-        return self._run_tile(noisy, gt, scene_latent, z_score)
+        return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
 
     def _run_tile(self, noisy, gt, scene_latent, z_score):
         """Core training step for one tile."""

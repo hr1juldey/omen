@@ -11,9 +11,8 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 logger = logging.getLogger("omen.train_cli")
 
-# Set GPU before nabla import if not overridden
-if os.environ.get("NABLA_DEFAULT_DEVICE") is None:
-    os.environ["NABLA_DEFAULT_DEVICE"] = "gpu"
+# Don't set NABLA_DEFAULT_DEVICE — nabla defaults to CPU safely.
+# GPU activated via .cuda() when _has_accelerator() returns True.
 
 from omen.config import OmenConfig
 from omen.gpu_budget import can_fit_tiles, get_gpu_memory_info
