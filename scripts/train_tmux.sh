@@ -6,8 +6,12 @@
 
 set -euo pipefail
 
+# Resolve project root (one dir up from this script)
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$PROJECT_DIR"
+
 SESSION="omen-training"
-LOG_DIR="logs"
+LOG_DIR="${PROJECT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -17,13 +21,14 @@ LOG_FILE="${LOG_DIR}/training_${TIMESTAMP}.log"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 echo "Starting omen-training in tmux"
+echo "  Project:  ${PROJECT_DIR}"
 echo "  Log file: ${LOG_FILE}"
 echo "  Monitor:  tail -f ${LOG_FILE}"
 echo "  Reattach: tmux attach -t ${SESSION}"
 echo ""
 
-tmux new-session -d -s "$SESSION" \
-  "uv run python scripts/start_training.py --log-file ${LOG_FILE} $@ 2>&1 | tee -a ${LOG_FILE}" \
+tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" \
+  "cd ${PROJECT_DIR} && uv run python scripts/start_training.py --log-file ${LOG_FILE} $@ 2>&1 | tee ${LOG_FILE}" \
   || { echo "Failed to create tmux session"; exit 1; }
 
 echo "Training started. Detaching..."
