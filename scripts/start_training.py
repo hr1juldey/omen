@@ -28,6 +28,25 @@ def _find_latest_checkpoint(ckpt_dir):
     return files[-1] if files else None
 
 
+def _system_ram_mb():
+    """System RAM used in MB via /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            info = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1]) // 1024
+        total = info.get("MemTotal", 0)
+        avail = info.get("MemAvailable", 0)
+        return total - avail
+    except Exception:
+        return 0
+
+
+RAM_LIMIT_GB = 24  # Leave ~8GB for OS on 32GB system
+
+
 def _train_on_data(
     trainer,
     gen,
@@ -39,38 +58,54 @@ def _train_on_data(
     steps_per_frame=1,
     checkpoint_every=0,
 ):
-    """Run tiled training step(s) and log results."""
+    """Run tiled training step(s) and log results.
+
+    Graph cache is flushed after EVERY frame — each frame is a different
+    camera view so the compiled graph isn't reusable anyway.  Within a frame,
+    all tiles share the same shapes and reuse one cached graph entry.
+    """
+    # RAM guard — abort before OOM kills the process
+    ram_mb = _system_ram_mb()
+    if ram_mb > RAM_LIMIT_GB * 1024:
+        raise MemoryError(
+            f"RAM {ram_mb}MB exceeds {RAM_LIMIT_GB}GB limit — stopping before OOM"
+        )
+
     all_metrics = []
     for sub_idx in range(steps_per_frame):
         t0 = time.perf_counter()
         metrics = trainer.train_step_tiled(noisy, gt, sg, tile_size=tile_size)
         dt = time.perf_counter() - t0
+        ram_now = _system_ram_mb()
         if steps_per_frame > 1:
             logger.info(
-                "Frame step %d/%d: loss=%.6f tiles=%d iter=%d (%.1fs)",
+                "Frame step %d/%d: loss=%.6f tiles=%d iter=%d (%.1fs) ram=%dMB",
                 sub_idx + 1,
                 steps_per_frame,
                 metrics["total_loss"],
                 metrics["num_tiles"],
                 metrics["iteration"],
                 dt,
+                ram_now,
             )
         else:
             logger.info(
-                "Step %d: loss=%.6f tiles=%d iter=%d (%.1fs)",
+                "Step %d: loss=%.6f tiles=%d iter=%d (%.1fs) ram=%dMB",
                 step_idx + 1,
                 metrics["total_loss"],
                 metrics["num_tiles"],
                 metrics["iteration"],
                 dt,
+                ram_now,
             )
         all_metrics.append(metrics)
         # Periodic checkpoint
         if checkpoint_every > 0 and trainer.iteration % checkpoint_every == 0:
             trainer.save_checkpoint_rotating(CKPT_DIR)
-    # Flush nabla graph cache after all sub-steps on this frame
-    if steps_per_frame > 1:
-        trainer.flush_graph_cache()
+
+    # Flush nabla graph cache after this frame — next frame is a new view.
+    # All tiles within this frame shared one cached graph (same shapes).
+    trainer.flush_graph_cache()
     return all_metrics[-1]
 
 
@@ -123,7 +158,16 @@ def main():
         default=None,
         help="Write logs to this file in addition to stdout",
     )
+    parser.add_argument(
+        "--ram-limit",
+        type=int,
+        default=RAM_LIMIT_GB,
+        help=f"Abort if system RAM exceeds this many GB (default: {RAM_LIMIT_GB})",
+    )
     args = parser.parse_args()
+
+    # Update RAM limit from CLI
+    RAM_LIMIT_GB = args.ram_limit
 
     # Log file handler
     if args.log_file:

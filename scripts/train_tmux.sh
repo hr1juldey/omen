@@ -28,7 +28,7 @@ echo "  Reattach: tmux attach -t ${SESSION}"
 echo ""
 
 tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" \
-  "cd ${PROJECT_DIR} && uv run python scripts/start_training.py --log-file ${LOG_FILE} $@ 2>&1 | tee ${LOG_FILE}" \
+  "cd ${PROJECT_DIR} && uv run python scripts/start_training.py --log-file ${LOG_FILE} $@ 2>&1" \
   || { echo "Failed to create tmux session"; exit 1; }
 
 echo "Training started. Detaching..."
