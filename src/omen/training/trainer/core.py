@@ -238,6 +238,13 @@ class OmenTrainer:
                 new_params[k] = v
         return new_params
 
+    def flush_graph_cache(self):
+        """Flush nabla's compiled graph cache — call between scene transitions."""
+        import nabla as nb
+
+        nb.GRAPH.clear_all()
+        logger.info("Graph cache flushed (inter-scene)")
+
     def save_checkpoint(self, path):
         """Save model state dict and config to disk."""
         os.makedirs(os.path.dirname(path), exist_ok=True)

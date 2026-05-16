@@ -156,16 +156,29 @@ def _run_static(trainer, gen, builder, args, losses):
 
 
 def _run_multi_scene(trainer, gen, args, losses, w, h):
-    """Multi-scene training — round-robin through all scenes."""
+    """Curriculum training — master one scene completely, then move to next.
+
+    Per scene: static cameras → all animation types.
+    Graph cache flushed between scenes.
+    """
+    from omen.scenes import get_animation_generator
+
     scene_names = sorted(SCENE_REGISTRY.keys())
-    logger.info("Mode: multi-scene | Scenes: %s | Steps: %d", scene_names, args.steps)
-    step_idx = 0
-    while step_idx < args.steps:
-        for scene_name in scene_names:
-            if step_idx >= args.steps:
-                break
-            builder = SCENE_REGISTRY[scene_name]
-            logger.info("Scene %d/%d: %s", step_idx + 1, args.steps, scene_name)
+    logger.info(
+        "Mode: curriculum | Scenes: %s | Steps/scene: %d", scene_names, args.steps
+    )
+
+    for scene_idx, scene_name in enumerate(scene_names):
+        logger.info("=" * 60)
+        logger.info(
+            "CURRICULUM: Scene %d/%d — %s", scene_idx + 1, len(scene_names), scene_name
+        )
+        logger.info("=" * 60)
+        builder = SCENE_REGISTRY[scene_name]
+
+        # Phase 1: static multi-camera
+        logger.info("[%s] Phase 1: static cameras", scene_name)
+        for step_idx in range(args.steps):
             for step_data in gen.train_step(builder, camera=args.camera):
                 metrics = _train_on_data(
                     trainer,
@@ -178,7 +191,36 @@ def _run_multi_scene(trainer, gen, args, losses, w, h):
                     steps_per_frame=args.steps_per_frame,
                 )
                 losses.append(metrics["total_loss"])
-            step_idx += 1
+
+        # Phase 2: all animation types
+        animations = get_animation_generator(scene_name, base_resolution=(w, h))
+        if animations is None:
+            logger.info("[%s] No animations, skipping to next scene", scene_name)
+            trainer.flush_graph_cache()
+            continue
+
+        _, sg = builder(resolution=(w, h))
+        for anim_type in ANIMATION_TYPES:
+            if anim_type not in animations:
+                continue
+            logger.info("[%s] Phase 2: animation %s", scene_name, anim_type)
+            frames = animations[anim_type]
+            for step_data in gen.train_animation(frames, sg):
+                metrics = _train_on_data(
+                    trainer,
+                    gen,
+                    step_data["noisy_image"],
+                    step_data["gt_image"],
+                    sg,
+                    args.tile_size,
+                    0,
+                    steps_per_frame=args.steps_per_frame,
+                )
+                losses.append(metrics["total_loss"])
+
+        # Scene mastered — flush cache before next scene
+        trainer.flush_graph_cache()
+        logger.info("[%s] Mastered. Cache flushed.", scene_name)
 
 
 def _run_animation(trainer, gen, builder, args, losses, w, h):
