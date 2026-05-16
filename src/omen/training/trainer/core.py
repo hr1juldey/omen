@@ -73,33 +73,22 @@ class OmenTrainer:
                 from max.driver import Accelerator
 
                 self._gpu = Accelerator()
-                self._transfer_model_to_gpu(self._gpu)
-                logger.info("Model weights transferred to GPU")
+                # NABLA_DEFAULT_DEVICE=gpu (set in start_training.py) ensures
+                # all tensor creation — including VJP scalar constants —
+                # targets GPU.  We still transfer model weights explicitly
+                # since they were created before the env-var takes full effect.
+                cpu_params = self.model.state_dict()
+                gpu_params = {
+                    name: nb.ops.transfer_to(param, self._gpu)
+                    for name, param in cpu_params.items()
+                }
+                self.model.load_state_dict(gpu_params)
+                logger.info("Transferred %d params to GPU", len(gpu_params))
             except Exception as e:
                 logger.warning("GPU model transfer failed, using CPU: %s", e)
                 self._gpu = None
 
         self._init_compiled_step()
-
-    def _transfer_model_to_gpu(self, gpu):
-        """Transfer all model weights to GPU so state_dict returns GPU tensors."""
-        for name, param in self.model.state_dict().items():
-            transferred = nb.ops.transfer_to(param, gpu)
-            # Replace the parameter in the model's internal storage
-            parts = name.split(".")
-            obj = self.model
-            for part in parts[:-1]:
-                if part.isdigit():
-                    obj = obj[int(part)]
-                else:
-                    obj = getattr(obj, part)
-            leaf_name = parts[-1]
-            if hasattr(obj, "weight") and leaf_name == "weight":
-                obj.weight = transferred
-            elif hasattr(obj, "bias") and leaf_name == "bias":
-                obj.bias = transferred
-            elif hasattr(obj, leaf_name):
-                setattr(obj, leaf_name, transferred)
 
     def _init_compiled_step(self):
         """Create compiled forward+backward step for graph cache reuse.
@@ -185,6 +174,8 @@ class OmenTrainer:
         Adds leading batch dim (``[np.newaxis]``) to match what
         :class:`SceneGraphEncoder` expects — ``vertices (B, N, 3)``,
         ``params (B, M, D)``.
+
+        When GPU is available, tensors are transferred to GPU immediately.
         """
         if not isinstance(scene_graph, dict):
             return scene_graph
@@ -193,32 +184,13 @@ class OmenTrainer:
             converted = {}
             for k, v in section.items():
                 if isinstance(v, np.ndarray):
-                    converted[k] = nb.Tensor.from_dlpack(
-                        v.astype(np.float32)[np.newaxis]
-                    )
+                    t = nb.Tensor.from_dlpack(v.astype(np.float32)[np.newaxis])
+                    if self._gpu is not None:
+                        t = nb.ops.transfer_to(t, self._gpu)
+                    converted[k] = t
                 else:
                     converted[k] = v
             result[section_key] = converted
-        return result
-
-    def _transfer_scene_latent_to_gpu(self, scene_latent):
-        """Transfer scene_latent tensors to GPU."""
-        if not isinstance(scene_latent, dict) or self._gpu is None:
-            return scene_latent
-        result = {}
-        for section_key, section in scene_latent.items():
-            if isinstance(section, dict):
-                converted = {}
-                for k, v in section.items():
-                    if nb.is_tensor(v):
-                        converted[k] = nb.ops.transfer_to(v, self._gpu)
-                    else:
-                        converted[k] = v
-                result[section_key] = converted
-            elif nb.is_tensor(section):
-                result[section_key] = nb.ops.transfer_to(section, self._gpu)
-            else:
-                result[section_key] = section
         return result
 
     def _train_single_tile(self, tile_noisy, tile_gt, scene_latent, z_score):
@@ -230,8 +202,6 @@ class OmenTrainer:
             try:
                 noisy_tensor = nb.ops.transfer_to(noisy_tensor, self._gpu)
                 gt_tensor = nb.ops.transfer_to(gt_tensor, self._gpu)
-                scene_latent = self._transfer_scene_latent_to_gpu(scene_latent)
-                logger.debug("Tile on GPU via transfer_to")
             except Exception:
                 logger.warning("GPU transfer failed, using CPU")
 
