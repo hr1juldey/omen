@@ -27,8 +27,15 @@ echo "  Monitor:  tail -f ${LOG_FILE}"
 echo "  Reattach: tmux attach -t ${SESSION}"
 echo ""
 
-tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" \
-  "cd ${PROJECT_DIR} && uv run python scripts/start_training.py --log-file ${LOG_FILE} $@ 2>&1" \
+tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" "bash" \
   || { echo "Failed to create tmux session"; exit 1; }
+
+# Small delay to let bash initialize inside tmux
+sleep 0.5
+
+# Send the training command via send-keys (more robust than inline command)
+tmux send-keys -t "$SESSION" \
+  "cd ${PROJECT_DIR} && uv run python scripts/start_training.py --log-file ${LOG_FILE} $@ 2>&1; echo 'Training exited with code:' \$?" \
+  Enter
 
 echo "Training started. Detaching..."
