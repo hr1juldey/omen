@@ -169,6 +169,18 @@ def main():
         default=DEFAULT_RAM_LIMIT_GB,
         help=f"Abort if system RAM exceeds this many GB (default: {DEFAULT_RAM_LIMIT_GB})",
     )
+    parser.add_argument(
+        "--gt-spp",
+        type=int,
+        default=512,
+        help="Ground-truth samples per pixel (default: 512)",
+    )
+    parser.add_argument(
+        "--noisy-spp",
+        type=int,
+        default=4,
+        help="Noisy samples per pixel (default: 4)",
+    )
     args = parser.parse_args()
 
     ram_limit_gb = args.ram_limit
@@ -215,7 +227,10 @@ def main():
             logger.warning("--resume set but no checkpoint found in %s", CKPT_DIR)
 
     gen = TrainingDataGenerator(
-        resolution=(w, h), gt_spp=512, noisy_spp=4, save_images=args.save_images
+        resolution=(w, h),
+        gt_spp=args.gt_spp,
+        noisy_spp=args.noisy_spp,
+        save_images=args.save_images,
     )
 
     ckpt_kw = {"checkpoint_every": args.checkpoint_every, "ram_limit_gb": ram_limit_gb}
