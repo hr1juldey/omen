@@ -33,9 +33,14 @@ tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" "bash" \
 # Small delay to let bash initialize inside tmux
 sleep 0.5
 
+# Build command string with proper spacing (plain $@ inside quotes loses spaces for send-keys)
+TRAIN_CMD="cd ${PROJECT_DIR} && uv run python scripts/start_training.py --log-file ${LOG_FILE}"
+for arg in "$@"; do
+  TRAIN_CMD="${TRAIN_CMD} ${arg}"
+done
+TRAIN_CMD="${TRAIN_CMD} 2>&1; echo 'Training exited with code:' \$?"
+
 # Send the training command via send-keys (more robust than inline command)
-tmux send-keys -t "$SESSION" \
-  "cd ${PROJECT_DIR} && uv run python scripts/start_training.py --log-file ${LOG_FILE} $@ 2>&1; echo 'Training exited with code:' \$?" \
-  Enter
+tmux send-keys -t "$SESSION" "$TRAIN_CMD" Enter
 
 echo "Training started. Detaching..."
