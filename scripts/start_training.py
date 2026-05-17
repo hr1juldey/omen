@@ -77,6 +77,14 @@ def _train_on_data(
 
     all_metrics = []
     for sub_idx in range(steps_per_frame):
+        # RAM guard inside loop — each tile can grow ~2GB if lazy tensors leak
+        ram_pre = _system_ram_mb()
+        if ram_pre > ram_limit_gb * 1024:
+            raise MemoryError(
+                f"RAM {ram_pre}MB exceeds {ram_limit_gb}GB limit at sub-step "
+                f"{sub_idx + 1}/{steps_per_frame} — stopping before OOM"
+            )
+
         t0 = time.perf_counter()
         metrics = trainer.train_step_tiled(noisy, gt, sg, tile_size=tile_size)
         dt = time.perf_counter() - t0
