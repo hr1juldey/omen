@@ -32,6 +32,19 @@ def _transfer(tree, device):
     return _move(tree)
 
 
+def _numpy_to_nabla(tree):
+    """Convert numpy arrays in a nested dict to nabla tensors."""
+
+    def _convert(t):
+        if isinstance(t, np.ndarray):
+            return nb.Tensor.from_dlpack(t.astype(np.float32))
+        return t
+
+    if isinstance(tree, dict):
+        return {k: _numpy_to_nabla(v) for k, v in tree.items()}
+    return _convert(tree)
+
+
 class CompiledOmenTrainer:
     """Training loop using @nb.compile for graph reuse and RAM stability.
 
@@ -65,6 +78,9 @@ class CompiledOmenTrainer:
         self.opt_states = self._init_opt_states()
         self.step_count = 0
 
+        # Cache CPU params for eager scene encoding (avoids transfer every step)
+        self._cpu_params = _transfer(self.params, CPU())
+
     def _init_opt_states(self):
         """Create per-component AdamW states for active components."""
         states = {}
@@ -95,9 +111,21 @@ class CompiledOmenTrainer:
         return self.step_count
 
     def _encode_scene(self, scene_input):
-        """Pre-encode scene graph outside compiled function, transfer to device."""
+        """Pre-encode scene graph on CPU, then transfer latent to device.
+
+        Scene graph data is numpy — encoding runs eagerly on CPU with CPU
+        param copies. The resulting latent is transferred to GPU for the
+        compiled train step.
+        """
         if isinstance(scene_input, dict):
-            latent = self.model.scene_encoder(scene_input)
+            from omen.model.functional import _extract_prefix, scene_encoder_fn
+
+            sg = _numpy_to_nabla(scene_input)
+            # Use cached CPU params for eager scene encoding
+            p = _extract_prefix(self._cpu_params, "scene_encoder.")
+            latent = scene_encoder_fn(p, sg)
+            # Realize: prevent lazy graph from leaking into @nb.compile
+            nb.realize_all(latent)
         else:
             latent = scene_input
         return _transfer(latent, self.device)
@@ -112,6 +140,23 @@ class CompiledOmenTrainer:
             metrics dict compatible with OmenTrainer interface.
         """
         scene_latent = self._encode_scene(scene_input)
+
+        # Ensure batch dim + 4 channels: (H,W,C) -> (1,H,W,4) for numpy arrays
+        if isinstance(noisy, np.ndarray):
+            if noisy.ndim == 3:
+                noisy = noisy[np.newaxis]
+            if noisy.shape[-1] == 3:
+                noisy = np.pad(noisy, ((0, 0), (0, 0), (0, 0), (0, 1)),
+                               constant_values=1.0)
+            noisy = nb.Tensor.from_dlpack(noisy.astype(np.float32))
+        if isinstance(gt, np.ndarray):
+            if gt.ndim == 3:
+                gt = gt[np.newaxis]
+            if gt.shape[-1] == 3:
+                gt = np.pad(gt, ((0, 0), (0, 0), (0, 0), (0, 1)),
+                            constant_values=1.0)
+            gt = nb.Tensor.from_dlpack(gt.astype(np.float32))
+
         B, H, W, C = (int(d) for d in noisy.shape)
         total_loss = 0.0
         n_tiles = 0
