@@ -3,7 +3,8 @@
 Mirrors RenderFeatureEncoder.forward but takes params dict directly.
 """
 
-from omen.kernels.activations import silu_gpu
+import nabla as nb
+
 from omen.kernels.conv2d import conv2d_safe
 
 
@@ -17,13 +18,13 @@ def render_encoder_fn(p, rgba):
     Returns:
         (batch, latent_dim) render latent.
     """
-    x = silu_gpu(
+    x = nb.silu(
         conv2d_safe(rgba, p["conv1_filter"], stride=2, padding=1, bias=p["conv1_bias"])
     )
-    x = silu_gpu(
+    x = nb.silu(
         conv2d_safe(x, p["conv2_filter"], stride=2, padding=1, bias=p["conv2_bias"])
     )
-    x = silu_gpu(
+    x = nb.silu(
         conv2d_safe(x, p["conv3_filter"], stride=2, padding=1, bias=p["conv3_bias"])
     )
 

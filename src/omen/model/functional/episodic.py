@@ -5,9 +5,6 @@ Mirrors EpisodicCorrection.forward but takes params dict directly.
 
 import nabla as nb
 
-from omen.kernels.activations import silu_gpu
-
-
 def episodic_fn(p, main_output, scene_context):
     """Apply episodic correction using params dict.
 
@@ -23,7 +20,7 @@ def episodic_fn(p, main_output, scene_context):
 
     # Sequential: Linear(dim*2, hidden) -> SiLU -> Linear(hidden, dim)
     x = combined @ p["net.0.weight"] + p["net.0.bias"]
-    x = silu_gpu(x)
+    x = nb.silu(x)
     correction = x @ p["net.2.weight"] + p["net.2.bias"]
 
     return main_output + correction

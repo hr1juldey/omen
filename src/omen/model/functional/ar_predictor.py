@@ -6,8 +6,6 @@ but takes params dict directly.
 
 import nabla as nb
 
-from omen.kernels.activations import silu_gpu
-
 NUM_HEADS = 8
 NUM_LAYERS = 4
 HISTORY_SIZE = 3
@@ -50,7 +48,7 @@ def _mha_fn(attn_p, x, num_heads):
 def _block_fn(p, x, delta_emb, num_heads):
     """Functional ConditionalBlock with AdaLN-zero."""
     dim = int(x.shape[-1])
-    ada_out = _linear(silu_gpu(delta_emb), p["adaLN.1.weight"], p["adaLN.1.bias"])
+    ada_out = _linear(nb.silu(delta_emb), p["adaLN.1.weight"], p["adaLN.1.bias"])
 
     s1 = ada_out[:, 0:dim]
     sc1 = ada_out[:, dim : 2 * dim]
@@ -67,7 +65,7 @@ def _block_fn(p, x, delta_emb, num_heads):
     # MLP with modulation
     h = _layer_norm(x, p["norm2.weight"], p["norm2.bias"])
     h = h * (1 + nb.reshape(sc2, (-1, 1, dim))) + nb.reshape(s2, (-1, 1, dim))
-    mlp_h = silu_gpu(_linear(h, p["mlp.0.weight"], p["mlp.0.bias"]))
+    mlp_h = nb.silu(_linear(h, p["mlp.0.weight"], p["mlp.0.bias"]))
     mlp_out = _linear(mlp_h, p["mlp.2.weight"], p["mlp.2.bias"])
     x = x + nb.reshape(g2, (-1, 1, dim)) * mlp_out
 
