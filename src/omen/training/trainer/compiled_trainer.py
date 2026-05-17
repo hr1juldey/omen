@@ -1,4 +1,8 @@
-"""Compiled OmenTrainer — wraps compiled_step with tiling and checkpoints."""
+"""Compiled OmenTrainer — wraps compiled_step with tiling and checkpoints.
+
+Supports GPU training: detects accelerator, transfers params + opt states
++ tile tensors to GPU. Falls back to CPU if no GPU detected.
+"""
 
 import json
 import logging
@@ -6,6 +10,7 @@ import time
 
 import numpy as np
 import nabla as nb
+from max.driver import CPU, Accelerator, accelerator_count
 from nabla.nn.optim import adamw_init
 
 from omen.training.trainer.compiled_step import compiled_train_step
@@ -14,19 +19,49 @@ from omen.training.trainer.optimizers import COMPONENT_PREFIXES
 logger = logging.getLogger("omen.training.trainer.compiled")
 
 
+def _transfer(tree, device):
+    """Recursively transfer a pytree of nabla tensors to device."""
+
+    def _move(t):
+        if hasattr(t, "to_numpy"):
+            return nb.ops.transfer_to(t, device)
+        return t
+
+    if isinstance(tree, dict):
+        return {k: _transfer(v, device) for k, v in tree.items()}
+    return _move(tree)
+
+
 class CompiledOmenTrainer:
     """Training loop using @nb.compile for graph reuse and RAM stability.
 
     One-time ~300s warmup compiles forward+backward+optimizer into a
     single graph entry. Subsequent steps hit cache (~5ms/step).
     No clear_all() — graph is reused, not destroyed.
+
+    Automatically uses GPU if available, falls back to CPU.
     """
 
     def __init__(self, model, config, weight_decay=0.01):
         self.model = model
         self.config = config
         self.weight_decay = weight_decay
-        self.params = model.state_dict()
+
+        # Device: GPU if available, else CPU
+        if accelerator_count() > 0:
+            self.device = Accelerator()
+            logger.info("GPU detected — training on accelerator")
+        else:
+            self.device = CPU()
+            logger.info("No GPU — training on CPU")
+
+        # Transfer model params to device
+        cpu_params = model.state_dict()
+        self.params = _transfer(cpu_params, self.device)
+        n = len(self.params)
+        logger.info("Transferred %d param tensors to %s", n, self.device)
+
+        # Optimizer states (zeros_like inherits device from params)
         self.opt_states = self._init_opt_states()
         self.step_count = 0
 
@@ -51,6 +86,7 @@ class CompiledOmenTrainer:
             ):
                 if not c.moe:
                     continue
+            # adamw_init creates zeros_like — same device as params
             states[name] = adamw_init(subset)
         return states
 
@@ -59,10 +95,12 @@ class CompiledOmenTrainer:
         return self.step_count
 
     def _encode_scene(self, scene_input):
-        """Pre-encode scene graph outside compiled function."""
+        """Pre-encode scene graph outside compiled function, transfer to device."""
         if isinstance(scene_input, dict):
-            return self.model.scene_encoder(scene_input)
-        return scene_input
+            latent = self.model.scene_encoder(scene_input)
+        else:
+            latent = scene_input
+        return _transfer(latent, self.device)
 
     def train_step_tiled(self, noisy, gt, scene_input, tile_size=256):
         """Run compiled train step per tile, accumulate loss.
@@ -85,6 +123,10 @@ class CompiledOmenTrainer:
                 tile_noisy = noisy[:, y:y2, x:x2, :]
                 tile_gt = gt[:, y:y2, x:x2, :]
 
+                # Transfer tiles to device
+                tile_noisy = _transfer(tile_noisy, self.device)
+                tile_gt = _transfer(tile_gt, self.device)
+
                 new_p, new_s, loss = compiled_train_step(
                     self.params,
                     tile_noisy,
@@ -96,18 +138,22 @@ class CompiledOmenTrainer:
 
                 self.params = new_p
                 self.opt_states = new_s
-                total_loss += float(loss.to_numpy())
+
+                # Transfer loss to CPU for logging
+                loss_cpu = _transfer(loss, CPU())
+                total_loss += float(loss_cpu.to_numpy())
                 n_tiles += 1
 
         self.step_count += 1
         avg_loss = total_loss / max(n_tiles, 1)
         elapsed = time.time() - t0
         logger.info(
-            "Step %d: loss=%.2f tiles=%d time=%.1fs",
+            "Step %d: loss=%.2f tiles=%d time=%.1fs device=%s",
             self.step_count,
             avg_loss,
             n_tiles,
             elapsed,
+            self.device,
         )
         return {
             "total_loss": avg_loss,
@@ -128,17 +174,17 @@ class CompiledOmenTrainer:
         self.save_checkpoint(path)
 
     def save_checkpoint(self, path):
-        """Save params + optimizer states as .npz (safe serialization)."""
+        """Save params + optimizer states as .npz (transfers to CPU first)."""
         arrays = {}
         meta = {"step": self.step_count, "components": []}
         for k, v in self.params.items():
-            arrays[f"p/{k}"] = v.to_numpy()
+            arrays[f"p/{k}"] = _transfer(v, CPU()).to_numpy()
         for name, state in self.opt_states.items():
             meta["components"].append(name)
             for k, v in state["m"].items():
-                arrays[f"opt/{name}/m/{k}"] = v.to_numpy()
+                arrays[f"opt/{name}/m/{k}"] = _transfer(v, CPU()).to_numpy()
             for k, v in state["v"].items():
-                arrays[f"opt/{name}/v/{k}"] = v.to_numpy()
+                arrays[f"opt/{name}/v/{k}"] = _transfer(v, CPU()).to_numpy()
             step_val = state["step"]
             arrays[f"opt/{name}/step"] = np.array(
                 float(step_val) if hasattr(step_val, "to_numpy") else step_val
@@ -148,26 +194,37 @@ class CompiledOmenTrainer:
         logger.info("Checkpoint saved to %s (step %d)", path, self.step_count)
 
     def load_checkpoint(self, path):
-        """Load params + optimizer states from .npz checkpoint."""
+        """Load params + optimizer states from .npz, transfer to device."""
         data = np.load(path, allow_pickle=False)
         meta = json.loads(str(data["_meta"]))
         self.step_count = meta["step"]
+        # Load to CPU first, then transfer to device
         self.params = {}
         for k in data.files:
             if k.startswith("p/"):
-                self.params[k[2:]] = nb.Tensor.from_dlpack(data[k])
+                cpu_t = nb.Tensor.from_dlpack(data[k])
+                self.params[k[2:]] = _transfer(cpu_t, self.device)
         self.opt_states = {}
         for name in meta["components"]:
             m = {
-                k[2 + len(name) + 4 :]: nb.Tensor.from_dlpack(data[k])
+                k[2 + len(name) + 4 :]: _transfer(
+                    nb.Tensor.from_dlpack(data[k]), self.device
+                )
                 for k in data.files
                 if k.startswith(f"opt/{name}/m/")
             }
             v = {
-                k[2 + len(name) + 4 :]: nb.Tensor.from_dlpack(data[k])
+                k[2 + len(name) + 4 :]: _transfer(
+                    nb.Tensor.from_dlpack(data[k]), self.device
+                )
                 for k in data.files
                 if k.startswith(f"opt/{name}/v/")
             }
             step = float(data[f"opt/{name}/step"])
             self.opt_states[name] = {"m": m, "v": v, "step": step}
-        logger.info("Checkpoint loaded from %s (step %d)", path, self.step_count)
+        logger.info(
+            "Checkpoint loaded from %s (step %d, device=%s)",
+            path,
+            self.step_count,
+            self.device,
+        )
