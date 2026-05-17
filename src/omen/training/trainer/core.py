@@ -24,7 +24,9 @@ except (ImportError, RuntimeError):
 
 DEFAULT_LR = 5e-5
 DEFAULT_WEIGHT_DECAY = 1e-3
-DEFAULT_GRADIENT_CLIP = 1.0
+DEFAULT_GRADIENT_CLIP = (
+    1e8  # High default — prevents grad explosion without killing learning
+)
 
 
 class OmenTrainer:
@@ -67,6 +69,7 @@ class OmenTrainer:
         )
 
         self._compiled_step = None
+        self._eager_fallback_detected = False
 
         self._init_compiled_step()
 
@@ -130,12 +133,15 @@ class OmenTrainer:
         gt_tiles = extract_tiles(gt_full, tile_size)
 
         total_loss = 0.0
+        last_grad_norm = 0.0
         for tile_noisy, tile_gt in zip(noisy_tiles, gt_tiles):
-            total_loss += self._train_single_tile(
+            tile_loss, grad_norm = self._train_single_tile(
                 tile_noisy, tile_gt, sg_tensor, z_score
             )
-            # Compiled mode: graph cached once, reused per tile (same shapes).
-            # Eager fallback: each call leaks a 6-8GB graph entry, must clear.
+            total_loss += tile_loss
+            last_grad_norm = grad_norm
+            # Clear graph after each tile in eager mode to prevent RAM leak.
+            # Compiled mode reuses graph (no accumulation).
             if self._compiled_step is None:
                 nb.GRAPH.clear_all()
 
@@ -146,6 +152,7 @@ class OmenTrainer:
             "num_tiles": len(noisy_tiles),
             "iteration": self.iteration,
             "z_score": z_score,
+            "grad_norm": last_grad_norm,
         }
 
     def _to_nabla_scene_graph(self, scene_graph):
@@ -177,8 +184,6 @@ class OmenTrainer:
 
         return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
 
-        return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
-
     def _run_tile(self, noisy, gt, scene_latent, z_score):
         """Core training step for one tile.
 
@@ -190,6 +195,16 @@ class OmenTrainer:
 
         if self._compiled_step is not None:
             grads, total_loss = self._compiled_step(params, noisy, gt, scene_latent)
+            # Check if @nb.compile fell back to eager — causes RAM leak if unchecked
+            stats = self._compiled_step.stats
+            if stats.fallbacks > 0 and not self._eager_fallback_detected:
+                self._eager_fallback_detected = True
+                logger.warning(
+                    "@nb.compile fell back to eager (%d fallbacks). "
+                    "Switching to eager+clear_all mode to prevent RAM leak.",
+                    stats.fallbacks,
+                )
+                self._compiled_step = None
         else:
             total_loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
                 params, self.model, noisy, gt, scene_latent, self.config
@@ -197,10 +212,12 @@ class OmenTrainer:
 
         loss_val = float(total_loss.to_numpy().sum())
         realized_grads = self._realize_grads(grads, params)
-        clipped_grads = clip_grad_norm_pytree(realized_grads, DEFAULT_GRADIENT_CLIP)
+        clipped_grads, grad_norm = clip_grad_norm_pytree(
+            realized_grads, DEFAULT_GRADIENT_CLIP, return_norm=True
+        )
         new_params = self._apply_optimizer_updates(params, clipped_grads, z_score)
         self.model.load_state_dict(new_params)
-        return loss_val
+        return loss_val, grad_norm
 
     def _tile_to_tensor(self, tile_data):
         """Convert numpy tile to nabla tensor (1, H, W, 4)."""
