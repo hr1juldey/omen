@@ -68,37 +68,14 @@ class OmenTrainer:
             self.model, self.config, self.weight_decay
         )
 
-        self._compiled_step = None
-        self._eager_fallback_detected = False
-
-        self._init_compiled_step()
+        # NOTE: @nb.compile is deliberately NOT used here.
+        # It traces Python side effects (model.load_state_dict) only once,
+        # then replays only nabla ops on cache hits — so model weights never
+        # actually update, producing identical loss every step.
+        # Eager value_and_grad + clear_all() after each tile is correct.
 
     def _init_compiled_step(self):
-        """Create compiled forward+backward step for graph cache reuse.
-
-        Following nabla's official examples (Transformer, CNN), the entire
-        ``value_and_grad`` call is wrapped in ``@nb.compile`` so the graph
-        is compiled ONCE and reused for every tile.  Same tile size means
-        same input shapes means cache hit — no accumulation, no RAM bomb.
-
-        Falls back to eager mode (with ``clear_all``) if compile fails.
-        """
-        try:
-            model = self.model
-            config = self.config
-
-            @nb.compile
-            def _compiled_fwd_bwd(params, noisy, gt, scene_latent):
-                loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
-                    params, model, noisy, gt, scene_latent, config
-                )
-                return grads, loss
-
-            self._compiled_step = _compiled_fwd_bwd
-            logger.info("Compiled training step ready (graph will be cached)")
-        except Exception as e:
-            logger.warning("@nb.compile not available, using eager mode: %s", e)
-            self._compiled_step = None
+        """No-op — kept for interface compat."""
 
     def train_step(self, noisy, ground_truth, scene_graph, z_score=0.0):
         """Single training step via ``nb.value_and_grad``."""
@@ -140,10 +117,8 @@ class OmenTrainer:
             )
             total_loss += tile_loss
             last_grad_norm = grad_norm
-            # Clear graph after each tile in eager mode to prevent RAM leak.
-            # Compiled mode reuses graph (no accumulation).
-            if self._compiled_step is None:
-                nb.GRAPH.clear_all()
+            # Always clear graph after each tile to prevent RAM leak.
+            nb.GRAPH.clear_all()
 
         avg_loss = total_loss / len(noisy_tiles)
         self.iteration += 1
@@ -185,30 +160,17 @@ class OmenTrainer:
         return self._run_tile(noisy_tensor, gt_tensor, scene_latent, z_score)
 
     def _run_tile(self, noisy, gt, scene_latent, z_score):
-        """Core training step for one tile.
+        """Core training step for one tile (eager mode).
 
-        Uses ``@nb.compile`` when available so the forward+backward graph
-        is compiled once and reused (no graph cache accumulation).
-        Falls back to eager ``value_and_grad`` when compile is unavailable.
+        Always uses eager ``nb.value_and_grad`` so ``model.load_state_dict``
+        actually executes every call (unlike ``@nb.compile`` which only
+        traces it once).
         """
         params = self.model.state_dict()
 
-        if self._compiled_step is not None:
-            grads, total_loss = self._compiled_step(params, noisy, gt, scene_latent)
-            # Check if @nb.compile fell back to eager — causes RAM leak if unchecked
-            stats = self._compiled_step.stats
-            if stats.fallbacks > 0 and not self._eager_fallback_detected:
-                self._eager_fallback_detected = True
-                logger.warning(
-                    "@nb.compile fell back to eager (%d fallbacks). "
-                    "Switching to eager+clear_all mode to prevent RAM leak.",
-                    stats.fallbacks,
-                )
-                self._compiled_step = None
-        else:
-            total_loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
-                params, self.model, noisy, gt, scene_latent, self.config
-            )
+        total_loss, grads = nb.value_and_grad(compute_training_loss, argnums=0)(
+            params, self.model, noisy, gt, scene_latent, self.config
+        )
 
         loss_val = float(total_loss.to_numpy().sum())
         realized_grads = self._realize_grads(grads, params)
@@ -216,7 +178,11 @@ class OmenTrainer:
             realized_grads, DEFAULT_GRADIENT_CLIP, return_norm=True
         )
         new_params = self._apply_optimizer_updates(params, clipped_grads, z_score)
-        self.model.load_state_dict(new_params)
+        # Realize new params to break lazy-tensor chain that causes RAM leak.
+        # Without this, adamw_update returns lazy tensors that reference the
+        # forward graph, and they accumulate across iterations.
+        realized_params = self._realize_params(new_params)
+        self.model.load_state_dict(realized_params)
         return loss_val, grad_norm
 
     def _tile_to_tensor(self, tile_data):
@@ -246,6 +212,20 @@ class OmenTrainer:
                 realized[name] = g
             else:
                 realized[name] = nb.Tensor.from_dlpack(g.to_numpy())
+        return realized
+
+    def _realize_params(self, params):
+        """Realize lazy optimizer output tensors to break the computation chain.
+
+        ``adamw_update`` returns lazy nabla tensors.  If stored directly into
+        the model, the next ``state_dict()`` call returns lazy tensors whose
+        graph references keep accumulating — each iteration chains onto the
+        previous one, leaking ~1-3 GB RAM per step.
+        """
+        realized = {}
+        for name, t in params.items():
+            arr = t.to_numpy()
+            realized[name] = nb.Tensor.from_dlpack(arr)
         return realized
 
     def _compute_scheduled_lr(self, component_name, z_score=0.0):
