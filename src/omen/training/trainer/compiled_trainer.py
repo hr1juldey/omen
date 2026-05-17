@@ -60,10 +60,10 @@ class CompiledOmenTrainer:
         self.config = config
         self.weight_decay = weight_decay
 
-        # Device: GPU if available, else CPU
+        # Device: CPU for now (GPU @nb.compile uses 25GB RAM during compilation)
         if accelerator_count() > 0:
-            self.device = Accelerator()
-            logger.info("GPU detected — training on accelerator")
+            self.device = CPU()  # TODO: switch to Accelerator() when RAM is fixed
+            logger.info("GPU available but using CPU for compilation RAM safety")
         else:
             self.device = CPU()
             logger.info("No GPU — training on CPU")
