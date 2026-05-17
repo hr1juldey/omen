@@ -11,10 +11,10 @@ import time
 import numpy as np
 import nabla as nb
 from max.driver import CPU, Accelerator, accelerator_count
-from nabla.nn.optim import adamw_init
+from nabla.nn.optim import adamw_init, adamw_update
 
-from omen.training.trainer.compiled_step import compiled_train_step
-from omen.training.trainer.optimizers import COMPONENT_PREFIXES
+from omen.training.trainer.compiled_step import compiled_loss_and_grads
+from omen.training.trainer.optimizers import COMPONENT_LRS, COMPONENT_PREFIXES
 
 logger = logging.getLogger("omen.training.trainer.compiled")
 
@@ -172,17 +172,46 @@ class CompiledOmenTrainer:
                 tile_noisy = _transfer(tile_noisy, self.device)
                 tile_gt = _transfer(tile_gt, self.device)
 
-                new_p, new_s, loss = compiled_train_step(
+                # Compiled forward + backward (no optimizer inside — avoids
+                # nabla's adamw_step CPU scalar device mismatch on GPU)
+                loss, grads = compiled_loss_and_grads(
                     self.params,
                     tile_noisy,
                     tile_gt,
                     scene_latent,
-                    self.opt_states,
-                    self.weight_decay,
                 )
 
-                self.params = new_p
-                self.opt_states = new_s
+                # Eager per-component AdamW update (CPU scalars OK in eager mode)
+                new_params = dict(self.params)
+                new_states = {}
+                for name in sorted(COMPONENT_LRS.keys()):
+                    if name not in self.opt_states:
+                        continue
+                    prefixes = COMPONENT_PREFIXES[name]
+                    subset_p = {
+                        k: new_params[k]
+                        for k in self.params
+                        if any(k.startswith(p) for p in prefixes)
+                    }
+                    subset_g = {
+                        k: grads[k]
+                        for k in grads
+                        if any(k.startswith(p) for p in prefixes)
+                    }
+                    if not subset_p:
+                        continue
+                    updated_p, updated_state = adamw_update(
+                        subset_p,
+                        subset_g,
+                        self.opt_states[name],
+                        lr=COMPONENT_LRS[name],
+                        weight_decay=self.weight_decay,
+                    )
+                    new_params.update(updated_p)
+                    new_states[name] = updated_state
+
+                self.params = new_params
+                self.opt_states = new_states
 
                 # Transfer loss to CPU for logging
                 loss_cpu = _transfer(loss, CPU())
