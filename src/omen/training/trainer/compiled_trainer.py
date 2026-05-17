@@ -228,6 +228,12 @@ class CompiledOmenTrainer:
                 self.params = new_params
                 self.opt_states = new_states
 
+                # Realize all lazy tensors — breaks computation graph chain
+                # that would otherwise accumulate across steps (RAM leak)
+                nb.realize_all(*self.params.values())
+                for s in self.opt_states.values():
+                    nb.realize_all(*s["m"].values(), *s["v"].values())
+
                 # Transfer loss to CPU for logging
                 loss_cpu = _transfer(loss, CPU())
                 total_loss += float(loss_cpu.to_numpy())
