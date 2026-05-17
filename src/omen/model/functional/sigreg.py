@@ -2,6 +2,8 @@
 
 import nabla as nb
 
+from omen.kernels.activations import square
+
 
 def sigreg_fn(predicted_latent, config=None):
     """Compute variance regularization loss (pure ops, 0 params).
@@ -17,6 +19,6 @@ def sigreg_fn(predicted_latent, config=None):
     """
     eps = 1e-6
     mean = nb.mean(predicted_latent, axis=0)
-    var = nb.mean((predicted_latent - mean) ** 2, axis=0)
+    var = nb.mean(square(predicted_latent - mean), axis=0)
     std = nb.sqrt(var + eps)
     return -nb.mean(nb.log(std + eps))

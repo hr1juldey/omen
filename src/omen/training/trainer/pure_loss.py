@@ -2,10 +2,12 @@
 
 Chains functional sub-modules from omen.model.functional.
 No model.load_state_dict — takes flat params dict directly.
+Uses square() instead of **2 / F.mse_loss to avoid pow VJP device mismatch.
 """
 
-import nabla.nn.functional as F
+import nabla as nb
 
+from omen.kernels.activations import square
 from omen.model.functional import (
     _extract_prefix,
     cross_attn_fn,
@@ -14,6 +16,11 @@ from omen.model.functional import (
     sigreg_fn,
 )
 from omen.model.jepa import SIGREG_LAMBDA
+
+
+def _mse(a, b):
+    """GPU-safe MSE: mean((a - b)^2) using square() not pow."""
+    return nb.mean(square(a - b))
 
 
 def pure_loss_fn(params, noisy, gt, scene_latent, config):
@@ -47,8 +54,8 @@ def pure_loss_fn(params, noisy, gt, scene_latent, config):
     gt_residual = gt[:, :, :, :3] - noisy_rgb
 
     # Loss: latent prediction + noise prediction + SIGReg
-    pred_loss = F.mse_loss(predicted_latent, target_latent)
-    pred_loss = pred_loss + F.mse_loss(predicted_noise, gt_residual)
+    pred_loss = _mse(predicted_latent, target_latent)
+    pred_loss = pred_loss + _mse(predicted_noise, gt_residual)
     reg_loss = sigreg_fn(predicted_latent, config)
 
     return pred_loss + SIGREG_LAMBDA * reg_loss

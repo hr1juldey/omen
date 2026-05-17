@@ -5,18 +5,18 @@ Mirrors CrossAttentionFusion.forward but takes params dict directly.
 
 import nabla as nb
 
-from omen.kernels.activations import sigmoid_gpu
+from omen.kernels.activations import sigmoid_gpu, square
 
 
 def _linear(x, weight, bias):
-    """Functional linear: x @ W^T + b."""
+    """Functional linear: x @ W + b."""
     return x @ weight + bias
 
 
 def _layer_norm(x, weight, bias, eps=1e-5):
-    """Functional layer norm."""
+    """Functional layer norm — uses square() not **2 for GPU safety."""
     mean = x.mean(axis=-1, keepdims=True)
-    var = ((x - mean) ** 2).mean(axis=-1, keepdims=True)
+    var = square(x - mean).mean(axis=-1, keepdims=True)
     return (x - mean) / nb.sqrt(var + eps) * weight + bias
 
 

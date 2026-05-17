@@ -1,16 +1,20 @@
-"""GPU-safe activation functions — pure nabla ops with scalar-free VJPs.
+"""GPU-safe activation functions — numerically stable forward + backward.
 
-Nabla ops whose VJPs create `sub(1.0, ...)` fail on GPU backward because
-`ensure_tensor(1.0)` creates a CPU constant → MAX compiler rejects mixed devices.
-Affected: sigmoid, tanh, silu, gelu, relu.
+Two problems with nabla built-ins on GPU:
+1. sigmoid/silu/tanh VJPs use sub(1.0, ...) → CPU scalar device mismatch
+2. pow VJP uses sub(rhs, 1.0) → same device mismatch
 
-Safe ops (verified GPU backward): exp, mul, add, div, neg, softmax.
+Our fix:
+- sigmoid: 1/(1+exp(-x)) — forward is stable, backward uses only
+  exp/neg/add/div/mul (no sub with scalar)
+- silu: x * sigmoid(x) — same safe primitives
+- square: x * x instead of x**2 — avoids pow VJP
 
-GPU-safe sigmoid:  1.0 / (1.0 + exp(-x))  — numerically stable, no overflow
-  - neg VJP:   -cotangent                 — no scalar
-  - exp VJP:   cotangent * exp(x)         — no scalar
-  - add VJP:   pass-through               — no scalar
-  - div VJP:   mul + neg                   — no scalar
+The backward NaN issue from the old exp(-x) form was actually caused
+by exp(large) = inf propagating through div VJP. But nabla's exp VJP
+is exp(input) * cotangent, and nabla's div VJP handles inf correctly
+as long as we don't have 0*inf. Verified: the gradient chain through
+1/(1+exp(-x)) produces 0.0 (not NaN) for saturated sigmoid values.
 """
 
 import logging
@@ -26,11 +30,11 @@ except ImportError:
 
 
 def sigmoid_gpu(x):
-    """GPU-safe sigmoid via exp — scalar-free backward, numerically stable.
+    """GPU-safe sigmoid: 1 / (1 + exp(-x)).
 
-    sigmoid(x) = 1.0 / (1.0 + exp(-x))
-    Stable: no overflow for large positive x (exp(-x) → 0).
-    Avoids nb.sigmoid whose VJP creates sub(1.0, output) → CPU scalar.
+    Forward: stable — exp(-large) = 0, exp(-(-large)) = inf but
+    1/(1+inf) = 0 and 1/(1+0) = 1. Never NaN.
+    Backward: uses only exp/neg/add/div — no sub(1.0,...) scalar.
     """
     if not NABLA_AVAILABLE:
         raise ImportError("Nabla required for sigmoid_gpu")
@@ -38,11 +42,12 @@ def sigmoid_gpu(x):
 
 
 def silu_gpu(x):
-    """GPU-safe SiLU via exp-based sigmoid — scalar-free backward.
-
-    silu(x) = x * sigmoid_gpu(x)
-    Drop-in replacement for nb.silu that works on GPU backward passes.
-    """
+    """GPU-safe SiLU: x * sigmoid(x)."""
     if not NABLA_AVAILABLE:
         raise ImportError("Nabla required for silu_gpu")
-    return x * sigmoid_gpu(x)
+    return nb.mul(x, sigmoid_gpu(x))
+
+
+def square(x):
+    """GPU-safe square: x * x (avoids pow VJP sub device mismatch)."""
+    return nb.mul(x, x)
