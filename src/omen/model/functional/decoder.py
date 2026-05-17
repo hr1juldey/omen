@@ -78,6 +78,7 @@ def decoder_fn(p, latent, noisy_image):
     )
 
     out = conv2d_safe(d2, p["d1"], padding=(1, 1))
+    out = nb.tanh(out)  # Bound output to [-1, 1] — prevents gradient explosion
 
     H, W = int(noisy_image.shape[1]), int(noisy_image.shape[2])
     if int(out.shape[1]) != H or int(out.shape[2]) != W:
