@@ -241,7 +241,11 @@ def main():
     model = OmenJEPA(config=config)
     if args.compiled:
         logger.info("Using compiled trainer (@nb.compile, graph reuse)")
-        trainer = CompiledOmenTrainer(model, config=config)
+        trainer = CompiledOmenTrainer(
+            model, config=config,
+            warmup_steps=args.lr_warmup,
+            total_steps=args.total_steps,
+        )
     else:
         logger.info("Using eager trainer (debugging mode)")
         trainer = OmenTrainer(

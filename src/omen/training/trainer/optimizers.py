@@ -9,15 +9,15 @@ logger = logging.getLogger("omen.training.trainer.optimizers")
 
 # Per-component base learning rates
 COMPONENT_LRS = {
-    "encoder": 5e-5,
-    "decoder": 5e-5,
-    "shared_expert": 5e-5,
-    "material_experts": 5e-5,
-    "light_experts": 3e-5,
-    "geometry_experts": 4e-5,
-    "motion_experts": 5e-5,
-    "ar_predictor": 5e-5,
-    "episodic_correction": 2e-2,
+    "encoder": 5e-6,
+    "decoder": 5e-6,
+    "shared_expert": 5e-6,
+    "material_experts": 5e-6,
+    "light_experts": 3e-6,
+    "geometry_experts": 4e-6,
+    "motion_experts": 5e-6,
+    "ar_predictor": 5e-6,
+    "episodic_correction": 2e-3,
 }
 
 # Per-component state_dict key prefixes (model attribute names)

@@ -55,10 +55,13 @@ class CompiledOmenTrainer:
     Automatically uses GPU if available, falls back to CPU.
     """
 
-    def __init__(self, model, config, weight_decay=0.01):
+    def __init__(self, model, config, weight_decay=0.01,
+                 warmup_steps=0, total_steps=1000):
         self.model = model
         self.config = config
         self.weight_decay = weight_decay
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
 
         # Device: CPU for now (GPU @nb.compile uses 25GB RAM during compilation)
         if accelerator_count() > 0:
@@ -109,6 +112,17 @@ class CompiledOmenTrainer:
     @property
     def iteration(self):
         return self.step_count
+
+    def _scaled_lr(self, base_lr):
+        """Linear warmup then cosine decay to 0 over total_steps."""
+        step = self.step_count
+        # Warmup: 0 -> base_lr over warmup_steps
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            return base_lr * (step + 1) / self.warmup_steps
+        # Cosine decay after warmup
+        progress = (step - self.warmup_steps) / max(self.total_steps - self.warmup_steps, 1)
+        progress = min(progress, 1.0)
+        return base_lr * 0.5 * (1.0 + __import__("math").cos(__import__("math").pi * progress))
 
     def _encode_scene(self, scene_input):
         """Pre-encode scene graph on CPU, then transfer latent to device.
@@ -200,11 +214,12 @@ class CompiledOmenTrainer:
                     }
                     if not subset_p:
                         continue
+                    lr = self._scaled_lr(COMPONENT_LRS[name])
                     updated_p, updated_state = adamw_update(
                         subset_p,
                         subset_g,
                         self.opt_states[name],
-                        lr=COMPONENT_LRS[name],
+                        lr=lr,
                         weight_decay=self.weight_decay,
                     )
                     new_params.update(updated_p)
@@ -222,12 +237,13 @@ class CompiledOmenTrainer:
         avg_loss = total_loss / max(n_tiles, 1)
         elapsed = time.time() - t0
         logger.info(
-            "Step %d: loss=%.2f tiles=%d time=%.1fs device=%s",
+            "Step %d: loss=%.2f tiles=%d time=%.1fs device=%s lr=%.2e",
             self.step_count,
             avg_loss,
             n_tiles,
             elapsed,
             self.device,
+            self._scaled_lr(COMPONENT_LRS.get("encoder", 5e-5)),
         )
         return {
             "total_loss": avg_loss,
