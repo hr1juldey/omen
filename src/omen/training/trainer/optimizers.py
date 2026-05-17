@@ -20,6 +20,19 @@ COMPONENT_LRS = {
     "episodic_correction": 2e-2,
 }
 
+# Per-component state_dict key prefixes (model attribute names)
+COMPONENT_PREFIXES = {
+    "encoder": ["scene_encoder.", "render_encoder.", "fusion.", "confidence_head."],
+    "decoder": ["decoder."],
+    "shared_expert": ["moe.shared"],
+    "material_experts": ["moe.materials"],
+    "light_experts": ["moe.lights"],
+    "geometry_experts": ["moe.geometry"],
+    "motion_experts": ["moe.motion"],
+    "ar_predictor": ["ar_predictor.", "delta_encoder."],
+    "episodic_correction": ["episodic."],
+}
+
 
 def _collect_param_names(model, prefix):
     """Return list of param names starting with *prefix*."""
@@ -53,12 +66,7 @@ def create_functional_optimizers(model, config, weight_decay):
     # Core encoder group
     add_component(
         "encoder",
-        [
-            "scene_encoder.",
-            "render_encoder.",
-            "cross_attn.",
-            "confidence_head.",
-        ],
+        COMPONENT_PREFIXES["encoder"],
     )
     add_component("decoder", ["decoder."])
 

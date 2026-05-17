@@ -12,6 +12,7 @@ from omen.gpu_budget import can_fit_tiles, get_gpu_memory_info
 from omen.model.jepa import OmenJEPA
 from omen.scenes import SCENE_REGISTRY
 from omen.training.online_gen import TrainingDataGenerator
+from omen.training.trainer.compiled_trainer import CompiledOmenTrainer
 from omen.training.trainer.core import OmenTrainer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -69,11 +70,19 @@ def _train_on_data(
     model architecture) or if RAM is critically high.
     """
     # RAM guard — abort before OOM kills the process
+    # Compiled mode: ~25GB peak during warmup is expected, only abort
+    # if steady-state exceeds limit.
     ram_mb = _system_ram_mb()
     if ram_mb > ram_limit_gb * 1024:
-        raise MemoryError(
-            f"RAM {ram_mb}MB exceeds {ram_limit_gb}GB limit — stopping before OOM"
-        )
+        if step_idx == 0 and flush_graph is False:
+            logger.warning(
+                "RAM %dMB high during warmup (compiled mode expects ~25GB peak)",
+                ram_mb,
+            )
+        else:
+            raise MemoryError(
+                f"RAM {ram_mb}MB exceeds {ram_limit_gb}GB limit — stopping before OOM"
+            )
 
     all_metrics = []
     for sub_idx in range(steps_per_frame):
@@ -178,6 +187,18 @@ def main():
         help=f"Abort if system RAM exceeds this many GB (default: {DEFAULT_RAM_LIMIT_GB})",
     )
     parser.add_argument(
+        "--compiled",
+        action="store_true",
+        default=True,
+        help="Use @nb.compile for graph reuse (default: True)",
+    )
+    parser.add_argument(
+        "--no-compiled",
+        dest="compiled",
+        action="store_false",
+        help="Use eager trainer (for debugging)",
+    )
+    parser.add_argument(
         "--gt-spp",
         type=int,
         default=512,
@@ -218,12 +239,17 @@ def main():
     # Setup
     config = OmenConfig.v1_dense()
     model = OmenJEPA(config=config)
-    trainer = OmenTrainer(
-        model,
-        config=config,
-        warmup_steps=args.lr_warmup,
-        total_steps=args.total_steps,
-    )
+    if args.compiled:
+        logger.info("Using compiled trainer (@nb.compile, graph reuse)")
+        trainer = CompiledOmenTrainer(model, config=config)
+    else:
+        logger.info("Using eager trainer (debugging mode)")
+        trainer = OmenTrainer(
+            model,
+            config=config,
+            warmup_steps=args.lr_warmup,
+            total_steps=args.total_steps,
+        )
 
     # Resume from checkpoint
     if args.resume:
