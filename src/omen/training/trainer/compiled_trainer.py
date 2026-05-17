@@ -228,11 +228,21 @@ class CompiledOmenTrainer:
                 self.params = new_params
                 self.opt_states = new_states
 
-                # Realize all lazy tensors — breaks computation graph chain
-                # that would otherwise accumulate across steps (RAM leak)
-                nb.realize_all(*self.params.values())
-                for s in self.opt_states.values():
-                    nb.realize_all(*s["m"].values(), *s["v"].values())
+                # Break lazy graph chain — realize_all computes but graph
+                # nodes persist in nabla engine (RAM leak). Converting to
+                # numpy creates fresh tensors with no graph history.
+                for k in list(self.params.keys()):
+                    self.params[k] = nb.Tensor.from_dlpack(
+                        self.params[k].to_numpy().astype(np.float32)
+                    )
+                for name in self.opt_states:
+                    for kind in ("m", "v"):
+                        for k in list(self.opt_states[name][kind].keys()):
+                            self.opt_states[name][kind][k] = nb.Tensor.from_dlpack(
+                                self.opt_states[name][kind][k].to_numpy().astype(
+                                    np.float32
+                                )
+                            )
 
                 # Transfer loss to CPU for logging
                 loss_cpu = _transfer(loss, CPU())
