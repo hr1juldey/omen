@@ -90,7 +90,8 @@ class OmenTrainer:
         realized_grads = self._realize_grads(grads, params)
         clipped_grads = clip_grad_norm_pytree(realized_grads, DEFAULT_GRADIENT_CLIP)
         new_params = self._apply_optimizer_updates(params, clipped_grads, z_score)
-        self.model.load_state_dict(new_params)
+        realized_params = self._realize_params(new_params)
+        self.model.load_state_dict(realized_params)
 
         self.iteration += 1
         return {
@@ -228,6 +229,30 @@ class OmenTrainer:
             realized[name] = nb.Tensor.from_dlpack(arr)
         return realized
 
+    def _realize_optimizer_state(self, state):
+        """Realize lazy optimizer state (m, v, step) to break graph chain.
+
+        ``adamw_update`` returns lazy m/v tensors that reference the forward
+        graph.  Without realizing, they accumulate across steps — the dominant
+        source of RAM growth (~2GB/step).
+        """
+        if not isinstance(state, dict):
+            return state
+        realized = {}
+        for key, val in state.items():
+            if isinstance(val, dict):
+                realized[key] = self._realize_optimizer_state(val)
+            elif isinstance(val, list):
+                realized[key] = [
+                    nb.Tensor.from_dlpack(v.to_numpy()) if hasattr(v, "to_numpy") else v
+                    for v in val
+                ]
+            elif hasattr(val, "to_numpy"):
+                realized[key] = nb.Tensor.from_dlpack(val.to_numpy())
+            else:
+                realized[key] = val
+        return realized
+
     def _compute_scheduled_lr(self, component_name, z_score=0.0):
         """Compute LR with warmup + cosine decay + optional surprise modulation."""
         base_lr = self._components[component_name]["lr"]
@@ -268,7 +293,7 @@ class OmenTrainer:
                 weight_decay=comp["weight_decay"],
             )
 
-            comp["state"] = new_state
+            comp["state"] = self._realize_optimizer_state(new_state)
             for k, v in updated_p.items():
                 new_params[k] = v
         return new_params
