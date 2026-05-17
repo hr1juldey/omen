@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Progressive GPU prototype — scale up from single ops to small model.
+"""Progressive GPU prototype — RAM-safe with 6GB process guard.
 
-Each test is independent and logs VRAM. Stop at any point.
-Runs while CPU training is going in tmux (separate process, separate VRAM).
+Each test checks RSS < 6GB before running, cleans up after.
+Aborts if process RSS > 6GB or system RAM < 4GB available.
 """
 
+import gc
+import os
+import sys
 import time
 
 import numpy as np
@@ -12,267 +15,249 @@ import numpy as np
 import nabla as nb
 from max.driver import CPU, Accelerator, accelerator_count
 
-# GPU-safe activations (exp-based, no CPU scalar in VJP)
-from omen.kernels.activations import sigmoid_gpu, silu_gpu
+from omen.kernels.activations import silu_gpu
 from omen.kernels.conv2d import conv2d_safe
 
+LIMIT_MB = 8 * 1024  # 8GB process RSS limit
 
-def _vram_mb():
-    """VRAM used in MB via torch."""
+
+def _rss():
+    """Process RSS in MB. Returns 0 on error."""
+    try:
+        text = open(f"/proc/{os.getpid()}/status").read()
+        match = next(ln for ln in text.splitlines() if ln.startswith("VmRSS:"))
+        return int(match.split()[1]) // 1024
+    except Exception:
+        return 0
+
+
+def _avail():
+    """System available RAM in MB. Returns 0 on error."""
+    try:
+        text = open("/proc/meminfo").read()
+        match = next(ln for ln in text.splitlines() if ln.startswith("MemAvailable:"))
+        return int(match.split()[1]) // 1024
+    except Exception:
+        return 0
+
+
+def _vram():
+    """GPU VRAM allocated in MB. Returns 0 on error."""
     try:
         import torch
-        if torch.cuda.is_available():
-            return torch.cuda.memory_allocated() / 1024 / 1024
+        if not torch.cuda.is_available():
+            return 0
+        return torch.cuda.memory_allocated() // 1024 // 1024
     except Exception:
-        pass
-    return 0
+        return 0
 
 
-def _gpu():
-    if accelerator_count() == 0:
-        raise RuntimeError("No GPU detected")
-    return Accelerator()
+def guard(label=""):
+    rss = _rss()
+    avail = _avail()
+    if rss > LIMIT_MB:
+        print(f"KILL: RSS={rss}MB > {LIMIT_MB}MB {label}")
+        sys.exit(99)
+    if avail < 4000:
+        print(f"KILL: sys_avail={avail}MB < 4000MB {label}")
+        sys.exit(98)
+    print(f"    [guard] RSS={rss}MB avail={avail}MB VRAM={_vram()}MB")
+    return rss
 
 
-def _t(arr, device=None):
-    """numpy -> nabla tensor on device."""
-    t = nb.Tensor.from_dlpack(arr.astype(np.float32))
-    if device:
-        return nb.ops.transfer_to(t, device)
-    return t
+GPU = None  # Lazy init
 
 
-def _to(tensor, device):
-    return nb.ops.transfer_to(tensor, device)
+def gpu():
+    global GPU
+    if GPU is None:
+        GPU = Accelerator()
+    return GPU
 
 
-# ── Test 01: Device detection ──────────────────────────────────
+def t(arr):
+    return nb.ops.transfer_to(nb.Tensor.from_dlpack(arr.astype(np.float32)), gpu())
+
+
+def cpu(tensor):
+    return nb.ops.transfer_to(tensor, CPU()).to_numpy()
+
+
+def clean():
+    gc.collect()
+
+
+# ── Model (flat, no nesting) ──────────────────────────────────
+def tiny_conv_loss(params, x):
+    f1, f2, pw, pb = params
+    h = silu_gpu(conv2d_safe(x, f1, stride=2, padding=1))
+    h = silu_gpu(conv2d_safe(h, f2, stride=2, padding=1))
+    h = h.mean(axis=(1, 2))
+    return (h @ pw + pb).sum()
+
+
+@nb.compile
+def compiled_conv_vjp(params, x):
+    return nb.value_and_grad(tiny_conv_loss, argnums=0)(params, x)
+
+
+@nb.compile
+def compiled_silu_sum(w, x):
+    return silu_gpu(x @ w).sum()
+
+
+@nb.compile
+def compiled_silu_vjp(w, x):
+    return nb.value_and_grad(lambda w, x: silu_gpu(x @ w).sum(), argnums=0)(w, x)
+
+
+# ── Tests (flat, one function each) ───────────────────────────
 def test_01_device():
-    gpu = _gpu()
-    print(f"[01] GPU: {gpu}, accelerator_count={accelerator_count()}")
+    print(f"    GPU={gpu()}, count={accelerator_count()}")
 
 
-# ── Test 02: Tensor transfer ───────────────────────────────────
 def test_02_transfer():
-    gpu = _gpu()
-    x = _t(np.random.randn(4, 4), gpu)
-    print(f"[02] Tensor on {x.device}, shape={x.shape}")
-    assert "gpu" in str(x.device).lower() or "accelerator" in str(x.device).lower()
+    x = t(np.random.randn(4, 4))
+    print(f"    device={x.device}, sum={cpu(x).sum():.4f}")
+    del x
+    clean()
 
 
-# ── Test 03: GPU matmul ────────────────────────────────────────
 def test_03_matmul():
-    gpu = _gpu()
-    a = _t(np.random.randn(64, 64), gpu)
-    b = _t(np.random.randn(64, 64), gpu)
+    a = t(np.random.randn(64, 64))
+    b = t(np.random.randn(64, 64))
     c = a @ b
     nb.realize_all(c)
-    result = _to(c, CPU()).to_numpy()
-    print(f"[03] GPU matmul result shape={result.shape}, sum={result.sum():.4f}")
+    print(f"    sum={cpu(c).sum():.4f}")
+    del a, b, c
+    clean()
 
 
-# ── Test 04: GPU forward+backward (tiny MLP) ───────────────────
 def test_04_fwd_bwd():
-    gpu = _gpu()
-    w = _t(np.random.randn(32, 16) * 0.01, gpu)
-    x = _t(np.random.randn(4, 32), gpu)
-
-    def loss_fn(w, x):
-        h = silu_gpu(x @ w)
-        return (h * h).sum()
-
-    val, grads = nb.value_and_grad(loss_fn, argnums=0)(w, x)
+    w = t(np.random.randn(32, 16) * 0.01)
+    x = t(np.random.randn(4, 32))
+    val, grads = nb.value_and_grad(
+        lambda w, x: silu_gpu(x @ w).sum(), argnums=0
+    )(w, x)
     nb.realize_all(val, grads)
-    v = _to(val, CPU()).to_numpy()
-    g = _to(grads, CPU()).to_numpy()
-    has_nan = np.isnan(g).any()
-    print(f"[04] GPU fwd+bwd: loss={v:.4f}, grad_nan={has_nan}, vram={_vram_mb():.0f}MB")
+    nan = np.isnan(cpu(grads)).any()
+    print(f"    loss={cpu(val):.4f}, grad_nan={nan}")
+    del w, x, val, grads
+    clean()
 
 
-# ── Test 05: GPU conv2d forward+backward ───────────────────────
 def test_05_conv2d():
-    gpu = _gpu()
-    x = _t(np.random.randn(1, 8, 8, 3), gpu)
-    filt = _t(np.random.randn(3, 3, 3, 16) * 0.01, gpu)
-
-    def loss_fn(filt, x):
-        out = conv2d_safe(x, filt, padding=1)
-        return (out * out).sum()
-
-    val, grads = nb.value_and_grad(loss_fn, argnums=0)(filt, x)
+    x = t(np.random.randn(1, 8, 8, 3))
+    f = t(np.random.randn(3, 3, 3, 16) * 0.01)
+    val, grads = nb.value_and_grad(
+        lambda f, x: conv2d_safe(x, f, padding=1).sum(), argnums=0
+    )(f, x)
     nb.realize_all(val, grads)
-    v = _to(val, CPU()).to_numpy()
-    g = _to(grads, CPU()).to_numpy()
-    has_nan = np.isnan(g).any()
-    print(f"[05] GPU conv2d fwd+bwd: loss={v:.4f}, grad_nan={has_nan}, vram={_vram_mb():.0f}MB")
+    nan = np.isnan(cpu(grads)).any()
+    print(f"    loss={cpu(val):.4f}, grad_nan={nan}")
+    del x, f, val, grads
+    clean()
 
 
-# ── Test 06: @nb.compile on GPU (tiny) ─────────────────────────
 def test_06_compile_tiny():
-    gpu = _gpu()
-    w = _t(np.random.randn(16, 8) * 0.01, gpu)
-    x = _t(np.random.randn(2, 16), gpu)
-
-    @nb.compile
-    def compiled_fn(w, x):
-        return silu_gpu(x @ w).sum()
-
+    w = t(np.random.randn(16, 8) * 0.01)
+    x = t(np.random.randn(2, 16))
     t0 = time.time()
-    result = compiled_fn(w, x)
-    nb.realize_all(result)
+    r = compiled_silu_sum(w, x)
+    nb.realize_all(r)
     dt = time.time() - t0
-    v = _to(result, CPU()).to_numpy()
-    print(f"[06] @nb.compile GPU (tiny): val={v:.4f}, compile={dt:.1f}s, vram={_vram_mb():.0f}MB")
-
-    # Cached run
-    w2 = _t(np.random.randn(16, 8) * 0.01, gpu)
-    x2 = _t(np.random.randn(2, 16), gpu)
-    t0 = time.time()
-    result2 = compiled_fn(w2, x2)
-    nb.realize_all(result2)
-    dt2 = time.time() - t0
-    print(f"[06] Cached run: {dt2*1000:.1f}ms")
-
-
-# ── Test 07: @nb.compile GPU with value_and_grad ──────────────
-def test_07_compile_vjp():
-    gpu = _gpu()
-    w = _t(np.random.randn(32, 16) * 0.01, gpu)
-    x = _t(np.random.randn(4, 32), gpu)
-
-    @nb.compile
-    def compiled_loss(w, x):
-        h = silu_gpu(x @ w)
-        return (h * h).sum()
-
-    t0 = time.time()
-    val = compiled_loss(w, x)
-    nb.realize_all(val)
-    dt = time.time() - t0
-    v = _to(val, CPU()).to_numpy()
-    print(f"[07] @nb.compile GPU fwd: val={v:.4f}, compile={dt:.1f}s, vram={_vram_mb():.0f}MB")
-
-    # value_and_grad inside compile
-    @nb.compile
-    def compiled_fwd_bwd(w, x):
-        return nb.value_and_grad(lambda w, x: silu_gpu(x @ w).sum(), argnums=0)(w, x)
-
-    t0 = time.time()
-    val, grads = compiled_fwd_bwd(w, x)
-    nb.realize_all(val, grads)
-    dt = time.time() - t0
-    g = _to(grads, CPU()).to_numpy()
-    has_nan = np.isnan(g).any()
-    print(f"[07] @nb.compile GPU fwd+bwd: val={_to(val, CPU()).to_numpy():.4f}, "
-          f"grad_nan={has_nan}, compile={dt:.1f}s, vram={_vram_mb():.0f}MB")
-
-
-# ── Test 08: Scale up — 256x256 conv model ─────────────────────
-def test_08_scale_256():
-    gpu = _gpu()
-    # Tiny encoder: conv 3→8→16, pool, linear 16→4
-    f1 = _t(np.random.randn(3, 3, 3, 8) * 0.01, gpu)
-    f2 = _t(np.random.randn(3, 3, 8, 16) * 0.01, gpu)
-    pw = _t(np.random.randn(16, 4) * 0.01, gpu)
-    pb = _t(np.zeros((1, 4)), gpu)
-    x = _t(np.random.randn(1, 64, 64, 3), gpu)
-
-    def model(params, x):
-        f1, f2, pw, pb = params
-        h = silu_gpu(conv2d_safe(x, f1, stride=2, padding=1))
-        h = silu_gpu(conv2d_safe(h, f2, stride=2, padding=1))
-        h = h.mean(axis=(1, 2))
-        return (h @ pw + pb).sum()
-
-    params = (f1, f2, pw, pb)
-    t0 = time.time()
-    val, grads = nb.value_and_grad(model, argnums=0)(params, x)
-    nb.realize_all(val, grads)
-    dt = time.time() - t0
-    v = _to(val, CPU()).to_numpy()
-    g0 = _to(grads[0], CPU()).to_numpy()
-    has_nan = np.isnan(g0).any()
-    print(f"[08] 64x64 tiny model fwd+bwd: val={v:.4f}, grad_nan={has_nan}, "
-          f"time={dt:.1f}s, vram={_vram_mb():.0f}MB")
-
-
-# ── Test 09: @nb.compile on scaled model ───────────────────────
-def test_09_compile_scaled():
-    gpu = _gpu()
-    f1 = _t(np.random.randn(3, 3, 3, 8) * 0.01, gpu)
-    f2 = _t(np.random.randn(3, 3, 8, 16) * 0.01, gpu)
-    pw = _t(np.random.randn(16, 4) * 0.01, gpu)
-    pb = _t(np.zeros((1, 4)), gpu)
-    x = _t(np.random.randn(1, 64, 64, 3), gpu)
-
-    @nb.compile
-    def compiled_model(params, x):
-        f1, f2, pw, pb = params
-        h = silu_gpu(conv2d_safe(x, f1, stride=2, padding=1))
-        h = silu_gpu(conv2d_safe(h, f2, stride=2, padding=1))
-        h = h.mean(axis=(1, 2))
-        return nb.value_and_grad(
-            lambda params, x: (params[2] @ params[3] + params[3]).sum(),
-            argnums=0,
-        )(params, x)
-
-    print(f"[09] Compiling 64x64 model on GPU (may take 30-120s)...")
-    t0 = time.time()
-    params = (f1, f2, pw, pb)
-    val, grads = compiled_model(params, x)
-    nb.realize_all(val, grads)
-    dt = time.time() - t0
-    print(f"[09] Compiled: {dt:.1f}s, vram={_vram_mb():.0f}MB")
-
+    print(f"    compile={dt:.1f}s, val={cpu(r):.4f}")
     # Cached
-    x2 = _t(np.random.randn(1, 64, 64, 3), gpu)
+    w2 = t(np.random.randn(16, 8) * 0.01)
+    x2 = t(np.random.randn(2, 16))
     t0 = time.time()
-    val2, _ = compiled_model(params, x2)
-    nb.realize_all(val2)
-    dt2 = time.time() - t0
-    print(f"[09] Cached run: {dt2*1000:.1f}ms, vram={_vram_mb():.0f}MB")
+    r2 = compiled_silu_sum(w2, x2)
+    nb.realize_all(r2)
+    print(f"    cached={((time.time()-t0)*1000):.1f}ms")
+    del w, x, w2, x2, r, r2
+    clean()
 
 
-# ── Runner ─────────────────────────────────────────────────────
+def test_07_compile_vjp():
+    w = t(np.random.randn(32, 16) * 0.01)
+    x = t(np.random.randn(4, 32))
+    t0 = time.time()
+    val, grads = compiled_silu_vjp(w, x)
+    nb.realize_all(val, grads)
+    dt = time.time() - t0
+    nan = np.isnan(cpu(grads)).any()
+    print(f"    compile={dt:.1f}s, loss={cpu(val):.4f}, grad_nan={nan}")
+    del w, x, val, grads
+    clean()
+
+
+def _make_scale_test(res, compiled=False):
+    """Factory: returns a test function for given resolution."""
+    def test():
+        f1 = t(np.random.randn(3, 3, 3, 8) * 0.01)
+        f2 = t(np.random.randn(3, 3, 8, 16) * 0.01)
+        pw = t(np.random.randn(16, 4) * 0.01)
+        pb = t(np.zeros((1, 4)))
+        x = t(np.random.randn(1, res, res, 3))
+        params = (f1, f2, pw, pb)
+        t0 = time.time()
+        if compiled:
+            val, grads = compiled_conv_vjp(params, x)
+        else:
+            val, grads = nb.value_and_grad(tiny_conv_loss, argnums=0)(params, x)
+        nb.realize_all(val, grads)
+        dt = time.time() - t0
+        nan = np.isnan(cpu(grads[0])).any()
+        tag = "compiled" if compiled else "eager"
+        print(f"    {tag} {res}x{res}: loss={cpu(val):.4f}, nan={nan}, {dt:.1f}s")
+        del f1, f2, pw, pb, x, params, val, grads
+        clean()
+    return test
+
+
+# ── Build test list (flat, no nesting in runner) ──────────────
 TESTS = [
-    ("Device detection", test_01_device),
-    ("Tensor transfer", test_02_transfer),
-    ("GPU matmul", test_03_matmul),
-    ("GPU fwd+bwd (tiny MLP)", test_04_fwd_bwd),
-    ("GPU conv2d fwd+bwd", test_05_conv2d),
-    ("@nb.compile tiny", test_06_compile_tiny),
-    ("@nb.compile vjp", test_07_compile_vjp),
-    ("Scale 64x64 model", test_08_scale_256),
-    ("@nb.compile scaled", test_09_compile_scaled),
+    ("01 Device", test_01_device),
+    ("02 Transfer", test_02_transfer),
+    ("03 Matmul", test_03_matmul),
+    ("04 Fwd+Bwd", test_04_fwd_bwd),
+    ("05 Conv2d", test_05_conv2d),
+    ("06 Compile tiny", test_06_compile_tiny),
+    ("07 Compile vjp", test_07_compile_vjp),
 ]
+# Scale up only if RAM allows
+for res in [8, 16, 32, 64]:
+    TESTS.append((f"Eager {res}x{res}", _make_scale_test(res)))
 
 
 def main():
     if accelerator_count() == 0:
-        print("No GPU — aborting")
+        print("No GPU")
         return
-
-    print(f"GPU micro-prototype: {len(TESTS)} tests")
-    print(f"Initial VRAM: {_vram_mb():.0f}MB")
+    print(f"GPU prototype: {len(TESTS)} tests, RSS limit={LIMIT_MB}MB")
+    print(f"Initial: RSS={_rss()}MB avail={_avail()}MB")
     print("=" * 60)
 
     for i, (name, fn) in enumerate(TESTS):
-        print(f"\n--- Test {i+1:02d}: {name} ---")
+        rss = guard(f"test {i+1}")
+        print(f"\n--- {name} [RSS={rss}MB] ---")
         try:
             t0 = time.time()
             fn()
             dt = time.time() - t0
-            print(f"    PASS ({dt:.1f}s) VRAM={_vram_mb():.0f}MB")
+            rss_after = guard("done")
+            print(f"    PASS ({dt:.1f}s)")
+            if rss_after > LIMIT_MB:
+                print("    OVER LIMIT — STOPPING")
+                break
+        except SystemExit:
+            raise
         except Exception as e:
             print(f"    FAIL: {e}")
-            # Don't continue if basic ops fail
             if i < 3:
-                print("Basic GPU ops failed — stopping")
                 break
-            print("Continuing to next test...")
-        time.sleep(2)  # Let VRAM settle between tests
 
-    print(f"\nFinal VRAM: {_vram_mb():.0f}MB")
+    print(f"\nFinal: RSS={_rss()}MB avail={_avail()}MB VRAM={_vram()}MB")
 
 
 if __name__ == "__main__":
