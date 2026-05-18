@@ -273,15 +273,12 @@ def unet_decoder(p, latent, noisy_img):
 
     # Decoder: pixel shuffle + skip concat + conv
     d4 = _pixel_shuffle(_linear(bn, p["up4_w"], p["up4_b"]))
-    C_s3 = int(s3.shape[-1])
     d4 = silu_gpu(conv2d(nb.concatenate([d4, s3], axis=-1), p["dd4"], padding=1))
 
     d3 = _pixel_shuffle(_linear(d4, p["up3_w"], p["up3_b"]))
-    C_s2 = int(s2.shape[-1])
     d3 = silu_gpu(conv2d(nb.concatenate([d3, s2], axis=-1), p["dd3"], padding=1))
 
     d2 = _pixel_shuffle(_linear(d3, p["up2_w"], p["up2_b"]))
-    C_s1 = int(s1.shape[-1])
     d2 = silu_gpu(conv2d(nb.concatenate([d2, s1], axis=-1), p["dd2"], padding=1))
 
     return conv2d(d2, p["dd1"], padding=1)
@@ -405,7 +402,7 @@ def stage_a(res=64, latent=256, steps=10):
 
     _report("A-init", p, time.time())
     losses, p = train_loop(p, loss_fn, noisy_np, gt_np, steps, label="A")
-    assert all(np.isfinite(l) for l in losses), "NaN in Stage A!"
+    assert all(np.isfinite(v) for v in losses), "NaN in Stage A!"
     log.info("Stage A PASSED")
     del p, noisy_np, gt_np
     cleanup()
@@ -437,7 +434,7 @@ def stage_b(res=64, latent=256, steps=10):
 
     _report("B-init", p, time.time())
     losses, p = train_loop(p, loss_fn, noisy_np, scene_np, gt_np, steps, label="B")
-    assert all(np.isfinite(l) for l in losses), "NaN in Stage B!"
+    assert all(np.isfinite(v) for v in losses), "NaN in Stage B!"
     log.info("Stage B PASSED")
     del p, noisy_np, scene_np, gt_np
     cleanup()
@@ -473,7 +470,7 @@ def stage_c(res=64, latent=256, enc_ch=(64, 128, 256, 256), steps=10):
 
     _report("C-init", p, time.time())
     losses, p = train_loop(p, loss_fn, noisy_np, gt_np, steps, label="C")
-    assert all(np.isfinite(l) for l in losses), "NaN in Stage C!"
+    assert all(np.isfinite(v) for v in losses), "NaN in Stage C!"
     log.info("Stage C PASSED")
     del p, noisy_np, scene_np, gt_np
     cleanup()
@@ -621,7 +618,7 @@ def stage_f(res=64, latent=256, target_min=60):
     log.info("Stage F COMPLETE: %d steps in %.1f min", step, total_min)
     log.info("  Max RSS: %dMB   Final loss: %.6f", max_rss, losses[-1])
     log.info("  Loss range: %.4f → %.4f", losses[0], losses[-1])
-    log.info("  All finite: %s", all(np.isfinite(l) for l in losses))
+    log.info("  All finite: %s", all(np.isfinite(v) for v in losses))
     log.info("=" * 60)
     return losses
 
