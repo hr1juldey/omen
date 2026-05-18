@@ -429,14 +429,14 @@ def stage_b(res=64, latent=256, steps=10):
     scene_np = np.random.randn(1, 18).astype(np.float32) * 0.1
     gt_np = np.random.randn(1, latent).astype(np.float32) * 0.1
 
-    def loss_fn(p, noisy, gt):
-        scene_lat = scene_encoder(p, gt)  # use gt as scene feat proxy
+    def loss_fn(p, noisy, scene_feat, gt_latent):
+        scene_lat = scene_encoder(p, scene_feat)
         render_lat = render_encoder(p, noisy)
         fused = cross_attn(p, render_lat, scene_lat)
-        return nb.mean(square(fused - gt))
+        return nb.mean(square(fused - gt_latent))
 
     _report("B-init", p, time.time())
-    losses, p = train_loop(p, loss_fn, noisy_np, gt_np, steps, label="B")
+    losses, p = train_loop(p, loss_fn, noisy_np, scene_np, gt_np, steps, label="B")
     assert all(np.isfinite(l) for l in losses), "NaN in Stage B!"
     log.info("Stage B PASSED")
     del p, noisy_np, scene_np, gt_np
