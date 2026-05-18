@@ -1,18 +1,18 @@
 ## 0. Mandatory Skill Prerequisites
 
-- [ ] 0.1 **MANDATORY**: Before writing any Mojo code, invoke `/mojo-syntax` skill to ensure correct current Mojo syntax (not outdated docs/examples)
-- [ ] 0.2 **MANDATORY**: Before writing any Mojo GPU kernel code, invoke `/mojo-gpu-fundamentals` skill for correct GPU targeting patterns (NVIDIA, foreach, InputTensor/OutputTensor)
-- [ ] 0.3 **MANDATORY**: Before writing any Python-Mojo interop (call_custom_kernel, Operation wrapper), invoke `/mojo-python-interop` skill for correct bridge patterns
-- [ ] 0.4 **MANDATORY**: If any Mojo kernel fails with `std::bad_cast` or compilation error, re-invoke `/mojo-syntax` + `/mojo-gpu-fundamentals` before debugging — verify syntax matches current Mojo version
+- [x] 0.1 **MANDATORY**: Before writing any Mojo code, invoke `/mojo-syntax` skill to ensure correct current Mojo syntax (not outdated docs/examples)
+- [x] 0.2 **MANDATORY**: Before writing any Mojo GPU kernel code, invoke `/mojo-gpu-fundamentals` skill for correct GPU targeting patterns (NVIDIA, foreach, InputTensor/OutputTensor)
+- [x] 0.3 **MANDATORY**: Before writing any Python-Mojo interop (call_custom_kernel, Operation wrapper), invoke `/mojo-python-interop` skill for correct bridge patterns
+- [x] 0.4 **MANDATORY**: If any Mojo kernel fails with `std::bad_cast` or compilation error, re-invoke `/mojo-syntax` + `/mojo-gpu-fundamentals` before debugging — verify syntax matches current Mojo version
 
 ## 1. Core Operation Implementation
 
-- [ ] 1.1 Create `tests/test_gpu_mojo_conv2d_backward.py` with boilerplate: imports, device setup, RAM guard, helper functions (to_dev, to_cpu, _rand, _zeros)
-- [ ] 1.2 Implement pure-nabla `_im2col(x, kh, kw, sh, sw, ph, pw)` function (pad/slice/concat patch extraction) — NO Mojo needed, pure nabla ops
-- [ ] 1.3 Implement pure-nabla `_col2im_scatter(col, B, H, W, C_in, kh, kw, sh, sw, ph, pw)` function (scatter patches back to image via pad+add) — NO Mojo needed, pure nabla ops
-- [ ] 1.4 Implement `Conv2dMojoOp(Operation)` with `name`, `kernel`, `compute_physical_shape` — forward uses pure-nabla im2col + matmul (reuses 1.2)
-- [ ] 1.5 Implement `Conv2dMojoOp.vjp_rule` — grad_filter via `patches.T @ cotangent`, grad_input via `_col2im_scatter(cotangent @ filter.T)` (reuses 1.3)
-- [ ] 1.6 Add convenience function `mojo_conv2d(x, filter, stride=1, padding=0, bias=None)` wrapping the op
+- [x] 1.1 Create `tests/test_gpu_mojo_conv2d_backward.py` with boilerplate: imports, device setup, RAM guard, helper functions (to_dev, to_cpu, _rand, _zeros)
+- [x] 1.2 Implement pure-nabla `_im2col(x, kh, kw, sh, sw, ph, pw)` function (pad/slice/concat patch extraction) — NO Mojo needed, pure nabla ops
+- [x] 1.3 Implement pure-nabla `_col2im_scatter(col, B, H, W, C_in, kh, kw, sh, sw, ph, pw)` function (scatter patches back to image via pad+add) — NO Mojo needed, pure nabla ops
+- [x] 1.4 Implement `Conv2dMojoOp(Operation)` with `name`, `kernel`, `compute_physical_shape` — forward uses pure-nabla im2col + matmul (reuses 1.2)
+- [x] 1.5 Implement `Conv2dMojoOp.vjp_rule` — grad_filter via `patches.T @ cotangent`, grad_input via `_col2im_scatter(cotangent @ filter.T)` (reuses 1.3)
+- [x] 1.6 Add convenience function `mojo_conv2d(x, filter, stride=1, padding=0, bias=None)` wrapping the op
 - [ ] 1.7 **OPTIONAL acceleration**: If pure-nabla path works, try adding Mojo GPU im2col via `call_custom_kernel("conv2d_im2col", ...)`. Use `/mojo-python-interop` for bridge. Fall back to pure-nabla on any failure.
 
 ## 2. Forward Correctness Verification
