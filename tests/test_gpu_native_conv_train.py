@@ -28,6 +28,8 @@ import numpy as np
 import nabla as nb
 from max.driver import CPU, Accelerator, accelerator_count
 
+from omen.kernels.activations import sigmoid_gpu, silu_gpu, sqrt_gpu, square
+
 
 # ── Numpy AdamW (avoids nabla graph compilation hang) ────────
 def np_adamw_init(params):
@@ -71,7 +73,6 @@ def _params_to_cpu(params):
         return params.to_numpy().astype(np.float32)
     return params
 
-from omen.kernels.activations import sigmoid_gpu, silu_gpu, sqrt_gpu, square
 
 LIMIT_MB = 12 * 1024
 LATENT = 64
@@ -281,20 +282,24 @@ def scene_enc(p, sg):
 
 
 def render_enc(p, rgba):
-    """3x native conv2d(stride=2) + global avg pool + linear → latent."""
+    """3x native conv2d(stride=1) + global avg pool + linear → latent.
+
+    All stride=1 to avoid conv_transpose in backward pass (cuDNN OOM on 12GB VRAM).
+    Global avg pool reduces spatial dims regardless.
+    """
     x = silu_gpu(
-        nb.conv2d(rgba, p["conv1_filter"], stride=(2, 2), padding=(1, 1, 1, 1),
+        nb.conv2d(rgba, p["conv1_filter"], padding=(1, 1, 1, 1),
                   bias=p["conv1_bias"])
     )
     x = silu_gpu(
-        nb.conv2d(x, p["conv2_filter"], stride=(2, 2), padding=(1, 1, 1, 1),
+        nb.conv2d(x, p["conv2_filter"], padding=(1, 1, 1, 1),
                   bias=p["conv2_bias"])
     )
     x = silu_gpu(
-        nb.conv2d(x, p["conv3_filter"], stride=(2, 2), padding=(1, 1, 1, 1),
+        nb.conv2d(x, p["conv3_filter"], padding=(1, 1, 1, 1),
                   bias=p["conv3_bias"])
     )
-    # Global average pool: (B, H', W', C) → (B, C)
+    # Global average pool: (B, H, W, C) → (B, C)
     pool = nb.mean(x, axis=(1, 2))
     return pool @ p["proj.weight"] + p["proj.bias"]
 
@@ -402,7 +407,7 @@ def main():
     WARMUP = 5
     DECAY_STEPS = 2000
 
-    print(f"=== Omen GPU Native Conv2d Training ===")
+    print("=== Omen GPU Native Conv2d Training ===")
     print(f"  latent={LATENT}, res={RES}")
     print(f"  Device: {dev()}")
     print(f"  Target: {TOTAL_SECONDS // 60} min sustained training")
@@ -421,9 +426,9 @@ def main():
     print(f"  All params on {dev()}")
     guard("params on device")
 
-    # 2. Optimizer
-    print("\n--- Init optimizer ---")
-    opt_state = adamw_init(params)
+    # 2. Optimizer (numpy-side, avoids nabla graph compilation)
+    print("\n--- Init numpy AdamW optimizer ---")
+    opt_state = np_adamw_init(params_cpu)
     guard("optimizer init")
 
     # 3. Scene data
@@ -463,18 +468,11 @@ def main():
     print(f"  First step: {dt:.1f}s (includes JIT compile), loss={loss_f:.4f}")
     compile_time = dt
 
-    # Warmup optimizer step (eager, no graph break — same as matmul test)
-    params, opt_state = adamw_update(
-        params, grads, opt_state, lr=BASE_LR / WARMUP, weight_decay=0.01
-    )
-    guard("warmup done")
-
     # 5. Training loop — run until 120 minutes elapsed
     start_time = time.time()
     step = 0
     best_loss = float("inf")
     losses = []
-    GRAPH_BREAK_EVERY = 100
 
     print(f"\n--- Training loop (target {TOTAL_SECONDS // 60} min) ---")
     while True:
@@ -493,6 +491,8 @@ def main():
             lr = BASE_LR * 0.5 * (1.0 + np.cos(np.pi * progress))
 
         t0 = time.time()
+
+        # Forward+backward on GPU (graph cached after first step)
         loss_val, grads = nb.value_and_grad(loss_fn, argnums=0)(
             params, noisy, gt, scene_latent
         )
@@ -504,14 +504,18 @@ def main():
             print(f"  NaN/Inf loss at step {step} — stopping")
             break
 
-        params, opt_state = adamw_update(
-            params, grads, opt_state, lr=lr, weight_decay=0.01
+        # Move grads to CPU + break graph
+        grads_cpu = _grads_to_cpu(grads)
+        params_cpu_local = _params_to_cpu(params)
+
+        # Numpy AdamW update (<1ms for 53K params)
+        params_cpu_local = np_adamw_step(
+            params_cpu_local, grads_cpu, opt_state,
+            lr=lr, weight_decay=0.01
         )
 
-        # Periodic graph break: prevent RAM leak from lazy tensor accumulation
-        if step % GRAPH_BREAK_EVERY == 0:
-            params = _to_dev(_break_graph(params))
-            opt_state = _to_dev(_break_graph(opt_state))
+        # Transfer updated params back to GPU (0.4MB, ~0.1ms)
+        params = {k: to_dev(v) for k, v in params_cpu_local.items()}
 
         dt = time.time() - t0
         losses.append(loss_f)
@@ -520,7 +524,7 @@ def main():
 
         elapsed = time.time() - start_time
         remaining = max(0, TOTAL_SECONDS - elapsed)
-        avg_step = elapsed / step if step > 0 else dt
+        _ = elapsed / step if step > 0 else dt  # noqa: F841
 
         # Log every 10 steps or every step for first 20
         if step <= 20 or step % 10 == 0:
@@ -534,7 +538,7 @@ def main():
     # 7. Summary
     total_time = time.time() - start_time
     print(f"\n{'=' * 60}")
-    print(f"  TRAINING COMPLETE")
+    print("  TRAINING COMPLETE")
     print(f"  Steps: {step}")
     print(f"  Total time: {total_time / 60:.1f} min")
     print(f"  Compile time: {compile_time:.1f}s")
