@@ -49,9 +49,9 @@ class _SigmoidMojoOp(UnaryOperation):
 
     def vjp_rule(self, primals, cotangents, outputs, kwargs):
         # sigmoid'(x) = σ(x)(1-σ(x)) = σ(x) - σ(x)²
-        # No CPU scalar 1.0 — uses square() which is GPU-safe
+        # Recompute from primal — never touch Mojo output tensor (causes SIGSEGV on GPU)
         ct = cotangents[0]
-        sig = outputs[0]
+        sig = sigmoid_gpu(primals[0])
         return [ct * nb.sub(sig, square(sig))]
 
 
