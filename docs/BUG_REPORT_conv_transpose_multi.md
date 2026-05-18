@@ -171,14 +171,58 @@ This completely prevents training any multi-layer CNN architecture on GPU with n
 
 3. This suggests a bug in the MAX runtime's dynamic loading of cuDNN when multiple `conv_transpose` ops are present in the same compiled region. The cuDNN library handle may not be properly shared or re-initialized across multiple `conv_transpose` invocations within the same kernel.
 
-### Related issues
+### Related issues — conv2d has a pattern of bugs
 
-- #5543 — Conv2D compilation failure on non-unit dilations (conv2d limitations)
-- #6248 — Conv2d produces incorrect results when C_in >= 8 (numerical correctness)
-- #6461 — Conv2d corrupts boundary output rows of padded input (padding bug)
-- #5614 — Cannot use grouped convolutions in graph mode (graph mode limitations)
+The `conv_transpose` multi-layer crash is not an isolated incident. The conv2d implementation in MAX has at least **4 open bugs** that collectively make it unreliable for production use:
 
-These issues collectively suggest that the conv2d implementation in MAX has several edge cases that need attention.
+#### #5543 — Conv2D compilation failure on non-unit dilations
+
+- **Status**: Open
+- **Symptom**: `ValueError: Non-unit dilation is not supported yet.`
+- **Impact**: Any architecture using dilated convolutions (DeepLab, WaveNet, atrous spatial pyramid pooling) cannot compile. Notably, `conv2d_transpose` supports non-unit dilation but `conv2d` does not — an asymmetric API contract.
+- **Discovered by**: TilliFe while developing conv2d kernels for the Nabla library (Nov 2025)
+- **Environment**: Apple M3, macOS 26.0.1, MAX 25.6.1
+
+#### #6248 — Conv2d produces incorrect results when C_in >= 8
+
+- **Status**: Open
+- **Symptom**: Numerically incorrect output that diverges from PyTorch and numpy ground truth. Error grows with channel count.
+- **Impact**: Blocks any model with C_in >= 8 from producing correct results. Since most real architectures have C_in >= 16 from the second layer onward, this makes conv2d unreliable for anything beyond toy examples.
+- **Root cause hypothesis**: Filter packing issue tied to SIMD/micro-kernel tile width (AVX2: 8 floats). The C_in=8 threshold strongly suggests boundary misalignment in `pack_filter`, similar to the `groups > 1` bug tracked internally as KERN-2567.
+- **Error magnitude**: max_diff ranges from 0.017 (C_in=8) to 0.166 (C_in=192, K=7) — not subtle numerical noise but significantly wrong values.
+- **Discovered by**: itsdevcoffee (Mar 2026), blocks NSF-HiFiGAN vocoder in mojo-audio pipeline
+- **Environment**: NVIDIA RTX 4060 Ti, CUDA 13.0, MAX 26.3.0
+
+#### #6461 — Conv2d silently corrupts boundary output rows of padded input (CPU)
+
+- **Status**: Open, PR #6508 pending
+- **Symptom**: `ops.conv2d` on CPU silently corrupts boundary output rows whenever its input was zero-padded (via `ops.pad` or `conv2d`'s own `padding=`). The same input constructed via `ops.concat([zeros, x, zeros])` produces correct output.
+- **Impact**: Silent correctness bug — no error, no warning, just wrong numbers. This is the most dangerous type of bug because it can go undetected during development and corrupt model training silently.
+- **Reproduced across**: MAX 26.2.0, 26.3.0.dev2026042005, 26.3.0.dev2026042605 — corruption pattern shifts between versions but never resolves.
+- **Discovered by**: richardkiss (Apr 2026) while porting VoxCPM audio VAE to MAX. The reconstructed audio came out as "saturated garbage" — bisected to a single conv2d op.
+- **Notable**: Issue includes a PEP 723 self-contained reproducer (`uv run 01_mre.py` with no setup).
+
+#### #5614 — Cannot use grouped convolutions in graph mode
+
+- **Status**: Open, Needs Triage
+- **Symptom**: Grouped convolutions (groups > 1) fail when used inside MAX graph mode. Only groups=1 (standard convolution) works.
+- **Impact**: Blocks depthwise convolutions (MobileNet, EfficientNet), grouped convolutions (ResNeXt), and any architecture using `groups` parameter. These are fundamental building blocks of efficient modern architectures.
+- **Discovered by**: gabrieldemarmiesse (Nov 2025)
+- **Environment**: MAX graph API, CPU
+
+#### Pattern analysis
+
+These 5 bugs (including this one) reveal a systemic pattern:
+
+| Bug ID | Layer | Component | Type |
+|--------|-------|-----------|------|
+| This issue | Runtime/cuDNN | `conv_transpose` multi-instance | Crash (SIGABRT) |
+| #5543 | Compiler | Dilation support | Feature gap |
+| #6248 | Kernel | Filter packing (SIMD) | Silent numerical error |
+| #6461 | Kernel | Padding boundary | Silent data corruption |
+| #5614 | Graph compiler | Grouped conv lowering | Compilation error |
+
+The conv2d implementation appears to have correctness gaps at every level: compilation (dilation, groups), kernel execution (filter packing, padding), and runtime (cuDNN multi-instance). For users building production neural network training pipelines, this means conv2d cannot be relied upon beyond the simplest single-layer, groups=1, dilation=1, C_in<8 case.
 
 ### Workaround
 
@@ -190,6 +234,23 @@ We have confirmed that using exactly **1 conv2d layer** with backward works at 6
 
 This is a severely limiting workaround but proves the basic GPU training pipeline is functional.
 
+#### Attempted workaround: Custom Mojo GPU kernels
+
+We investigated writing conv2d as a custom Mojo GPU kernel to bypass the broken MAX runtime conv2d/conv_transpose path. Two Mojo GPU kernels already exist in our codebase (`conv2d_im2col.mojo` for forward, `conv2im.mojo` for backward col2im), registered as nabla custom operations via `call_custom_kernel`. This approach failed because:
+
+1. **No VJP registration for custom ops**: Nabla's autodiff cannot backpropagate through `call_custom_kernel` ops. There is no public API to register custom VJP (backward) rules for custom operations. Without this, the Mojo GPU kernels are forward-only.
+
+2. **`std::bad_cast` runtime bug**: The `call_custom_kernel` API has type marshalling issues that cause `std::bad_cast` crashes at runtime for several of our other custom kernels (`moe_dispatch`, `mla_compress`, `ssim_kernel`). This makes the custom kernel path unreliable.
+
+3. **Im2col approach still multi-op**: Even with working Mojo GPU kernels for im2col/col2im, the conv2d computation still requires `nb.matmul` — so each conv2d becomes 2 custom ops + 1 matmul, which may still trigger slow JIT compilation.
+
 ## Additional context
 
 This bug was discovered during development of the Omen JEPA denoiser project, which uses nabla for GPU-accelerated neural network training integrated with Mitsuba 3 path tracing. The project is open-source and the test demonstrating this bug is at `tests/test_gpu_native_conv_train.py` in our repository.
+
+We are committed to helping resolve this issue and can provide:
+
+- Full reproduction scripts (attached above)
+- Access to our training logs showing the crash at various model sizes
+- GPU environment for testing fixes (NVIDIA RTX 3060, CUDA 13.0, driver 580.159.03)
+- The `tests/test_gpu_native_conv_train.py` file which systematically tests 1-N conv2d layers with backward
