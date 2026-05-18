@@ -27,7 +27,49 @@ import time
 import numpy as np
 import nabla as nb
 from max.driver import CPU, Accelerator, accelerator_count
-from nabla.nn.optim import adamw_init, adamw_update
+
+
+# ── Numpy AdamW (avoids nabla graph compilation hang) ────────
+def np_adamw_init(params):
+    """Init AdamW state as numpy arrays."""
+    return {
+        "m": {k: np.zeros_like(v) for k, v in params.items()},
+        "v": {k: np.zeros_like(v) for k, v in params.items()},
+        "t": 0,
+    }
+
+
+def np_adamw_step(params, grads_np, state, lr=1e-3, beta1=0.9, beta2=0.999,
+                  eps=1e-8, weight_decay=0.01):
+    """AdamW update in pure numpy. params/grads are numpy arrays."""
+    state["t"] += 1
+    t = state["t"]
+    new_params = {}
+    for k in params:
+        g = grads_np[k]
+        state["m"][k] = beta1 * state["m"][k] + (1 - beta1) * g
+        state["v"][k] = beta2 * state["v"][k] + (1 - beta2) * g * g
+        m_hat = state["m"][k] / (1 - beta1 ** t)
+        v_hat = state["v"][k] / (1 - beta2 ** t)
+        new_params[k] = params[k] - lr * (m_hat / (np.sqrt(v_hat) + eps)
+                                           + weight_decay * params[k])
+    return new_params
+
+
+def _grads_to_cpu(grads):
+    """Move nabla gradient dict to CPU numpy."""
+    if isinstance(grads, dict):
+        return {k: _grads_to_cpu(v) for k, v in grads.items()}
+    return nb.ops.transfer_to(grads, CPU()).to_numpy()
+
+
+def _params_to_cpu(params):
+    """Move nabla param dict to CPU numpy, breaking the graph."""
+    if isinstance(params, dict):
+        return {k: _params_to_cpu(v) for k, v in params.items()}
+    if hasattr(params, "to_numpy"):
+        return params.to_numpy().astype(np.float32)
+    return params
 
 from omen.kernels.activations import sigmoid_gpu, silu_gpu, sqrt_gpu, square
 
