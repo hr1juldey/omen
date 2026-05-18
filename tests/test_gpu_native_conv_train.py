@@ -74,8 +74,9 @@ def _params_to_cpu(params):
     return params
 
 
-LIMIT_MB = 12 * 1024
+LIMIT_MB = 20 * 1024  # JIT compilation of conv_transpose uses ~16GB RAM
 LATENT = 64
+MID_DIM = 128
 SIGREG_LAMBDA = 0.09
 RES = 64
 
@@ -200,19 +201,13 @@ def init_params():
     p["scene_encoder.proj.weight"] = _rand(L, L, scale=0.05)
     p["scene_encoder.proj.bias"] = _zeros(L)
 
-    # render_encoder: 3x conv2d(stride=2) + global pool + linear proj
-    # Input: (B, H, W, 4) RGBA
-    # conv1: 4→16, 3x3 → (B, H/2, W/2, 16)
-    p["render_encoder.conv1_filter"] = _rand(3, 3, 4, 16, scale=0.05)
-    p["render_encoder.conv1_bias"] = _zeros(16)
-    # conv2: 16→32, 3x3 → (B, H/4, W/4, 32)
-    p["render_encoder.conv2_filter"] = _rand(3, 3, 16, 32, scale=0.05)
-    p["render_encoder.conv2_bias"] = _zeros(32)
-    # conv3: 32→64, 3x3 → (B, H/8, W/8, 64)
-    p["render_encoder.conv3_filter"] = _rand(3, 3, 32, 64, scale=0.05)
-    p["render_encoder.conv3_bias"] = _zeros(64)
-    # Project pooled 64-dim to LATENT
-    p["render_encoder.proj.weight"] = _rand(64, L, scale=0.05)
+    # render_encoder: 1 native conv2d + global pool + linear proj
+    # LIMITED TO 1 CONV2D: MAX runtime crashes with 2+ conv_transpose in backward
+    # (cudnnCreate symbol not found). Single conv_transpose works at 64x64.
+    p["render_encoder.conv1_filter"] = _rand(3, 3, 4, 32, scale=0.05)
+    p["render_encoder.conv1_bias"] = _zeros(32)
+    # Project pooled 32-dim to LATENT
+    p["render_encoder.proj.weight"] = _rand(32, L, scale=0.05)
     p["render_encoder.proj.bias"] = _zeros(L)
 
     # fusion (same as matmul test)
@@ -221,16 +216,12 @@ def init_params():
     p["fusion.norm.weight"] = np.ones((L,), dtype=np.float32)
     p["fusion.norm.bias"] = _zeros(L)
 
-    # decoder: 4x stride-1 conv2d layers (no stride-2 → no conv_transpose backward)
-    # (B,H,W,3) → conv1(32ch) → conv2(32ch) → conv3(16ch) → conv4(3ch)
-    p["decoder.conv1_filter"] = _rand(3, 3, 3, 32, scale=0.05)
-    p["decoder.conv1_bias"] = _zeros(32)
-    p["decoder.conv2_filter"] = _rand(3, 3, 32, 32, scale=0.05)
-    p["decoder.conv2_bias"] = _zeros(32)
-    p["decoder.conv3_filter"] = _rand(3, 3, 32, 16, scale=0.05)
-    p["decoder.conv3_bias"] = _zeros(16)
-    p["decoder.conv4_filter"] = _rand(3, 3, 16, 3, scale=0.05)
-    p["decoder.conv4_bias"] = _zeros(3)
+    # decoder: linear layers (no conv2d — avoids conv_transpose backward OOM)
+    # latent(64) → Linear(128) → SiLU → Linear(12288) → reshape(64,64,3)
+    p["decoder.fc1.weight"] = _rand(L, MID_DIM, scale=0.01)
+    p["decoder.fc1.bias"] = _zeros(MID_DIM)
+    p["decoder.fc2.weight"] = _rand(MID_DIM, RES * RES * 3, scale=0.01)
+    p["decoder.fc2.bias"] = _zeros(RES * RES * 3)
 
     return p
 
@@ -282,22 +273,14 @@ def scene_enc(p, sg):
 
 
 def render_enc(p, rgba):
-    """3x native conv2d(stride=1) + global avg pool + linear → latent.
+    """1 native conv2d + global avg pool + linear → latent.
 
-    All stride=1 to avoid conv_transpose in backward pass (cuDNN OOM on 12GB VRAM).
-    Global avg pool reduces spatial dims regardless.
+    MAX runtime limitation: 2+ conv_transpose in backward crashes (cudnnCreate).
+    Single conv2d backward works at 64x64 with 32 channels (verified).
     """
     x = silu_gpu(
         nb.conv2d(rgba, p["conv1_filter"], padding=(1, 1, 1, 1),
                   bias=p["conv1_bias"])
-    )
-    x = silu_gpu(
-        nb.conv2d(x, p["conv2_filter"], padding=(1, 1, 1, 1),
-                  bias=p["conv2_bias"])
-    )
-    x = silu_gpu(
-        nb.conv2d(x, p["conv3_filter"], padding=(1, 1, 1, 1),
-                  bias=p["conv3_bias"])
     )
     # Global average pool: (B, H, W, C) → (B, C)
     pool = nb.mean(x, axis=(1, 2))
@@ -311,26 +294,14 @@ def cross_attn(p, render_lat, scene_lat):
     return render_lat + g * scene_lat
 
 
-def decode(p, noisy_rgb):
-    """Simple 4-layer stride-1 conv2d decoder: noisy_rgb → predicted clean RGB.
+def decode(p, latent):
+    """Linear decoder: latent → Linear → SiLU → Linear → reshape(H,W,3).
 
-    All stride=1, padding=1 → no conv_transpose in backward pass.
-    (B,H,W,3) → 32ch → 32ch → 16ch → 3ch.
+    No conv2d — avoids conv_transpose backward OOM on 12GB VRAM.
     """
-    x = silu_gpu(
-        nb.conv2d(noisy_rgb, p["conv1_filter"], padding=(1, 1, 1, 1),
-                  bias=p["conv1_bias"])
-    )
-    x = silu_gpu(
-        nb.conv2d(x, p["conv2_filter"], padding=(1, 1, 1, 1),
-                  bias=p["conv2_bias"])
-    )
-    x = silu_gpu(
-        nb.conv2d(x, p["conv3_filter"], padding=(1, 1, 1, 1),
-                  bias=p["conv3_bias"])
-    )
-    return nb.conv2d(x, p["conv4_filter"], padding=(1, 1, 1, 1),
-                     bias=p["conv4_bias"])
+    h = silu_gpu(latent @ p["fc1.weight"] + p["fc1.bias"])
+    flat = h @ p["fc2.weight"] + p["fc2.bias"]
+    return nb.reshape(flat, (int(latent.shape[0]), RES, RES, 3))
 
 
 def sigreg(pred_latent):
@@ -346,18 +317,17 @@ def loss_fn(params, noisy, gt, scene_latent):
     p_fu = _extract(params, "fusion.")
     p_de = _extract(params, "decoder.")
 
-    # Render encoder (single pass — noisy input) + cross attention
+    # Render encoder (conv2d) + cross attention
     rl = render_enc(p_re, noisy)
     fused = cross_attn(p_fu, rl, scene_latent)
 
-    # Decoder: predict clean RGB from noisy input
-    noisy_rgb = noisy[:, :, :, :3]
+    # Decoder (linear): predict clean RGB from fused latent
     gt_rgb = gt[:, :, :, :3]
-    pred_rgb = decode(p_de, noisy_rgb)
+    pred_rgb = decode(p_de, fused)
 
-    # Reconstruction loss + latent regularization (keeps all params in grad graph)
+    # Reconstruction loss + latent regularization
     recon = nb.mean(square(pred_rgb - gt_rgb))
-    latent_reg = nb.mean(square(fused)) * 0.001  # small weight, prevents dead grads
+    latent_reg = nb.mean(square(fused)) * 0.001
     return recon + latent_reg
 
 
@@ -423,9 +393,9 @@ def main():
     print(f"  All params on {dev()}")
     guard("params on device")
 
-    # 2. Optimizer (GPU-only SGD — no CPU transfer, no graph replay)
-    print("\n--- GPU-only SGD optimizer ---")
-    GRAPH_CLEAR_EVERY = 50  # clear graph cache to prevent RAM growth
+    # 2. Optimizer (numpy AdamW — breaks lazy graph chain, prevents RAM leak)
+    print("\n--- Numpy AdamW optimizer ---")
+    opt_state = np_adamw_init(params_cpu)
     guard("optimizer init")
 
     # 3. Scene data
@@ -459,9 +429,12 @@ def main():
     loss_val, grads = nb.value_and_grad(loss_fn, argnums=0)(
         params, noisy, gt, scene_latent
     )
-    nb.realize_all(loss_val, grads)
-    dt = time.time() - t0
+    # Move grads to CPU first — this triggers forward+backward compilation together
+    # (don't call nb.realize_all(loss_val) first — that separates forward from backward
+    # and leaves forward activations in VRAM, causing cuDNN workspace OOM)
+    grads_np = _grads_to_cpu(grads)
     loss_f = float(to_cpu(loss_val))
+    dt = time.time() - t0
     print(f"  First step: {dt:.1f}s (includes JIT compile), loss={loss_f:.4f}")
     compile_time = dt
 
@@ -470,6 +443,7 @@ def main():
     step = 0
     best_loss = float("inf")
     losses = []
+    params_np = params_cpu  # numpy copy for optimizer
 
     print(f"\n--- Training loop (target {TOTAL_SECONDS // 60} min) ---")
     while True:
@@ -489,11 +463,15 @@ def main():
 
         t0 = time.time()
 
-        # Forward+backward on GPU (graph cached after first step)
+        # Transfer numpy params to GPU (fresh tensors, no lazy graph chain)
+        params = {k: to_dev(v) for k, v in params_np.items()}
+
+        # Forward+backward on GPU
         loss_val, grads = nb.value_and_grad(loss_fn, argnums=0)(
             params, noisy, gt, scene_latent
         )
-        nb.realize_all(loss_val, grads)
+        # Move grads to CPU first (triggers fwd+bwd compilation together)
+        grads_np = _grads_to_cpu(grads)
         loss_f = float(to_cpu(loss_val))
 
         # Check for NaN
@@ -501,13 +479,11 @@ def main():
             print(f"  NaN/Inf loss at step {step} — stopping")
             break
 
-        # GPU-only SGD: param = param - lr * grad (stays on GPU, no CPU transfer)
-        for k in params:
-            params[k] = params[k] - lr * grads[k]
+        # Move grads to CPU (forces backward graph execution if not yet realized)
+        grads_np = _grads_to_cpu(grads)
 
-        # Periodic graph break: clear cache to prevent RAM growth
-        if step % GRAPH_CLEAR_EVERY == 0:
-            nb.GRAPH.clear_all()
+        # Numpy AdamW update (breaks lazy graph chain)
+        params_np = np_adamw_step(params_np, grads_np, opt_state, lr=lr)
 
         dt = time.time() - t0
         losses.append(loss_f)
@@ -516,7 +492,6 @@ def main():
 
         elapsed = time.time() - start_time
         remaining = max(0, TOTAL_SECONDS - elapsed)
-        _ = elapsed / step if step > 0 else dt  # noqa: F841
 
         # Log every 10 steps or every step for first 20
         if step <= 20 or step % 10 == 0:
