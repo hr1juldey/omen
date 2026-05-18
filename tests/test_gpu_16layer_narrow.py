@@ -32,6 +32,10 @@ import subprocess
 import sys
 import time
 
+# Deep conv2d_safe graphs exceed Python's default 1000 recursion limit
+# during nabla's graph fingerprinting (_fingerprint_obj recursion)
+sys.setrecursionlimit(50_000)
+
 import mitsuba as mi
 import numpy as np
 import nabla as nb
