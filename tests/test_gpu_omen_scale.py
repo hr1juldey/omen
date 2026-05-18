@@ -4,6 +4,9 @@
 Mirrors the actual Omen JEPA model (11 conv2d + linear + fusion)
 using Conv2dMojoOp (native forward + custom VJP, no conv_transpose).
 
+Trains on REAL Mitsuba renders (Veach Ajar, Shaderball, Studio, Foggy Corridor).
+NOT random noise. NOT Cornell Box.
+
 Usage:
   python test_gpu_omen_scale.py              # all stages A-F
   python test_gpu_omen_scale.py --stage A    # render encoder only
@@ -12,7 +15,7 @@ Usage:
   python test_gpu_omen_scale.py --stage D    # scale LATENT up (256/512/1024)
   python test_gpu_omen_scale.py --stage E    # scale resolution up (64/128)
   python test_gpu_omen_scale.py --stage F    # 60-min sustained at max safe
-  python test_gpu_omen_scale.py --full       # full model (C + D sweep)
+  python test_gpu_omen_scale.py --full       # full model (C + D)
 
 Architecture (mirrors src/omen/model/):
   RenderEncoder  — 3 conv2d (4→32→64→128, stride=2) + pool + Linear
@@ -33,11 +36,20 @@ import subprocess
 import sys
 import time
 
+import mitsuba as mi
 import numpy as np
 import nabla as nb
 from max.driver import CPU, Accelerator, accelerator_count
 from nabla.ops import Operation
-from omen.kernels.activations import sigmoid_gpu, silu_gpu, square
+from omen.kernels.activations import sigmoid_gpu, silu_gpu, sqrt_gpu, square
+from omen.scenes import (
+    build_foggy_corridor,
+    build_shaderball,
+    build_studio_product,
+    build_veach_ajar,
+)
+
+mi.set_variant("scalar_rgb")
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -49,6 +61,14 @@ log = logging.getLogger("omen_scale")
 
 WARN_MB = 20 * 1024
 KILL_MB = 24 * 1024
+
+# Real scenes — NOT Cornell Box (too simple, nothing to learn)
+SCENE_BUILDERS = [
+    ("veach_ajar", build_veach_ajar),
+    ("shaderball", build_shaderball),
+    ("studio_product", build_studio_product),
+    ("foggy_corridor", build_foggy_corridor),
+]
 
 
 # ── System helpers ────────────────────────────────────────────
@@ -130,6 +150,42 @@ def _report(stage, params_np, t0, step_ms=None):
     )
     if step_ms:
         log.info("[%s] step=%dms", stage, step_ms)
+
+
+# ── Real render data (Mitsuba, NOT random noise) ─────────────
+def _render_pair(res, scene_idx=0, gt_spp=64, noisy_spp=2):
+    """Render real GT+noisy pair from a complex Mitsuba scene."""
+    name, builder = SCENE_BUILDERS[scene_idx % len(SCENE_BUILDERS)]
+    log.info("  Rendering %s at %dx%d (gt_spp=%d noisy_spp=%d)...", name, res, res, gt_spp, noisy_spp)
+    scene, sg = builder(resolution=(res, res))
+    gt = np.array(mi.render(scene, spp=gt_spp, seed=0))[:, :, :3].astype(np.float32)
+    noisy = np.array(mi.render(scene, spp=noisy_spp, seed=42))[:, :, :3].astype(np.float32)
+    # RGBA: add alpha=1.0 channel
+    alpha = np.ones((res, res, 1), dtype=np.float32)
+    noisy_rgba = np.concatenate([noisy, alpha], axis=-1)[np.newaxis]  # (1, H, W, 4)
+    gt_rgb = gt[np.newaxis]  # (1, H, W, 3)
+    feat = _scene_feat(sg)[np.newaxis]  # (1, 18)
+    log.info("  noisy range=[%.4f,%.4f] gt range=[%.4f,%.4f]",
+             noisy.min(), noisy.max(), gt.min(), gt.max())
+    return noisy_rgba, gt_rgb, feat
+
+
+def _scene_feat(sg, dim=18):
+    """Extract fixed-size features from scene graph."""
+    parts = []
+    geom = sg.get("geometry", {})
+    if "features" in geom:
+        parts.append(np.array(geom["features"]).flatten())
+    mat = sg.get("materials", {})
+    if "params" in mat:
+        parts.append(np.mean(np.array(mat["params"]), axis=0).flatten())
+    light = sg.get("lights", {})
+    if "params" in light:
+        parts.append(np.mean(np.array(light["params"]), axis=0).flatten())
+    feat = np.concatenate(parts).astype(np.float32) if parts else np.zeros(dim, dtype=np.float32)
+    if feat.shape[0] < dim:
+        feat = np.pad(feat, (0, dim - feat.shape[0]))
+    return feat[:dim]
 
 
 # ── Conv2dMojoOp (from test_gpu_mojo_conv2d_backward.py) ─────
@@ -225,8 +281,9 @@ def _linear(x, weight, bias):
 
 def _layer_norm(x, weight, bias, eps=1e-5):
     mean = x.mean(axis=-1, keepdims=True)
-    var = ((x - mean) * (x - mean)).mean(axis=-1, keepdims=True)
-    return (x - mean) / nb.sqrt(var + eps) * weight + bias
+    centered = x - mean
+    var = (centered * centered).mean(axis=-1, keepdims=True)
+    return centered / sqrt_gpu(var + eps) * weight + bias
 
 
 def _pixel_shuffle(x, r=2):
@@ -336,8 +393,17 @@ def _init_decoder(latent, enc_ch=(64, 128, 256, 256)):
 
 
 # ── Training loop ─────────────────────────────────────────────
-def train_loop(params_np, loss_fn, noisy_np, gt_np, steps, lr=1e-3, label=""):
-    """Run training steps with numpy AdamW (graph break pattern)."""
+def train_loop(params_np, loss_fn, data_np, *, steps=10, lr=1e-3, label=""):
+    """Run training steps with numpy AdamW (graph break pattern).
+
+    Args:
+        params_np: numpy param dict
+        loss_fn: callable(params, *data_args) -> scalar loss
+        data_np: list of numpy arrays transferred to device each step
+        steps: number of training steps
+        lr: learning rate
+        label: logging label
+    """
     opt_m = {k: np.zeros_like(v) for k, v in params_np.items()}
     opt_v = {k: np.zeros_like(v) for k, v in params_np.items()}
     losses = []
@@ -346,11 +412,10 @@ def train_loop(params_np, loss_fn, noisy_np, gt_np, steps, lr=1e-3, label=""):
 
     for step in range(1, steps + 1):
         p = {k: to_dev(v) for k, v in params_np.items()}
-        noisy = to_dev(noisy_np)
-        gt = to_dev(gt_np)
+        dev_data = [to_dev(d) for d in data_np]
 
         t0 = time.time()
-        lv, grads = nb.value_and_grad(loss_fn, argnums=0)(p, noisy, gt)
+        lv, grads = nb.value_and_grad(loss_fn, argnums=0)(p, *dev_data)
         for k in grads:
             nb.realize_all(grads[k])
         nb.realize_all(lv)
@@ -376,7 +441,7 @@ def train_loop(params_np, loss_fn, noisy_np, gt_np, steps, lr=1e-3, label=""):
         guard(f"{label} step {step}")
         log.info("%s Step %2d: loss=%.6f (%dms)", label, step, loss_f, int(dt * 1000))
 
-        del p, noisy, gt, lv, grads, g_np
+        del p, dev_data, lv, grads, g_np
         cleanup()
 
     steady_ms = int(t_first * 1000) if t_first else int(t_compile * 1000)
@@ -386,69 +451,71 @@ def train_loop(params_np, loss_fn, noisy_np, gt_np, steps, lr=1e-3, label=""):
 
 
 # ── Stage A: Render Encoder Only ──────────────────────────────
-def stage_a(res=64, latent=256, steps=10):
+def stage_a(res=64, latent=256, steps=10, scene_idx=0, **_kw):
     log.info("=" * 60)
     log.info("Stage A: Render Encoder (3 conv2d) at %dx%d latent=%d", res, res, latent)
     log.info("=" * 60)
     guard("start")
 
+    noisy_rgba, gt_rgb, scene_feat = _render_pair(res, scene_idx=scene_idx)
+    gt_latent = np.random.randn(1, latent).astype(np.float32) * 0.01
+
     p = _init_render_encoder(latent)
-    noisy_np = np.random.randn(1, res, res, 4).astype(np.float32) * 0.1
-    gt_np = np.random.randn(1, latent).astype(np.float32) * 0.1
 
     def loss_fn(p, noisy, gt):
         latent_out = render_encoder(p, noisy)
         return nb.mean(square(latent_out - gt))
 
     _report("A-init", p, time.time())
-    losses, p = train_loop(p, loss_fn, noisy_np, gt_np, steps, label="A")
+    losses, p = train_loop(p, loss_fn, [noisy_rgba, gt_latent], steps=steps, label="A")
     assert all(np.isfinite(v) for v in losses), "NaN in Stage A!"
     log.info("Stage A PASSED")
-    del p, noisy_np, gt_np
+    del p, noisy_rgba, gt_rgb, gt_latent, scene_feat
     cleanup()
     guard("end")
     return losses
 
 
 # ── Stage B: Render + Scene + Fusion ──────────────────────────
-def stage_b(res=64, latent=256, steps=10):
+def stage_b(res=64, latent=256, steps=10, scene_idx=1, **_kw):
     log.info("=" * 60)
     log.info("Stage B: Render + Scene + Fusion latent=%d", latent)
     log.info("=" * 60)
     guard("start")
+
+    noisy_rgba, gt_rgb, scene_feat = _render_pair(res, scene_idx=scene_idx)
+    gt_latent = np.random.randn(1, latent).astype(np.float32) * 0.01
 
     p = {}
     p.update(_init_render_encoder(latent))
     p.update(_init_scene_encoder(latent))
     p.update(_init_cross_attn(latent))
 
-    noisy_np = np.random.randn(1, res, res, 4).astype(np.float32) * 0.1
-    scene_np = np.random.randn(1, 18).astype(np.float32) * 0.1
-    gt_np = np.random.randn(1, latent).astype(np.float32) * 0.1
-
-    def loss_fn(p, noisy, scene_feat, gt_latent):
-        scene_lat = scene_encoder(p, scene_feat)
+    def loss_fn(p, noisy, scene_f, gt_lat):
+        scene_lat = scene_encoder(p, scene_f)
         render_lat = render_encoder(p, noisy)
         fused = cross_attn(p, render_lat, scene_lat)
-        return nb.mean(square(fused - gt_latent))
+        return nb.mean(square(fused - gt_lat))
 
     _report("B-init", p, time.time())
-    losses, p = train_loop(p, loss_fn, noisy_np, scene_np, gt_np, steps, label="B")
+    losses, p = train_loop(p, loss_fn, [noisy_rgba, scene_feat, gt_latent], steps=steps, label="B")
     assert all(np.isfinite(v) for v in losses), "NaN in Stage B!"
     log.info("Stage B PASSED")
-    del p, noisy_np, scene_np, gt_np
+    del p, noisy_rgba, gt_rgb, gt_latent, scene_feat
     cleanup()
     guard("end")
     return losses
 
 
 # ── Stage C: Full U-Net Decoder (11 conv2d total) ────────────
-def stage_c(res=64, latent=256, enc_ch=(64, 128, 256, 256), steps=10):
+def stage_c(res=64, latent=256, enc_ch=(64, 128, 256, 256), steps=10, scene_idx=2, **_kw):
     log.info("=" * 60)
     log.info("Stage C: Full model (11 conv2d) %dx%d latent=%d", res, res, latent)
     log.info("  decoder channels: %s", enc_ch)
     log.info("=" * 60)
     guard("start")
+
+    noisy_rgba, gt_rgb, scene_feat = _render_pair(res, scene_idx=scene_idx)
 
     p = {}
     p.update(_init_render_encoder(latent))
@@ -456,44 +523,39 @@ def stage_c(res=64, latent=256, enc_ch=(64, 128, 256, 256), steps=10):
     p.update(_init_cross_attn(latent))
     p.update(_init_decoder(latent, enc_ch))
 
-    noisy_np = np.random.randn(1, res, res, 4).astype(np.float32) * 0.1
-    scene_np = np.random.randn(1, 18).astype(np.float32) * 0.1
-    gt_np = np.random.randn(1, res, res, 3).astype(np.float32) * 0.1
-
-    def loss_fn(p, noisy, gt):
-        scene_feat = nb.mean(gt, axis=(1, 2))  # proxy scene features
-        scene_lat = scene_encoder(p, scene_feat)
+    def loss_fn(p, noisy, gt, scene_f):
+        scene_lat = scene_encoder(p, scene_f)
         render_lat = render_encoder(p, noisy)
         fused = cross_attn(p, render_lat, scene_lat)
         pred = unet_decoder(p, fused, noisy[:, :, :, :3])
         return nb.mean(square(pred - gt))
 
     _report("C-init", p, time.time())
-    losses, p = train_loop(p, loss_fn, noisy_np, gt_np, steps, label="C")
+    losses, p = train_loop(p, loss_fn, [noisy_rgba, gt_rgb, scene_feat], steps=steps, label="C")
     assert all(np.isfinite(v) for v in losses), "NaN in Stage C!"
     log.info("Stage C PASSED")
-    del p, noisy_np, scene_np, gt_np
+    del p, noisy_rgba, gt_rgb, scene_feat
     cleanup()
     guard("end")
     return losses
 
 
 # ── Stage D: Scale LATENT up ─────────────────────────────────
-def stage_d(res=64, steps=5):
+def stage_d(res=64, steps=5, latent=None, **_kw):
     log.info("=" * 60)
     log.info("Stage D: Scale LATENT (256/512/1024) at %dx%d", res, res)
     log.info("=" * 60)
 
     results = {}
-    for latent in [256, 512, 1024]:
-        log.info("--- D: latent=%d ---", latent)
-        guard(f"pre-latent={latent}")
+    for idx, lat in enumerate([256, 512, 1024]):
+        log.info("--- D: latent=%d ---", lat)
+        guard(f"pre-latent={lat}")
         try:
-            losses = stage_c(res=res, latent=latent, steps=steps)
-            results[latent] = ("PASS", _rss(), losses[-1])
+            losses = stage_c(res=res, latent=lat, steps=steps, scene_idx=idx)
+            results[lat] = ("PASS", _rss(), losses[-1])
         except (RuntimeError, ValueError, MemoryError) as e:
-            results[latent] = ("FAIL", _rss(), str(e)[:80])
-            log.warning("D: latent=%d FAILED: %s", latent, e)
+            results[lat] = ("FAIL", _rss(), str(e)[:80])
+            log.warning("D: latent=%d FAILED: %s", lat, e)
             cleanup()
             if _rss() > KILL_MB:
                 log.error("RAM critical after failure — stopping D sweep")
@@ -511,21 +573,21 @@ def stage_d(res=64, steps=5):
 
 
 # ── Stage E: Scale Resolution up ─────────────────────────────
-def stage_e(latent=256, steps=5):
+def stage_e(latent=256, steps=5, res=None, **_kw):
     log.info("=" * 60)
     log.info("Stage E: Scale Resolution (64/128) at latent=%d", latent)
     log.info("=" * 60)
 
     results = {}
-    for res in [64, 128]:
-        log.info("--- E: res=%d ---", res)
-        guard(f"pre-res={res}")
+    for idx, resolution in enumerate([64, 128]):
+        log.info("--- E: res=%d ---", resolution)
+        guard(f"pre-res={resolution}")
         try:
-            losses = stage_c(res=res, latent=latent, steps=steps)
-            results[res] = ("PASS", _rss(), losses[-1])
+            losses = stage_c(res=resolution, latent=latent, steps=steps, scene_idx=idx)
+            results[resolution] = ("PASS", _rss(), losses[-1])
         except (RuntimeError, ValueError, MemoryError) as e:
-            results[res] = ("FAIL", _rss(), str(e)[:80])
-            log.warning("E: res=%d FAILED: %s", res, e)
+            results[resolution] = ("FAIL", _rss(), str(e)[:80])
+            log.warning("E: res=%d FAILED: %s", resolution, e)
             cleanup()
             if _rss() > KILL_MB:
                 log.error("RAM critical — stopping E sweep")
@@ -533,30 +595,29 @@ def stage_e(latent=256, steps=5):
 
     log.info("=" * 60)
     log.info("Stage E Summary: Resolution sweep at latent=%d", latent)
-    for res, (status, rss, val) in sorted(results.items()):
+    for resolution, (status, rss, val) in sorted(results.items()):
         if status == "PASS":
-            log.info("  res=%d: PASS  RSS=%dMB  final_loss=%.4f", res, rss, val)
+            log.info("  res=%d: PASS  RSS=%dMB  final_loss=%.4f", resolution, rss, val)
         else:
-            log.info("  res=%d: FAIL  RSS=%dMB  %s", res, rss, val)
+            log.info("  res=%d: FAIL  RSS=%dMB  %s", resolution, rss, val)
     log.info("=" * 60)
     return results
 
 
 # ── Stage F: 60-min sustained at max safe config ──────────────
-def stage_f(res=64, latent=256, target_min=60):
+def stage_f(res=64, latent=256, target_min=60, scene_idx=3, **_kw):
     log.info("=" * 60)
     log.info("Stage F: %d-min sustained training at %dx%d latent=%d", target_min, res, res, latent)
     log.info("=" * 60)
     guard("start")
+
+    noisy_rgba, gt_rgb, scene_feat = _render_pair(res, scene_idx=scene_idx)
 
     p = {}
     p.update(_init_render_encoder(latent))
     p.update(_init_scene_encoder(latent))
     p.update(_init_cross_attn(latent))
     p.update(_init_decoder(latent))
-
-    noisy_np = np.random.randn(1, res, res, 4).astype(np.float32) * 0.1
-    gt_np = np.random.randn(1, res, res, 3).astype(np.float32) * 0.1
     _report("F-init", p, time.time())
 
     opt_m = {k: np.zeros_like(v) for k, v in p.items()}
@@ -566,6 +627,13 @@ def stage_f(res=64, latent=256, target_min=60):
     t_start = time.time()
     step = 0
     max_rss = 0
+
+    def full_loss(params, noisy, gt, sf):
+        scene_lat = scene_encoder(params, sf)
+        render_lat = render_encoder(params, noisy)
+        fused = cross_attn(params, render_lat, scene_lat)
+        pred = unet_decoder(params, fused, noisy[:, :, :, :3])
+        return nb.mean(square(pred - gt))
 
     while True:
         step += 1
@@ -577,14 +645,12 @@ def stage_f(res=64, latent=256, target_min=60):
         lr = lr0 * 0.5 * (1 + np.cos(np.pi * elapsed / target_min))
 
         params = {k: to_dev(v) for k, v in p.items()}
-        noisy = to_dev(noisy_np)
-        gt = to_dev(gt_np)
+        noisy = to_dev(noisy_rgba)
+        gt = to_dev(gt_rgb)
+        sf = to_dev(scene_feat)
 
         t0 = time.time()
-        lv, grads = nb.value_and_grad(
-            lambda p, n, g: nb.mean(square(unet_decoder(p, cross_attn(p, render_encoder(p, n), scene_encoder(p, nb.mean(g, axis=(1,2)))), n[:,:,:,:3]) - g)),
-            argnums=0,
-        )(params, noisy, gt)
+        lv, grads = nb.value_and_grad(full_loss, argnums=0)(params, noisy, gt, sf)
         for k in grads:
             nb.realize_all(grads[k])
         nb.realize_all(lv)
@@ -610,7 +676,7 @@ def stage_f(res=64, latent=256, target_min=60):
                 step, loss_f, int(dt * 1000), lr, elapsed,
             )
 
-        del params, noisy, gt, lv, grads, g_np
+        del params, noisy, gt, sf, lv, grads, g_np
         cleanup()
 
     total_min = (time.time() - t_start) / 60
@@ -652,6 +718,7 @@ def main():
     log.info("Omen JEPA GPU Scale-Up Test")
     log.info("Device: %s", dev())
     log.info("Model: 11 conv2d (Conv2dMojoOp) + linear + fusion")
+    log.info("Data: REAL Mitsuba renders (NOT Cornell Box, NOT random noise)")
     log.info("Target: find RAM ceiling at %d-%d GB", WARN_MB // 1024, KILL_MB // 1024)
     log.info("=" * 60)
     guard("start")
@@ -659,18 +726,11 @@ def main():
     if args.stage:
         name, fn = STAGES[args.stage]
         log.info("Running single stage %s: %s", args.stage, name)
-        if args.stage == "D":
-            fn(res=args.res, steps=args.steps)
-        elif args.stage == "E":
-            fn(latent=args.latent, steps=args.steps)
-        elif args.stage == "F":
-            fn(res=args.res, latent=args.latent, target_min=args.minutes)
-        elif args.stage in ("A", "B", "C"):
-            fn(res=args.res, latent=args.latent, steps=args.steps)
+        fn(res=args.res, latent=args.latent, steps=args.steps, target_min=args.minutes)
     elif args.full:
         log.info("Running FULL model sweep (C + D)")
         stage_c(res=args.res, latent=args.latent, steps=args.steps)
-        stage_d(res=args.res, steps=args.steps)
+        stage_d(res=args.res, steps=max(3, args.steps // 2))
     else:
         log.info("Running ALL stages A-F")
         stage_a(res=args.res, latent=args.latent, steps=args.steps)
