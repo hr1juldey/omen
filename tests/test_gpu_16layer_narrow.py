@@ -437,7 +437,7 @@ def main():
         _run_sustain(args.sustain, 64, args.latent)
         return
 
-    if args.phase:
+    if args.phase is not None:
         name, nl, res = PHASES[args.phase]
         # Phase 0 uses smaller latent to seed JIT cache
         lat = 32 if args.phase == 0 else args.latent
