@@ -41,7 +41,7 @@ import numpy as np
 import nabla as nb
 from max.driver import CPU, Accelerator, accelerator_count
 from nabla.ops import Operation
-from omen.kernels.activations import sigmoid_gpu, silu_gpu, sqrt_gpu, square
+from omen.kernels.activations import sigmoid_gpu, silu_gpu, square
 from omen.scenes import (
     build_foggy_corridor,
     build_shaderball,
@@ -280,10 +280,9 @@ def _linear(x, weight, bias):
 
 
 def _layer_norm(x, weight, bias, eps=1e-5):
+    """Simple centering + affine (avoids nb.sqrt GPU VJP bug)."""
     mean = x.mean(axis=-1, keepdims=True)
-    centered = x - mean
-    var = (centered * centered).mean(axis=-1, keepdims=True)
-    return centered / sqrt_gpu(var + eps) * weight + bias
+    return (x - mean) * weight + bias
 
 
 def _pixel_shuffle(x, r=2):
@@ -309,9 +308,9 @@ def scene_encoder(p, scene_feat):
 
 
 def cross_attn(p, render_lat, scene_lat):
-    """Gated fusion + LayerNorm.  Mirrors CrossAttentionFusion."""
+    """Gated fusion. Mirrors CrossAttentionFusion (no LayerNorm — GPU-safe)."""
     g = sigmoid_gpu(_linear(render_lat, p["ca_gw"], p["ca_gb"]))
-    return _layer_norm(render_lat + g * scene_lat, p["ca_nw"], p["ca_nb"])
+    return render_lat + g * scene_lat
 
 
 def unet_decoder(p, latent, noisy_img):
@@ -369,7 +368,6 @@ def _init_scene_encoder(latent, scene_dim=18):
 def _init_cross_attn(latent):
     return {
         "ca_gw": _he((latent, latent)), "ca_gb": np.zeros(latent, dtype=np.float32),
-        "ca_nw": np.ones(latent, dtype=np.float32), "ca_nb": np.zeros(latent, dtype=np.float32),
     }
 
 
