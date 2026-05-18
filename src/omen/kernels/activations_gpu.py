@@ -3,7 +3,10 @@
 Single-op activations bypassing MAX graph — reduces LLVM JIT compilation RAM.
 
 Forward: Mojo GPU kernel (1 graph node vs 4-5 for pure-nabla)
-Backward: pure-nabla VJP rules (compiled once, cached by @nb.compile)
+Backward: _derivative recomputes from primal input via pure-nabla ops
+
+Pattern: official Nabla custom kernels tutorial
+https://www.nablaml.com/examples/12_custom_mojo_kernels.html
 """
 
 import logging
@@ -23,66 +26,52 @@ from omen.kernels.activations import sigmoid_gpu, silu_gpu, square
 
 logger = logging.getLogger("omen.kernels.activations_gpu")
 
-KERNEL_DIR = Path(__file__).parent
+KERNEL_DIR = str(Path(__file__).parent)
 
 
 class _SigmoidMojoOp(UnaryOperation):
-    """Nabla operation wrapping the Mojo sigmoid kernel."""
+    """Mojo sigmoid kernel — forward via Mojo, backward via pure-nabla."""
 
     @property
     def name(self) -> str:
         return "sigmoid_kernel"
 
-    def compute_physical_shape(self, args, kwargs, output_sharding=None):
-        x = args[0]
-        shape = tuple(int(d) for d in x.shape)
-        return [shape], [x.dtype], [x.device]
-
     def kernel(self, args, kwargs):
-        from max.graph import TensorType
-
         x = args[0]
-        shape = tuple(int(d) for d in x.shape)
-        out_type = TensorType(dtype=x.dtype, shape=shape, device=x.device)
-        result = call_custom_kernel("sigmoid_kernel", str(KERNEL_DIR), x, out_type)
+        result = call_custom_kernel(
+            "sigmoid_kernel", KERNEL_DIR, x, x.type, device=x.device
+        )
         return [result]
 
-    def vjp_rule(self, primals, cotangents, outputs, kwargs):
-        # sigmoid'(x) = σ(x)(1-σ(x)) = σ(x) - σ(x)²
-        # Recompute from primal — never touch Mojo output tensor (causes SIGSEGV on GPU)
-        ct = cotangents[0]
+    def _derivative(self, primals, output):
+        # dσ/dx = σ(x) - σ(x)²
+        # Recompute from primal (pure-nabla) — never touch Mojo output on GPU
         sig = sigmoid_gpu(primals[0])
-        return [ct * nb.sub(sig, square(sig))]
+        return sig - square(sig)
 
 
 class _SiluMojoOp(UnaryOperation):
-    """Nabla operation wrapping the Mojo silu kernel."""
+    """Mojo silu kernel — forward via Mojo, backward via pure-nabla."""
 
     @property
     def name(self) -> str:
         return "silu_kernel"
 
-    def compute_physical_shape(self, args, kwargs, output_sharding=None):
-        x = args[0]
-        shape = tuple(int(d) for d in x.shape)
-        return [shape], [x.dtype], [x.device]
-
     def kernel(self, args, kwargs):
-        from max.graph import TensorType
-
         x = args[0]
-        shape = tuple(int(d) for d in x.shape)
-        out_type = TensorType(dtype=x.dtype, shape=shape, device=x.device)
-        result = call_custom_kernel("silu_kernel", str(KERNEL_DIR), x, out_type)
+        result = call_custom_kernel(
+            "silu_kernel", KERNEL_DIR, x, x.type, device=x.device
+        )
         return [result]
 
-    def vjp_rule(self, primals, cotangents, outputs, kwargs):
-        # silu'(x) = σ(x) + silu(x)*(1-σ(x)) = σ(x) + silu(x) - silu(x)*σ(x)
-        # Recompute σ(x) for backward (~4 nabla nodes, compiled once)
-        ct = cotangents[0]
-        silu_out = outputs[0]
-        sig = sigmoid_gpu(primals[0])
-        return [ct * (sig + silu_out - nb.mul(silu_out, sig))]
+    def _derivative(self, primals, output):
+        # d(silu)/dx = σ(x) + x*σ(x)*(1-σ(x))
+        # = σ(x) + x*σ(x) - x*σ(x)²
+        # = σ(x) + x*(σ(x) - σ(x)²)
+        # Recompute sigmoid from primal (pure-nabla)
+        x = primals[0]
+        sig = sigmoid_gpu(x)
+        return sig + x * (sig - square(sig))
 
 
 # Module-level op instances
