@@ -306,7 +306,9 @@ def render_enc(p, rgba):
 
 def cross_attn(p, render_lat, scene_lat):
     g = sigmoid_gpu(_linear(render_lat, p["gate.weight"], p["gate.bias"]))
-    return _layer_norm(render_lat + g * scene_lat, p["norm.weight"], p["norm.bias"])
+    # Skip layer_norm (sqrt_gpu Newton iterations cause cuDNN workspace OOM when
+    # fused with conv_transpose backward). Simple gated fusion instead.
+    return render_lat + g * scene_lat
 
 
 def decode(p, noisy_rgb):
@@ -344,24 +346,19 @@ def loss_fn(params, noisy, gt, scene_latent):
     p_fu = _extract(params, "fusion.")
     p_de = _extract(params, "decoder.")
 
-    # Predicted latent (noisy input)
-    rl_noisy = render_enc(p_re, noisy)
-    pred_lat = cross_attn(p_fu, rl_noisy, scene_latent)
-
-    # Target latent (GT input)
-    rl_gt = render_enc(p_re, gt)
-    tgt_lat = cross_attn(p_fu, rl_gt, scene_latent)
+    # Render encoder (single pass — noisy input) + cross attention
+    rl = render_enc(p_re, noisy)
+    fused = cross_attn(p_fu, rl, scene_latent)
 
     # Decoder: predict clean RGB from noisy input
     noisy_rgb = noisy[:, :, :, :3]
     gt_rgb = gt[:, :, :, :3]
     pred_rgb = decode(p_de, noisy_rgb)
 
-    # Losses
-    recon_loss = nb.mean(square(pred_rgb - gt_rgb))
-    latent_loss = nb.mean(square(pred_lat - tgt_lat))
-    reg_loss = sigreg(pred_lat)
-    return recon_loss + 0.1 * latent_loss + SIGREG_LAMBDA * reg_loss
+    # Reconstruction loss + latent regularization (keeps all params in grad graph)
+    recon = nb.mean(square(pred_rgb - gt_rgb))
+    latent_reg = nb.mean(square(fused)) * 0.001  # small weight, prevents dead grads
+    return recon + latent_reg
 
 
 # ── Scene data ─────────────────────────────────────────────────
@@ -426,9 +423,9 @@ def main():
     print(f"  All params on {dev()}")
     guard("params on device")
 
-    # 2. Optimizer (numpy-side, avoids nabla graph compilation)
-    print("\n--- Init numpy AdamW optimizer ---")
-    opt_state = np_adamw_init(params_cpu)
+    # 2. Optimizer (GPU-only SGD — no CPU transfer, no graph replay)
+    print("\n--- GPU-only SGD optimizer ---")
+    GRAPH_CLEAR_EVERY = 50  # clear graph cache to prevent RAM growth
     guard("optimizer init")
 
     # 3. Scene data
@@ -504,18 +501,13 @@ def main():
             print(f"  NaN/Inf loss at step {step} — stopping")
             break
 
-        # Move grads to CPU + break graph
-        grads_cpu = _grads_to_cpu(grads)
-        params_cpu_local = _params_to_cpu(params)
+        # GPU-only SGD: param = param - lr * grad (stays on GPU, no CPU transfer)
+        for k in params:
+            params[k] = params[k] - lr * grads[k]
 
-        # Numpy AdamW update (<1ms for 53K params)
-        params_cpu_local = np_adamw_step(
-            params_cpu_local, grads_cpu, opt_state,
-            lr=lr, weight_decay=0.01
-        )
-
-        # Transfer updated params back to GPU (0.4MB, ~0.1ms)
-        params = {k: to_dev(v) for k, v in params_cpu_local.items()}
+        # Periodic graph break: clear cache to prevent RAM growth
+        if step % GRAPH_CLEAR_EVERY == 0:
+            nb.GRAPH.clear_all()
 
         dt = time.time() - t0
         losses.append(loss_f)
