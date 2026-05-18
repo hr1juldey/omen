@@ -178,28 +178,16 @@ def init_params():
     p["fusion.norm.weight"] = np.ones((L,), dtype=np.float32)
     p["fusion.norm.bias"] = _zeros(L)
 
-    # decoder: U-Net — 3 encoder convs + 3 decoder convs with skip connections
-    # Encoder path: (B,H,W,3) RGB
-    # e1: 3→16, 3x3, stride=1 → (B, H, W, 16)  — skip s1
-    p["decoder.e1_filter"] = _rand(3, 3, 3, 16, scale=0.05)
-    p["decoder.e1_bias"] = _zeros(16)
-    # e2: 16→32, 3x3, stride=2 → (B, H/2, W/2, 32) — skip s2
-    p["decoder.e2_filter"] = _rand(3, 3, 16, 32, scale=0.05)
-    p["decoder.e2_bias"] = _zeros(32)
-    # e3: 32→64, 3x3, stride=2 → (B, H/4, W/4, 64) — bottleneck
-    p["decoder.e3_filter"] = _rand(3, 3, 32, 64, scale=0.05)
-    p["decoder.e3_bias"] = _zeros(64)
-
-    # Decoder path: d3→upsample→d2(concat s2)→upsample→d1(concat s1)
-    # d3: e3(64ch) → 32ch, no skip at bottleneck level
-    p["decoder.d3_filter"] = _rand(3, 3, 64, 32, scale=0.05)
-    p["decoder.d3_bias"] = _zeros(32)
-    # d2: concat(d3_up, s2) = 32+32=64ch → 16ch
-    p["decoder.d2_filter"] = _rand(3, 3, 64, 16, scale=0.05)
-    p["decoder.d2_bias"] = _zeros(16)
-    # d1: concat(d2_up, s1) = 16+16=32ch → 3ch (RGB)
-    p["decoder.d1_filter"] = _rand(3, 3, 32, 3, scale=0.05)
-    p["decoder.d1_bias"] = _zeros(3)
+    # decoder: 4x stride-1 conv2d layers (no stride-2 → no conv_transpose backward)
+    # (B,H,W,3) → conv1(32ch) → conv2(32ch) → conv3(16ch) → conv4(3ch)
+    p["decoder.conv1_filter"] = _rand(3, 3, 3, 32, scale=0.05)
+    p["decoder.conv1_bias"] = _zeros(32)
+    p["decoder.conv2_filter"] = _rand(3, 3, 32, 32, scale=0.05)
+    p["decoder.conv2_bias"] = _zeros(32)
+    p["decoder.conv3_filter"] = _rand(3, 3, 32, 16, scale=0.05)
+    p["decoder.conv3_bias"] = _zeros(16)
+    p["decoder.conv4_filter"] = _rand(3, 3, 16, 3, scale=0.05)
+    p["decoder.conv4_bias"] = _zeros(3)
 
     return p
 
@@ -274,64 +262,26 @@ def cross_attn(p, render_lat, scene_lat):
     return _layer_norm(render_lat + g * scene_lat, p["norm.weight"], p["norm.bias"])
 
 
-def _upsample_2x(x):
-    """Nearest-neighbor 2x upsample for (B,H,W,C) via reshape + broadcast_to.
-
-    (B,H,W,C) → reshape(B,H,1,W,1,C) → broadcast(B,H,2,W,2,C) → reshape(B,2H,2W,C)
-    """
-    B = int(x.shape[0])
-    H = int(x.shape[1])
-    W = int(x.shape[2])
-    C = int(x.shape[3])
-    # Insert size-1 dims for spatial axes
-    y = nb.reshape(x, (B, H, 1, W, 1, C))
-    # Broadcast those to size 2
-    y = nb.broadcast_to(y, (B, H, 2, W, 2, C))
-    # Collapse back to (B, 2H, 2W, C)
-    return nb.reshape(y, (B, H * 2, W * 2, C))
-
-
 def decode(p, noisy_rgb):
-    """U-Net decoder: noisy_rgb in → predicted clean RGB out.
+    """Simple 4-layer stride-1 conv2d decoder: noisy_rgb → predicted clean RGB.
 
-    3 encoder convs (stride-2 downsample) with skip connections
-    to 3 decoder convs (upsample + concat + conv).
+    All stride=1, padding=1 → no conv_transpose in backward pass.
+    (B,H,W,3) → 32ch → 32ch → 16ch → 3ch.
     """
-    # Encoder path
-    s1 = silu_gpu(
-        nb.conv2d(noisy_rgb, p["e1_filter"], padding=(1, 1, 1, 1),
-                  bias=p["e1_bias"])
-    )  # (B, H, W, 16)   — skip
-    s2 = silu_gpu(
-        nb.conv2d(s1, p["e2_filter"], stride=(2, 2), padding=(1, 1, 1, 1),
-                  bias=p["e2_bias"])
-    )  # (B, H/2, W/2, 32) — skip
-    e3 = silu_gpu(
-        nb.conv2d(s2, p["e3_filter"], stride=(2, 2), padding=(1, 1, 1, 1),
-                  bias=p["e3_bias"])
-    )  # (B, H/4, W/4, 64) — bottleneck
-
-    # Decoder path
-    # d3: bottleneck (64ch) → 32ch, no skip at this scale
-    d3 = silu_gpu(
-        nb.conv2d(e3, p["d3_filter"], padding=(1, 1, 1, 1),
-                  bias=p["d3_bias"])
-    )  # (B, H/4, W/4, 32)
-    d3_up = _upsample_2x(d3)  # (B, H/2, W/2, 32)
-
-    # d2: concat(d3_up, s2) = 32+32 = 64ch → 16ch
-    d2_cat = nb.concatenate([d3_up, s2], axis=-1)
-    d2 = silu_gpu(
-        nb.conv2d(d2_cat, p["d2_filter"], padding=(1, 1, 1, 1),
-                  bias=p["d2_bias"])
-    )  # (B, H/2, W/2, 16)
-    d2_up = _upsample_2x(d2)  # (B, H, W, 16)
-
-    # d1: concat(d2_up, s1) = 16+16 = 32ch → 3ch (RGB)
-    d1_cat = nb.concatenate([d2_up, s1], axis=-1)
-    out = nb.conv2d(d1_cat, p["d1_filter"], padding=(1, 1, 1, 1),
-                    bias=p["d1_bias"])  # (B, H, W, 3)
-    return out
+    x = silu_gpu(
+        nb.conv2d(noisy_rgb, p["conv1_filter"], padding=(1, 1, 1, 1),
+                  bias=p["conv1_bias"])
+    )
+    x = silu_gpu(
+        nb.conv2d(x, p["conv2_filter"], padding=(1, 1, 1, 1),
+                  bias=p["conv2_bias"])
+    )
+    x = silu_gpu(
+        nb.conv2d(x, p["conv3_filter"], padding=(1, 1, 1, 1),
+                  bias=p["conv3_bias"])
+    )
+    return nb.conv2d(x, p["conv4_filter"], padding=(1, 1, 1, 1),
+                     bias=p["conv4_bias"])
 
 
 def sigreg(pred_latent):
@@ -471,37 +421,18 @@ def main():
     print(f"  First step: {dt:.1f}s (includes JIT compile), loss={loss_f:.4f}")
     compile_time = dt
 
-    # Warmup optimizer step
+    # Warmup optimizer step (eager, no graph break — same as matmul test)
     params, opt_state = adamw_update(
         params, grads, opt_state, lr=BASE_LR / WARMUP, weight_decay=0.01
     )
-    params = _to_dev(_break_graph(params))
-    opt_state = _to_dev(_break_graph(opt_state))
     guard("warmup done")
 
-    # 5. Second step (should use cached graph)
-    print("\n--- Second step (cached graph) ---")
-    t0 = time.time()
-    loss_val, grads = nb.value_and_grad(loss_fn, argnums=0)(
-        params, noisy, gt, scene_latent
-    )
-    nb.realize_all(loss_val, grads)
-    dt = time.time() - t0
-    loss_f = float(to_cpu(loss_val))
-    print(f"  Second step: {dt:.1f}s, loss={loss_f:.4f}")
-
-    params, opt_state = adamw_update(
-        params, grads, opt_state, lr=BASE_LR / WARMUP, weight_decay=0.01
-    )
-    params = _to_dev(_break_graph(params))
-    opt_state = _to_dev(_break_graph(opt_state))
-    guard("step 2 done")
-
-    # 6. Training loop — run until 120 minutes elapsed
+    # 5. Training loop — run until 120 minutes elapsed
     start_time = time.time()
     step = 0
     best_loss = float("inf")
     losses = []
+    GRAPH_BREAK_EVERY = 100
 
     print(f"\n--- Training loop (target {TOTAL_SECONDS // 60} min) ---")
     while True:
@@ -535,9 +466,10 @@ def main():
             params, grads, opt_state, lr=lr, weight_decay=0.01
         )
 
-        # Graph break: prevent RAM leak from lazy tensor accumulation
-        params = _to_dev(_break_graph(params))
-        opt_state = _to_dev(_break_graph(opt_state))
+        # Periodic graph break: prevent RAM leak from lazy tensor accumulation
+        if step % GRAPH_BREAK_EVERY == 0:
+            params = _to_dev(_break_graph(params))
+            opt_state = _to_dev(_break_graph(opt_state))
 
         dt = time.time() - t0
         losses.append(loss_f)
