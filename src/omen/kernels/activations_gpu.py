@@ -35,13 +35,15 @@ class _SigmoidMojoOp(UnaryOperation):
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
         x = args[0]
-        return [x.shape], [x.dtype], [x.device]
+        shape = tuple(int(d) for d in x.shape)
+        return [shape], [x.dtype], [x.device]
 
     def kernel(self, args, kwargs):
         from max.graph import TensorType
 
         x = args[0]
-        out_type = TensorType(dtype=x.dtype, shape=x.shape, device=x.device)
+        shape = tuple(int(d) for d in x.shape)
+        out_type = TensorType(dtype=x.dtype, shape=shape, device=x.device)
         result = call_custom_kernel("sigmoid_kernel", str(KERNEL_DIR), x, out_type)
         return [result]
 
@@ -62,13 +64,15 @@ class _SiluMojoOp(UnaryOperation):
 
     def compute_physical_shape(self, args, kwargs, output_sharding=None):
         x = args[0]
-        return [x.shape], [x.dtype], [x.device]
+        shape = tuple(int(d) for d in x.shape)
+        return [shape], [x.dtype], [x.device]
 
     def kernel(self, args, kwargs):
         from max.graph import TensorType
 
         x = args[0]
-        out_type = TensorType(dtype=x.dtype, shape=x.shape, device=x.device)
+        shape = tuple(int(d) for d in x.shape)
+        out_type = TensorType(dtype=x.dtype, shape=shape, device=x.device)
         result = call_custom_kernel("silu_kernel", str(KERNEL_DIR), x, out_type)
         return [result]
 

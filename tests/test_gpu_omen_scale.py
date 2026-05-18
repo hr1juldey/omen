@@ -42,6 +42,7 @@ import nabla as nb
 from max.driver import CPU, Accelerator, accelerator_count
 from nabla.ops import Operation
 from omen.kernels.activations import sigmoid_gpu, silu_gpu, square
+from omen.kernels.activations_gpu import sigmoid_mojo, silu_mojo
 from omen.scenes import (
     build_foggy_corridor,
     build_shaderball,
@@ -292,50 +293,50 @@ def _pixel_shuffle(x, r=2):
     return nb.reshape(y, (B, H * r, W * r, C // (r * r)))
 
 
-def render_encoder(p, rgba):
+def render_encoder(p, rgba, silu_fn=silu_gpu):
     """3 conv2d (stride=2) → global pool → linear.  Mirrors RenderFeatureEncoder."""
-    x = silu_gpu(conv2d(rgba, p["re_f1"], stride=2, padding=1, bias=p["re_b1"]))
-    x = silu_gpu(conv2d(x, p["re_f2"], stride=2, padding=1, bias=p["re_b2"]))
-    x = silu_gpu(conv2d(x, p["re_f3"], stride=2, padding=1, bias=p["re_b3"]))
+    x = silu_fn(conv2d(rgba, p["re_f1"], stride=2, padding=1, bias=p["re_b1"]))
+    x = silu_fn(conv2d(x, p["re_f2"], stride=2, padding=1, bias=p["re_b2"]))
+    x = silu_fn(conv2d(x, p["re_f3"], stride=2, padding=1, bias=p["re_b3"]))
     x = x.mean(axis=(1, 2))
     return _linear(x, p["re_pw"], p["re_pb"])
 
 
-def scene_encoder(p, scene_feat):
+def scene_encoder(p, scene_feat, silu_fn=silu_gpu):
     """Linear(18→64) → proj(64→LATENT).  Simplified scene graph encoder."""
-    h = silu_gpu(_linear(scene_feat, p["se_w1"], p["se_b1"]))
+    h = silu_fn(_linear(scene_feat, p["se_w1"], p["se_b1"]))
     return _linear(h, p["se_pw"], p["se_pb"])
 
 
-def cross_attn(p, render_lat, scene_lat):
+def cross_attn(p, render_lat, scene_lat, sigmoid_fn=sigmoid_gpu):
     """Gated fusion. Mirrors CrossAttentionFusion (no LayerNorm — GPU-safe)."""
-    g = sigmoid_gpu(_linear(render_lat, p["ca_gw"], p["ca_gb"]))
+    g = sigmoid_fn(_linear(render_lat, p["ca_gw"], p["ca_gb"]))
     return render_lat + g * scene_lat
 
 
-def unet_decoder(p, latent, noisy_img):
+def unet_decoder(p, latent, noisy_img, silu_fn=silu_gpu, sigmoid_fn=sigmoid_gpu):
     """U-Net: 4 enc conv2d + bottleneck + 4 dec conv2d.  Mirrors Decoder."""
     # Encoder
-    s1 = silu_gpu(conv2d(noisy_img, p["de1"], padding=1))
-    s2 = silu_gpu(conv2d(s1, p["de2"], stride=2, padding=1))
-    s3 = silu_gpu(conv2d(s2, p["de3"], stride=2, padding=1))
-    e4 = silu_gpu(conv2d(s3, p["de4"], stride=2, padding=1))
+    s1 = silu_fn(conv2d(noisy_img, p["de1"], padding=1))
+    s2 = silu_fn(conv2d(s1, p["de2"], stride=2, padding=1))
+    s3 = silu_fn(conv2d(s2, p["de3"], stride=2, padding=1))
+    e4 = silu_fn(conv2d(s3, p["de4"], stride=2, padding=1))
 
     # Bottleneck: gated latent injection
-    gate = sigmoid_gpu(_linear(latent, p["lg_w"], p["lg_b"]))
+    gate = sigmoid_fn(_linear(latent, p["lg_w"], p["lg_b"]))
     l_feat = gate * _linear(latent, p["lp_w"], p["lp_b"])
     C_bn = int(e4.shape[-1])
     bn = e4 * nb.reshape(l_feat, (1, 1, 1, C_bn))
 
     # Decoder: pixel shuffle + skip concat + conv
     d4 = _pixel_shuffle(_linear(bn, p["up4_w"], p["up4_b"]))
-    d4 = silu_gpu(conv2d(nb.concatenate([d4, s3], axis=-1), p["dd4"], padding=1))
+    d4 = silu_fn(conv2d(nb.concatenate([d4, s3], axis=-1), p["dd4"], padding=1))
 
     d3 = _pixel_shuffle(_linear(d4, p["up3_w"], p["up3_b"]))
-    d3 = silu_gpu(conv2d(nb.concatenate([d3, s2], axis=-1), p["dd3"], padding=1))
+    d3 = silu_fn(conv2d(nb.concatenate([d3, s2], axis=-1), p["dd3"], padding=1))
 
     d2 = _pixel_shuffle(_linear(d3, p["up2_w"], p["up2_b"]))
-    d2 = silu_gpu(conv2d(nb.concatenate([d2, s1], axis=-1), p["dd2"], padding=1))
+    d2 = silu_fn(conv2d(nb.concatenate([d2, s1], axis=-1), p["dd2"], padding=1))
 
     return conv2d(d2, p["dd1"], padding=1)
 
@@ -490,9 +491,9 @@ def stage_b(res=64, latent=256, steps=10, scene_idx=1, **_kw):
     p.update(_init_cross_attn(latent))
 
     def loss_fn(p, noisy, scene_f, gt_lat):
-        scene_lat = scene_encoder(p, scene_f)
-        render_lat = render_encoder(p, noisy)
-        fused = cross_attn(p, render_lat, scene_lat)
+        scene_lat = scene_encoder(p, scene_f, silu_fn=silu_mojo)
+        render_lat = render_encoder(p, noisy, silu_fn=silu_mojo)
+        fused = cross_attn(p, render_lat, scene_lat, sigmoid_fn=sigmoid_mojo)
         return nb.mean(square(fused - gt_lat))
 
     _report("B-init", p, time.time())
