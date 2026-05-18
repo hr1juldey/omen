@@ -50,7 +50,9 @@ class SSIMComputeOp(UnaryOperation):
         h = int(source.shape[1]) - 2 * _PAD
         w = int(source.shape[2]) - 2 * _PAD
         out_type = TensorType(dtype=source.dtype, shape=(h, w), device=source.device)
-        result = call_custom_kernel("ssim_compute", str(KERNEL_DIR), source, out_type)
+        result = call_custom_kernel(
+            "ssim_compute", str(KERNEL_DIR), source, out_type, device=source.device
+        )
         return [result]
 
 

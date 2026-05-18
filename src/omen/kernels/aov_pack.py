@@ -41,7 +41,9 @@ class AOVPackOp(UnaryOperation):
         x = args[0]
         h, w = int(x.shape[0]), int(x.shape[1])
         out_type = TensorType(dtype=x.dtype, shape=(h, w, PACKED_CH), device=x.device)
-        result = call_custom_kernel("aov_pack", str(KERNEL_DIR), x, out_type)
+        result = call_custom_kernel(
+            "aov_pack", str(KERNEL_DIR), x, out_type, device=x.device
+        )
         return [result]
 
 

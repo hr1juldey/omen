@@ -57,7 +57,9 @@ class MLACompressOp(UnaryOperation):
         out_type = TensorType(
             dtype=source.dtype, shape=(self.n, self.c_latent), device=source.device
         )
-        result = call_custom_kernel("mla_compress", str(KERNEL_DIR), source, out_type)
+        result = call_custom_kernel(
+            "mla_compress", str(KERNEL_DIR), source, out_type, device=source.device
+        )
         return [result]
 
 
@@ -83,7 +85,7 @@ class MLAReconstructOp(UnaryOperation):
             dtype=source.dtype, shape=(self.n, self.c_in), device=source.device
         )
         result = call_custom_kernel(
-            "mla_reconstruct", str(KERNEL_DIR), source, out_type
+            "mla_reconstruct", str(KERNEL_DIR), source, out_type, device=source.device
         )
         return [result]
 

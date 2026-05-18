@@ -83,7 +83,9 @@ class TileFingerprintOp(UnaryOperation):
         out_type = TensorType(
             dtype=x.dtype, shape=(h // TILE_SIZE, w // TILE_SIZE, FINGERPRINT_DIM), device=x.device
         )
-        result = call_custom_kernel("tile_fingerprint", str(KERNEL_DIR), x, out_type)
+        result = call_custom_kernel(
+            "tile_fingerprint", str(KERNEL_DIR), x, out_type, device=x.device
+        )
         return [result]
 
 

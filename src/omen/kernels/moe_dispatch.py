@@ -61,7 +61,9 @@ class MoEDispatchOp(UnaryOperation):
             shape=(self.tokens, self.channels),
             device=source.device,
         )
-        result = call_custom_kernel("moe_dispatch", str(KERNEL_DIR), source, out_type)
+        result = call_custom_kernel(
+            "moe_dispatch", str(KERNEL_DIR), source, out_type, device=source.device
+        )
         return [result]
 
 

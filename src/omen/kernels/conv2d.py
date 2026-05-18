@@ -107,7 +107,9 @@ class Im2colOp(UnaryOperation):
         out_type = TensorType(
             dtype=x.dtype, shape=(b * hout * wout, self.kh * self.kw * cin), device=x.device
         )
-        result = call_custom_kernel("conv2d_im2col", str(KERNEL_DIR), [x, params], out_type)
+        result = call_custom_kernel(
+            "conv2d_im2col", str(KERNEL_DIR), [x, params], out_type, device=x.device
+        )
         return [result]
 
 
@@ -144,7 +146,9 @@ class Col2imOp(UnaryOperation):
         out_type = TensorType(
             dtype=col.dtype, shape=(self.b, self.h, self.w, self.cin), device=col.device
         )
-        result = call_custom_kernel("conv2im_col2im", str(KERNEL_DIR), [col, params], out_type)
+        result = call_custom_kernel(
+            "conv2im_col2im", str(KERNEL_DIR), [col, params], out_type, device=col.device
+        )
         return [result]
 
 
@@ -159,6 +163,9 @@ def _im2col_gpu(x, kh, kw, sh, sw, ph, pw):
         [hout, wout, kh, kw, c_in, sh, sw, ph, pw, h, w], dtype=np.float32
     )
     params = nb.Tensor.from_dlpack(params_np)
+    # Transfer params to same device as input — avoids CPU/GPU device mismatch
+    if hasattr(x, "device") and str(x.device) != "cpu":
+        params = nb.ops.transfer_to(params, x.device)
     op = Im2colOp(kh=kh, kw=kw, sh=sh, sw=sw, ph=ph, pw=pw)
     return op([x, params], {})[0]
 
@@ -173,6 +180,9 @@ def _col2im_gpu(col, kh, kw, sh, sw, ph, pw, b, h, w, cin):
         [hout, wout, kh, kw, cin, sh, sw, ph, pw, h, w], dtype=np.float32
     )
     params = nb.Tensor.from_dlpack(params_np)
+    # Transfer params to same device as col — avoids CPU/GPU device mismatch
+    if hasattr(col, "device") and str(col.device) != "cpu":
+        params = nb.ops.transfer_to(params, col.device)
     op = Col2imOp(kh=kh, kw=kw, sh=sh, sw=sw, ph=ph, pw=pw, b=b, h=h, w=w, cin=cin)
     return op([col, params], {})[0]
 
