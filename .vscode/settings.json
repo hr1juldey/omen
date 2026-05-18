@@ -1,32 +1,32 @@
-{
-  //"python.defaultInterpreterPath": "/.venv/bin/python",
-  "python.analysis.extraPaths": [],
-  "workbench.editorAssociations": {
-    "*.md": "vscode.markdown.preview.editor",
-    "*.csv": "default"
-  },
-  "[markdown]": {
-    "editor.formatOnSave": true,
-    "editor.formatOnPaste": true
-  },
-  "editor.codeActionsOnSave": {
-    "source.fixAll.markdownlint": "explicit"
-  },
-  //"terminal.explorerKind": "external",
-  "terminal.integrated.enableImages": true,
-  "terminal.integrated.defaultProfile.linux": "bash",
-  "terminal.integrated.fontFamily": "'DejaVu Sans Mono','Noto Sans Bengali','monospace'",
-  "terminal.integrated.fontSize": 14,
-  "terminal.integrated.gpuAcceleration": "on",
-  "terminal.integrated.scrollback": 10000,
-  // Keep unlimited editors open
-  "workbench.editor.enablePreview": true,
-  "workbench.editor.limit.enabled": true,
-  "workbench.editor.limit.perEditorGroup": false,
-  "workbench.editor.limit.value": 100,
-  "python.analysis.autoSearchPaths": true,
-  "python.analysis.autoImportCompletions": true,
-  "python.terminal.activateEnvironment": true,
-  "pylance.inlayHints.variableTypes": true,
-  "pylance.inlayHints.functionReturnTypes": true
-}
+// {
+//   //"python.defaultInterpreterPath": "/.venv/bin/python",
+//   "python.analysis.extraPaths": [],
+//   "workbench.editorAssociations": {
+//     "*.md": "vscode.markdown.preview.editor",
+//     "*.csv": "default"
+//   },
+//   "[markdown]": {
+//     "editor.formatOnSave": true,
+//     "editor.formatOnPaste": true
+//   },
+//   "editor.codeActionsOnSave": {
+//     "source.fixAll.markdownlint": "explicit"
+//   },
+//   //"terminal.explorerKind": "external",
+//   "terminal.integrated.enableImages": true,
+//   "terminal.integrated.defaultProfile.linux": "bash",
+//   "terminal.integrated.fontFamily": "'DejaVu Sans Mono','Noto Sans Bengali','monospace'",
+//   "terminal.integrated.fontSize": 14,
+//   "terminal.integrated.gpuAcceleration": "on",
+//   "terminal.integrated.scrollback": 10000,
+//   // Keep unlimited editors open
+//   "workbench.editor.enablePreview": true,
+//   "workbench.editor.limit.enabled": true,
+//   "workbench.editor.limit.perEditorGroup": false,
+//   "workbench.editor.limit.value": 100,
+//   "python.analysis.autoSearchPaths": true,
+//   "python.analysis.autoImportCompletions": true,
+//   "python.terminal.activateEnvironment": true,
+//   "pylance.inlayHints.variableTypes": true,
+//   "pylance.inlayHints.functionReturnTypes": true
+// }
