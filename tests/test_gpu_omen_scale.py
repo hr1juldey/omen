@@ -61,7 +61,7 @@ logging.basicConfig(
 log = logging.getLogger("omen_scale")
 
 WARN_MB = 20 * 1024
-KILL_MB = 24 * 1024
+KILL_MB = 28 * 1024
 
 # Real scenes — NOT Cornell Box (too simple, nothing to learn)
 SCENE_BUILDERS = [
@@ -96,7 +96,11 @@ def _vram_mb():
 def _gpu_util():
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
             text=True,
         )
         return int(out.strip())
@@ -111,7 +115,9 @@ def guard(label=""):
         sys.exit(99)
     if rss > WARN_MB:
         log.warning("WARN: RSS=%dMB > %dMB %s", rss, WARN_MB, label)
-    log.info("[guard] RSS=%dMB VRAM=%dMB GPU=%d%%  %s", rss, _vram_mb(), _gpu_util(), label)
+    log.info(
+        "[guard] RSS=%dMB VRAM=%dMB GPU=%d%%  %s", rss, _vram_mb(), _gpu_util(), label
+    )
     return rss
 
 
@@ -147,7 +153,11 @@ def _report(stage, params_np, t0, step_ms=None):
     n_p = _param_count(params_np)
     log.info(
         "[%s] params=%s RSS=%dMB VRAM=%dMB GPU=%d%%",
-        stage, f"{n_p:,}", rss, vram, _gpu_util(),
+        stage,
+        f"{n_p:,}",
+        rss,
+        vram,
+        _gpu_util(),
     )
     if step_ms:
         log.info("[%s] step=%dms", stage, step_ms)
@@ -157,17 +167,31 @@ def _report(stage, params_np, t0, step_ms=None):
 def _render_pair(res, scene_idx=0, gt_spp=64, noisy_spp=2):
     """Render real GT+noisy pair from a complex Mitsuba scene."""
     name, builder = SCENE_BUILDERS[scene_idx % len(SCENE_BUILDERS)]
-    log.info("  Rendering %s at %dx%d (gt_spp=%d noisy_spp=%d)...", name, res, res, gt_spp, noisy_spp)
+    log.info(
+        "  Rendering %s at %dx%d (gt_spp=%d noisy_spp=%d)...",
+        name,
+        res,
+        res,
+        gt_spp,
+        noisy_spp,
+    )
     scene, sg = builder(resolution=(res, res))
     gt = np.array(mi.render(scene, spp=gt_spp, seed=0))[:, :, :3].astype(np.float32)
-    noisy = np.array(mi.render(scene, spp=noisy_spp, seed=42))[:, :, :3].astype(np.float32)
+    noisy = np.array(mi.render(scene, spp=noisy_spp, seed=42))[:, :, :3].astype(
+        np.float32
+    )
     # RGBA: add alpha=1.0 channel
     alpha = np.ones((res, res, 1), dtype=np.float32)
     noisy_rgba = np.concatenate([noisy, alpha], axis=-1)[np.newaxis]  # (1, H, W, 4)
     gt_rgb = gt[np.newaxis]  # (1, H, W, 3)
     feat = _scene_feat(sg)[np.newaxis]  # (1, 18)
-    log.info("  noisy range=[%.4f,%.4f] gt range=[%.4f,%.4f]",
-             noisy.min(), noisy.max(), gt.min(), gt.max())
+    log.info(
+        "  noisy range=[%.4f,%.4f] gt range=[%.4f,%.4f]",
+        noisy.min(),
+        noisy.max(),
+        gt.min(),
+        gt.max(),
+    )
     return noisy_rgba, gt_rgb, feat
 
 
@@ -183,7 +207,11 @@ def _scene_feat(sg, dim=18):
     light = sg.get("lights", {})
     if "params" in light:
         parts.append(np.mean(np.array(light["params"]), axis=0).flatten())
-    feat = np.concatenate(parts).astype(np.float32) if parts else np.zeros(dim, dtype=np.float32)
+    feat = (
+        np.concatenate(parts).astype(np.float32)
+        if parts
+        else np.zeros(dim, dtype=np.float32)
+    )
     if feat.shape[0] < dim:
         feat = np.pad(feat, (0, dim - feat.shape[0]))
     return feat[:dim]
@@ -192,7 +220,11 @@ def _scene_feat(sg, dim=18):
 # ── Conv2dMojoOp (from test_gpu_mojo_conv2d_backward.py) ─────
 def _parse_sp(stride, padding):
     sh = sw = stride if isinstance(stride, int) else stride[0]
-    ph = pw = padding if isinstance(padding, int) else (padding[0] if isinstance(padding, (tuple, list)) else 0)
+    ph = pw = (
+        padding
+        if isinstance(padding, int)
+        else (padding[0] if isinstance(padding, (tuple, list)) else 0)
+    )
     return sh, sw, ph, pw
 
 
@@ -210,7 +242,7 @@ def _col2im(col, b, h, w, c_in, kh, kw, ph, pw, h_out, w_out):
     for p in parts[1:]:
         result = result + p
     if ph > 0 or pw > 0:
-        result = result[:, ph:ph + h, pw:pw + w, :]
+        result = result[:, ph : ph + h, pw : pw + w, :]
     return result
 
 
@@ -231,11 +263,16 @@ class Conv2dMojoOp(Operation):
 
     def kernel(self, args, kwargs):
         from max.graph import ops as graph_ops
+
         x, filt = args[0], args[1]
         sh, sw = kwargs["sh"], kwargs["sw"]
         ph, pw = kwargs["ph"], kwargs["pw"]
         bias = args[2] if len(args) > 2 else None
-        return [graph_ops.conv2d(x, filt, stride=(sh, sw), padding=(ph, ph, pw, pw), bias=bias)]
+        return [
+            graph_ops.conv2d(
+                x, filt, stride=(sh, sw), padding=(ph, ph, pw, pw), bias=bias
+            )
+        ]
 
     def vjp_rule(self, primals, cotangents, outputs, kwargs):
         x, filt = primals[0], primals[1]
@@ -247,19 +284,35 @@ class Conv2dMojoOp(Operation):
         h_out = (h + 2 * ph - kh) // sh + 1
         w_out = (w + 2 * pw - kw) // sw + 1
 
-        x_pad = nb.pad(x, ((0, 0), (ph, ph), (pw, pw), (0, 0))) if (ph > 0 or pw > 0) else x
+        x_pad = (
+            nb.pad(x, ((0, 0), (ph, ph), (pw, pw), (0, 0))) if (ph > 0 or pw > 0) else x
+        )
         patch_list = []
         for ki in range(kh):
             for kj in range(kw):
-                p = x_pad[:, ki:ki + h_out, kj:kj + w_out, :]
+                p = x_pad[:, ki : ki + h_out, kj : kj + w_out, :]
                 patch_list.append(nb.reshape(p, (b * h_out * w_out, c_in)))
         patches = nb.concatenate(patch_list, axis=1)
 
         ct_flat = nb.reshape(ct, (b * h_out * w_out, c_out))
         filt_flat = nb.reshape(filt, (kh * kw * c_in, c_out))
 
-        grad_filt = nb.reshape(nb.matmul(nb.transpose(patches, 1, 0), ct_flat), (kh, kw, c_in, c_out))
-        grad_input = _col2im(nb.matmul(ct_flat, nb.transpose(filt_flat, 1, 0)), b, h, w, c_in, kh, kw, ph, pw, h_out, w_out)
+        grad_filt = nb.reshape(
+            nb.matmul(nb.transpose(patches, 1, 0), ct_flat), (kh, kw, c_in, c_out)
+        )
+        grad_input = _col2im(
+            nb.matmul(ct_flat, nb.transpose(filt_flat, 1, 0)),
+            b,
+            h,
+            w,
+            c_in,
+            kh,
+            kw,
+            ph,
+            pw,
+            h_out,
+            w_out,
+        )
 
         if len(primals) > 2:
             return [grad_input, grad_filt, nb.sum(ct, axis=(0, 1, 2))]
@@ -346,29 +399,36 @@ def _he(shape):
     """He normal init."""
     fan_in = int(np.prod(shape[:-1])) if len(shape) > 1 else shape[0]
     std = np.sqrt(2.0 / fan_in)
-    return (np.random.randn(*shape).astype(np.float32) * std)
+    return np.random.randn(*shape).astype(np.float32) * std
 
 
 def _init_render_encoder(latent, ch_enc=(32, 64, 128)):
     c1, c2, c3 = ch_enc
     return {
-        "re_f1": _he((3, 3, 4, c1)), "re_b1": np.zeros(c1, dtype=np.float32),
-        "re_f2": _he((3, 3, c1, c2)), "re_b2": np.zeros(c2, dtype=np.float32),
-        "re_f3": _he((3, 3, c2, c3)), "re_b3": np.zeros(c3, dtype=np.float32),
-        "re_pw": _he((c3, latent)), "re_pb": np.zeros(latent, dtype=np.float32),
+        "re_f1": _he((3, 3, 4, c1)),
+        "re_b1": np.zeros(c1, dtype=np.float32),
+        "re_f2": _he((3, 3, c1, c2)),
+        "re_b2": np.zeros(c2, dtype=np.float32),
+        "re_f3": _he((3, 3, c2, c3)),
+        "re_b3": np.zeros(c3, dtype=np.float32),
+        "re_pw": _he((c3, latent)),
+        "re_pb": np.zeros(latent, dtype=np.float32),
     }
 
 
 def _init_scene_encoder(latent, scene_dim=18):
     return {
-        "se_w1": _he((scene_dim, 64)), "se_b1": np.zeros(64, dtype=np.float32),
-        "se_pw": _he((64, latent)), "se_pb": np.zeros(latent, dtype=np.float32),
+        "se_w1": _he((scene_dim, 64)),
+        "se_b1": np.zeros(64, dtype=np.float32),
+        "se_pw": _he((64, latent)),
+        "se_pb": np.zeros(latent, dtype=np.float32),
     }
 
 
 def _init_cross_attn(latent):
     return {
-        "ca_gw": _he((latent, latent)), "ca_gb": np.zeros(latent, dtype=np.float32),
+        "ca_gw": _he((latent, latent)),
+        "ca_gb": np.zeros(latent, dtype=np.float32),
     }
 
 
@@ -379,11 +439,16 @@ def _init_decoder(latent, enc_ch=(64, 128, 256, 256)):
         "de2": _he((3, 3, c1, c2)),
         "de3": _he((3, 3, c2, c3)),
         "de4": _he((3, 3, c3, c4)),
-        "lg_w": _he((latent, c4)), "lg_b": np.zeros(c4, dtype=np.float32),
-        "lp_w": _he((latent, c4)), "lp_b": np.zeros(c4, dtype=np.float32),
-        "up4_w": _he((c4, c4 * 4)), "up4_b": np.zeros(c4 * 4, dtype=np.float32),
-        "up3_w": _he((c4, c3 * 4)), "up3_b": np.zeros(c3 * 4, dtype=np.float32),
-        "up2_w": _he((c3, c2 * 4)), "up2_b": np.zeros(c2 * 4, dtype=np.float32),
+        "lg_w": _he((latent, c4)),
+        "lg_b": np.zeros(c4, dtype=np.float32),
+        "lp_w": _he((latent, c4)),
+        "lp_b": np.zeros(c4, dtype=np.float32),
+        "up4_w": _he((c4, c4 * 4)),
+        "up4_b": np.zeros(c4 * 4, dtype=np.float32),
+        "up3_w": _he((c4, c3 * 4)),
+        "up3_b": np.zeros(c3 * 4, dtype=np.float32),
+        "up2_w": _he((c3, c2 * 4)),
+        "up2_b": np.zeros(c2 * 4, dtype=np.float32),
         "dd4": _he((3, 3, c4 + c3, c3)),
         "dd3": _he((3, 3, c3 + c2, c2)),
         "dd2": _he((3, 3, c2 + c1, c1)),
@@ -444,8 +509,14 @@ def train_loop(params_np, loss_fn, data_np, *, steps=10, lr=1e-3, label=""):
         cleanup()
 
     steady_ms = int(t_first * 1000) if t_first else int(t_compile * 1000)
-    log.info("%s compile=%.1fs steady=%dms loss %.4f→%.4f",
-             label, t_compile or 0, steady_ms, losses[0], losses[-1])
+    log.info(
+        "%s compile=%.1fs steady=%dms loss %.4f→%.4f",
+        label,
+        t_compile or 0,
+        steady_ms,
+        losses[0],
+        losses[-1],
+    )
     return losses, params_np
 
 
@@ -476,28 +547,51 @@ def stage_a(res=64, latent=256, steps=10, scene_idx=0, **_kw):
 
 
 # ── Stage B: Render + Scene + Fusion ──────────────────────────
-def stage_b(res=64, latent=256, steps=10, scene_idx=1, **_kw):
+def stage_b(res=256, latent=128, steps=10, scene_idx=1, **_kw):
     log.info("=" * 60)
-    log.info("Stage B: Render + Scene + Fusion latent=%d", latent)
+    log.info("Stage B: Render + Scene + Fusion 256x256 latent=%d", latent)
+    log.info("  2 conv2d (4→16→16), Mojo activations, 24GB budget")
     log.info("=" * 60)
     guard("start")
 
     noisy_rgba, gt_rgb, scene_feat = _render_pair(res, scene_idx=scene_idx)
     gt_latent = np.random.randn(1, latent).astype(np.float32) * 0.01
 
+    # Slim model: 2 conv2d (16D channels), latent=128
     p = {}
-    p.update(_init_render_encoder(latent))
-    p.update(_init_scene_encoder(latent))
-    p.update(_init_cross_attn(latent))
+    # render_encoder: 2 conv2d stride=2 → pool → linear(16, 128)
+    p["re_f1"] = _he((3, 3, 4, 16))
+    p["re_b1"] = np.zeros(16, dtype=np.float32)
+    p["re_f2"] = _he((3, 3, 16, 16))
+    p["re_b2"] = np.zeros(16, dtype=np.float32)
+    p["re_pw"] = _he((16, latent))
+    p["re_pb"] = np.zeros(latent, dtype=np.float32)
+    # scene_encoder: linear(18→32) → linear(32→128)
+    p["se_w1"] = _he((18, 32))
+    p["se_b1"] = np.zeros(32, dtype=np.float32)
+    p["se_pw"] = _he((32, latent))
+    p["se_pb"] = np.zeros(latent, dtype=np.float32)
+    # cross_attn: linear(128→128)
+    p["ca_gw"] = _he((latent, latent))
+    p["ca_gb"] = np.zeros(latent, dtype=np.float32)
 
     def loss_fn(p, noisy, scene_f, gt_lat):
-        scene_lat = scene_encoder(p, scene_f, silu_fn=silu_mojo)
-        render_lat = render_encoder(p, noisy, silu_fn=silu_mojo)
-        fused = cross_attn(p, render_lat, scene_lat, sigmoid_fn=sigmoid_mojo)
+        # 2 conv2d render encoder (no re_f3)
+        x = silu_mojo(conv2d(noisy, p["re_f1"], stride=2, padding=1, bias=p["re_b1"]))
+        x = silu_mojo(conv2d(x, p["re_f2"], stride=2, padding=1, bias=p["re_b2"]))
+        render_lat = x.mean(axis=(1, 2)) @ p["re_pw"] + p["re_pb"]
+        # scene encoder
+        h = silu_mojo(scene_f @ p["se_w1"] + p["se_b1"])
+        scene_lat = h @ p["se_pw"] + p["se_pb"]
+        # cross attention
+        g = sigmoid_mojo(render_lat @ p["ca_gw"] + p["ca_gb"])
+        fused = render_lat + g * scene_lat
         return nb.mean(square(fused - gt_lat))
 
     _report("B-init", p, time.time())
-    losses, p = train_loop(p, loss_fn, [noisy_rgba, scene_feat, gt_latent], steps=steps, label="B")
+    losses, p = train_loop(
+        p, loss_fn, [noisy_rgba, scene_feat, gt_latent], steps=steps, label="B"
+    )
     assert all(np.isfinite(v) for v in losses), "NaN in Stage B!"
     log.info("Stage B PASSED")
     del p, noisy_rgba, gt_rgb, gt_latent, scene_feat
@@ -507,7 +601,9 @@ def stage_b(res=64, latent=256, steps=10, scene_idx=1, **_kw):
 
 
 # ── Stage C: Full U-Net Decoder (11 conv2d total) ────────────
-def stage_c(res=64, latent=256, enc_ch=(64, 128, 256, 256), steps=10, scene_idx=2, **_kw):
+def stage_c(
+    res=64, latent=256, enc_ch=(64, 128, 256, 256), steps=10, scene_idx=2, **_kw
+):
     log.info("=" * 60)
     log.info("Stage C: Full model (11 conv2d) %dx%d latent=%d", res, res, latent)
     log.info("  decoder channels: %s", enc_ch)
@@ -530,7 +626,9 @@ def stage_c(res=64, latent=256, enc_ch=(64, 128, 256, 256), steps=10, scene_idx=
         return nb.mean(square(pred - gt))
 
     _report("C-init", p, time.time())
-    losses, p = train_loop(p, loss_fn, [noisy_rgba, gt_rgb, scene_feat], steps=steps, label="C")
+    losses, p = train_loop(
+        p, loss_fn, [noisy_rgba, gt_rgb, scene_feat], steps=steps, label="C"
+    )
     assert all(np.isfinite(v) for v in losses), "NaN in Stage C!"
     log.info("Stage C PASSED")
     del p, noisy_rgba, gt_rgb, scene_feat
@@ -606,7 +704,13 @@ def stage_e(latent=256, steps=5, res=None, **_kw):
 # ── Stage F: 60-min sustained at max safe config ──────────────
 def stage_f(res=64, latent=256, target_min=60, scene_idx=3, **_kw):
     log.info("=" * 60)
-    log.info("Stage F: %d-min sustained training at %dx%d latent=%d", target_min, res, res, latent)
+    log.info(
+        "Stage F: %d-min sustained training at %dx%d latent=%d",
+        target_min,
+        res,
+        res,
+        latent,
+    )
     log.info("=" * 60)
     guard("start")
 
@@ -672,7 +776,11 @@ def stage_f(res=64, latent=256, target_min=60, scene_idx=3, **_kw):
         if step % 20 == 0 or step == 1:
             log.info(
                 "F Step %d: loss=%.6f (%dms) lr=%.2e elapsed=%.1fmin",
-                step, loss_f, int(dt * 1000), lr, elapsed,
+                step,
+                loss_f,
+                int(dt * 1000),
+                lr,
+                elapsed,
             )
 
         del params, noisy, gt, sf, lv, grads, g_np
@@ -706,11 +814,21 @@ def main():
 
     parser = argparse.ArgumentParser(description="Omen GPU scale-up test")
     parser.add_argument("--stage", choices=list(STAGES.keys()), help="Run single stage")
-    parser.add_argument("--full", action="store_true", help="Run full model sweep (C + D)")
-    parser.add_argument("--steps", type=int, default=10, help="Steps per stage (default 10)")
-    parser.add_argument("--minutes", type=int, default=60, help="Stage F duration (default 60)")
-    parser.add_argument("--latent", type=int, default=256, help="Latent dim for stages (default 256)")
-    parser.add_argument("--res", type=int, default=64, help="Resolution for stages (default 64)")
+    parser.add_argument(
+        "--full", action="store_true", help="Run full model sweep (C + D)"
+    )
+    parser.add_argument(
+        "--steps", type=int, default=10, help="Steps per stage (default 10)"
+    )
+    parser.add_argument(
+        "--minutes", type=int, default=60, help="Stage F duration (default 60)"
+    )
+    parser.add_argument(
+        "--latent", type=int, default=256, help="Latent dim for stages (default 256)"
+    )
+    parser.add_argument(
+        "--res", type=int, default=64, help="Resolution for stages (default 64)"
+    )
     args = parser.parse_args()
 
     log.info("=" * 60)
