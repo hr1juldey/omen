@@ -12,10 +12,10 @@
 - [ ] 2.4 Implement `_generate_synthetic_aov()` fallback for when Mitsuba AOV fails
 - [ ] 2.5 Implement tile position encoding: `_add_tile_position(aov, tile_row, tile_col, grid_h, grid_w)` appending 2 sin/cos channels (10→12ch)
 
-## 3. Deep Scene Encoder
+## 3. Deep Scene Encoder (configurable 16/32/64 layers)
 
-- [ ] 3.1 Implement `init_scene_encoder_params()` — Linear(18,128) + 10× ResBlock params (W_residual, b_residual each 128→128) + Linear(128,128) = ~250K params with He init
-- [ ] 3.2 Implement `scene_encoder_fn(p, scene_features)` — 12-layer residual MLP: input → Linear(18,128) → 10× [silu(x @ W + b) + x] → Linear(128,128) → scene_latent (1, 128)
+- [ ] 3.1 Implement `init_scene_encoder_params(depth=32)` — Linear(18,128) + (depth-2)× ResBlock params (W_residual, b_residual each 128→128) + Linear(128,128). He init. Params: ~360K (16L) / ~770K (32L) / ~1.6M (64L)
+- [ ] 3.2 Implement `scene_encoder_fn(p, scene_features, depth=32)` — depth-layer residual MLP: input → Linear(18,128) → (depth-2)× [silu(x @ W + b) + x] → Linear(128,128) → scene_latent (1, 128)
 
 ## 4. FiLM-Conditioned Tile Encoder
 
@@ -33,7 +33,7 @@
 
 ## 6. Training Loop
 
-- [ ] 6.1 Implement `init_all_params(latent=128, channels=128)` — merge scene_encoder + tile_encoder + cross_attn params into single dict, log param count
+- [ ] 6.1 Implement `init_all_params(latent=128, channels=128, scene_depth=32)` — merge scene_encoder (configurable depth) + tile_encoder + cross_attn params into single dict, log param count
 - [ ] 6.2 Implement `train_loop()` — per-step: to_dev all params/data → nb.value_and_grad → realize_all → to_cpu grads → AdamW update (numpy) → guard() → cleanup. Track compile time, steady time, losses
 - [ ] 6.3 Implement `run_phase()` — render pair, init params, run train_loop, log results, check all finite
 
@@ -50,13 +50,14 @@
 
 ## 9. CLI & Sustained Mode
 
-- [ ] 9.1 Implement CLI: `--steps`, `--sustain` (minutes), `--channels` (128 default), `--latent` (128), `--show` (visualization flag), `--resolution` (256 default)
+- [ ] 9.1 Implement CLI: `--steps`, `--sustain` (minutes), `--channels` (128 default), `--latent` (128), `--scene-depth` (32 default, choices: 16/32/64), `--show` (visualization flag), `--resolution` (256 default)
 - [ ] 9.2 Implement `_run_sustained()` — sustained training with cosine LR decay, scene re-rendering every N steps, RSS/VRAM monitoring
 - [ ] 9.3 Implement `main()` — guard at start, dispatch to phase/sustain/show modes, final guard
 
 ## 10. Verification
 
-- [ ] 10.1 Run smoke test: `uv run tests/test_gpu_tiled_aov_denoiser.py --steps 10` at 256x256 single tile, verify loss converges and all values finite
-- [ ] 10.2 Run 1000-step convergence test: verify loss reaches ~0.000
-- [ ] 10.3 Run multi-tile test: `--resolution 512` (4 tiles), verify stitching produces correct 512x512 output
-- [ ] 10.4 Run `--show` visualization: verify GT/Noisy/Denoised figure saved to logs/
+- [ ] 10.1 Run smoke test: `uv run tests/test_gpu_tiled_aov_denoiser.py --steps 10 --scene-depth 16` at 256x256 single tile, verify loss converges and all values finite
+- [ ] 10.2 Run 1000-step convergence test at depth=32: verify loss reaches ~0.000
+- [ ] 10.3 Run deep encoder test: `--scene-depth 64 --steps 100`, verify 64-layer scene encoder trains without NaN/vanishing gradients
+- [ ] 10.4 Run multi-tile test: `--resolution 512` (4 tiles), verify stitching produces correct 512x512 output
+- [ ] 10.5 Run `--show` visualization: verify GT/Noisy/Denoised figure saved to logs/

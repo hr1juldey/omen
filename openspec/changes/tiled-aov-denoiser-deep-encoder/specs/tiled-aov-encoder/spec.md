@@ -11,16 +11,24 @@ The system SHALL split render images into 256x256 tiles with 16px overlap and pr
 - **WHEN** a 1024x1024 render is processed
 - **THEN** the system produces 16 tiles (4x4 grid) of 256x256 each
 
-### Requirement: Deep residual scene encoder
-The system SHALL encode scene graph features through a 12-layer residual MLP (18→128→...→128) producing a 128-dimensional scene latent vector.
+### Requirement: Deep residual scene encoder (configurable depth)
+The system SHALL encode scene graph features through a configurable-depth residual MLP (18→128→...→128) producing a 128-dimensional scene latent vector. Depth is controlled by `--scene-depth` CLI flag with choices 16, 32 (default), 64.
 
-#### Scenario: Scene encoding produces 128d latent
-- **WHEN** scene graph features (geometry 6d + materials 5d + lights 7d = 18d) are provided
-- **THEN** the encoder outputs a (1, 128) latent vector through 12 residual layers
+#### Scenario: Scene encoding produces 128d latent at any depth
+- **WHEN** scene graph features (geometry 6d + materials 5d + lights 7d = 18d) are provided with --scene-depth 32
+- **THEN** the encoder outputs a (1, 128) latent vector through 32 residual layers (Linear(18,128) + 30 ResBlocks + Linear(128,128))
 
-#### Scenario: Residual connections maintain gradient flow
-- **WHEN** backward pass runs through the 12-layer encoder
-- **THEN** gradients SHALL NOT vanish (all finite, no NaN) after 1000 training steps
+#### Scenario: 16-layer encoder
+- **WHEN** --scene-depth 16 is specified
+- **THEN** the encoder uses 14 ResBlocks (~360K params) and trains without error
+
+#### Scenario: 64-layer encoder
+- **WHEN** --scene-depth 64 is specified
+- **THEN** the encoder uses 62 ResBlocks (~1.6M params) and trains without error
+
+#### Scenario: Residual connections maintain gradient flow at all depths
+- **WHEN** backward pass runs through a 64-layer encoder for 1000 steps
+- **THEN** gradients SHALL NOT vanish (all finite, no NaN)
 
 ### Requirement: FiLM conditioning from scene latent
 The system SHALL inject scene context at every convolutional layer via Feature-wise Linear Modulation: `output = γ * conv_output + β` where γ and β are computed from scene_latent.

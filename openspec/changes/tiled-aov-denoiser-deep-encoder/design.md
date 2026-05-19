@@ -8,7 +8,7 @@ Hardware constraint: RTX 3060 12GB VRAM, 32GB system RAM. Target: 256x256 tiles 
 
 **Goals:**
 - Prove tiled 256x256 AOV denoising works end-to-end with loss convergence to zero
-- Validate deep (12-layer) residual scene encoder produces meaningful scene representations
+- Validate deep (16/32/64-layer) residual scene encoder produces meaningful scene representations
 - Validate FiLM conditioning from scene_latent at every conv layer
 - Multi-term loss: MSE + SIGReg + energy conservation physics loss
 - Decode and visualize GT / noisy / denoised output
@@ -31,17 +31,29 @@ Hardware constraint: RTX 3060 12GB VRAM, 32GB system RAM. Target: 256x256 tiles 
 
 **Alternative considered**: 128x128 tiles — more tiles, more overhead, less spatial context per tile. 512x512 tiles — 6GB VRAM, too tight for 12GB card with graph overhead.
 
-### D2: Scene encoder = 12-layer residual MLP (18→128→...→128)
+### D2: Scene encoder = configurable 16/32/64-layer residual MLP (18→128→...→128)
 
-**Choice**: Linear(18, 128) → 10× ResBlock(128→128 + silu + skip) → Linear(128, 128). ~250K params.
+**Choice**: `--scene-depth` CLI flag (default=32). Linear(18, 128) → N× ResBlock(128→128 + silu + skip) → Linear(128, 128).
 
-**Rationale**: ImageNet showed deeper = more semantic abstraction. Same principle: 12 layers let the encoder learn hierarchical scene representations:
-- Layers 1-3: raw features (light positions, material colors, bbox)
-- Layers 4-6: pairwise relationships (light-material interactions)
-- Layers 7-9: global properties (scene complexity, dominant transport)
-- Layers 10-12: scene signature (unique noise fingerprint)
+| Depth | ResBlocks | Total Layers | Params | Compile est. |
+|-------|-----------|-------------|--------|-------------|
+| 16    | 14        | 16          | ~360K  | ~2 min      |
+| 32    | 30        | 32          | ~770K  | ~5 min      |
+| 64    | 62        | 64          | ~1.6M  | ~15 min     |
 
-Overfitting is DESIRED — per-user pretraining means the encoder should memorize scene noise characteristics. The 128-dim bottleneck prevents memorizing pixel-level noise (only scene-level properties pass through).
+Each ResBlock is just 128×128 = 16K params (cheap). The cost is JIT compile time (more graph ops), not VRAM or runtime. Once cached, all depths run at the same steady-state speed.
+
+**Rationale**: ImageNet showed deeper = more semantic abstraction. Same principle: 64 layers let the encoder learn extremely fine-grained scene representations:
+- Layers 1-8: raw features (light positions, material colors, bbox dimensions)
+- Layers 9-16: entity-level (individual light characteristics, surface properties)
+- Layers 17-24: pairwise relationships (light-material, light-geometry interactions)
+- Layers 25-32: local transport (direct illumination patterns, shadow boundaries)
+- Layers 33-48: global transport (indirect bounce paths, caustic structure)
+- Layers 49-64: scene signature (unique noise fingerprint, energy distribution)
+
+Overfitting is DESIRED — per-user pretraining means the encoder should memorize scene noise characteristics. The 128-dim bottleneck prevents memorizing pixel-level noise (only scene-level properties pass through). At 64 layers, the encoder has enough capacity to distinguish subtle differences between similar scenes (e.g., two cornell boxes with different wall colors).
+
+**Why not deeper?** 128 layers would be ~3.2M params — still cheap in params, but JIT compile time would exceed 30 min on first run. nabla's graph fingerprinting recursion also scales with depth (already set to 50K limit). 64 is the sweet spot before diminishing returns.
 
 **Alternative considered**: Per-entity transformer (encode each light/material separately, then cross-attend) — too complex for nabla's graph engine, would blow compile time.
 
@@ -75,7 +87,7 @@ Where:
 ### D6: Architecture data flow
 
 ```
-Scene features (18d) → 12-layer MLP → scene_latent (128d)  [RUNS ONCE]
+Scene features (18d) → {16,32,64}-layer MLP → scene_latent (128d)  [RUNS ONCE]
                                                     │
                                         ┌───────────┤ FiLM generators
                                         │           │
@@ -98,7 +110,7 @@ Loss: MSE(fused, target) + SIGReg + EnergyConservation
 
 ## Risks / Trade-offs
 
-**[12-layer scene encoder JIT compile time]** → First compile may take 5-10 min with 12 extra linear layers + residual connections in the graph. Mitigated by JIT cache persistence (proven: 676s first → 58s cached).
+**[Deep scene encoder JIT compile time]** → First compile at 64 layers may take ~15 min with 62 extra linear layers + residual connections in the graph. Mitigated by JIT cache persistence (proven: 676s first → 58s cached). Default depth=32 as the practical default (~5 min first compile).
 
 **[Tile boundary artifacts]** → 16px overlap may not be enough for scenes with large-scale caustics. Mitigated by scene_latent providing global context — the network knows about off-screen lights even at tile boundaries.
 
