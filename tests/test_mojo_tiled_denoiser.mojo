@@ -32,7 +32,7 @@ comptime DEFAULT_DEPTH = 4
 comptime AOV_BASE_CH = 13
 comptime AOV_POS_CH = 2
 comptime AOV_CH = AOV_BASE_CH + AOV_POS_CH  # 15 total
-comptime TILE_SIZE = 64
+comptime TILE_SIZE = 512
 comptime BLOCK_SIZE = 256
 
 # Tile encoder spatial dims after stride-2 convs
@@ -921,8 +921,8 @@ def main() raises:
     comptime adamw_res = adamw_kernel[type_of(row_major[CHANNELS * CHANNELS]())]
 
     # ── Training loop ─────────────────────────────────────────────────
-    comptime STEPS = 10
-    comptime LR: Float32 = 1e-3
+    comptime STEPS = 10000
+    comptime LR: Float32 = 1e-4
     comptime BETA1: Float32 = 0.9
     comptime BETA2: Float32 = 0.999
     comptime EPS: Float32 = 1e-8
@@ -932,7 +932,7 @@ def main() raises:
 
     for step in range(1, STEPS + 1):
         # ── Render Mitsuba scene ────────────────────────────────────
-        var render_result = render_mitsuba_tile(ctx, np, step % 2, 42 + step)
+        var render_result = render_mitsuba_tile(ctx, np, step % 5, 42 + step)
         var aov_buf = render_result[0]
         var scene_buf = render_result[1]
         var target_buf = render_result[2]
@@ -953,7 +953,7 @@ def main() raises:
             TileTensor(conv1_w, row_major[3 * 3 * AOV_CH, CHANNELS]()),
             TileTensor(conv1_out_2d, row_major[H1 * W1, CHANNELS]()),
             H1 * W1, 3 * 3 * AOV_CH, CHANNELS,
-            grid_dim=(W1, 1), block_dim=(1, 16),
+            grid_dim=ceildiv(H1 * W1 * CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         ctx.enqueue_function[bias_conv1](
             TileTensor(conv1_out_2d, row_major[H1 * W1, CHANNELS]()),
@@ -969,7 +969,7 @@ def main() raises:
             TileTensor(se_in_w, row_major[SCENE_FEAT_DIM, CHANNELS]()),
             TileTensor(scene_enc_out, layout_1_128),
             1, SCENE_FEAT_DIM, CHANNELS,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         var scene_bias_tmp = ctx.enqueue_create_buffer[dtype](1 * CHANNELS)
         ctx.enqueue_function[bias_add_1_128](
@@ -993,7 +993,7 @@ def main() raises:
                 TileTensor(se_res_w[i], row_major[CHANNELS, CHANNELS]()),
                 TileTensor(res_out, layout_1_128),
                 1, CHANNELS, CHANNELS,
-                grid_dim=1, block_dim=(1, 16),
+                grid_dim=ceildiv(CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
             )
             ctx.enqueue_function[bias_add_1_128](
                 TileTensor(res_out, layout_1_128),
@@ -1025,7 +1025,7 @@ def main() raises:
             TileTensor(se_out_w, row_major[CHANNELS, LATENT_DIM]()),
             TileTensor(scene_latent, layout_1_latent),
             1, CHANNELS, LATENT_DIM,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(LATENT_DIM, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         ctx.enqueue_function[bias_add_1_latent](
             TileTensor(scene_latent, layout_1_latent),
@@ -1043,7 +1043,7 @@ def main() raises:
             TileTensor(film1_gw, row_major[LATENT_DIM, CHANNELS]()),
             TileTensor(film1_g_out, layout_1_128),
             1, LATENT_DIM, CHANNELS,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         ctx.enqueue_function[bias_add_1_128](
             TileTensor(film1_g_out, layout_1_128),
@@ -1058,7 +1058,7 @@ def main() raises:
             TileTensor(film1_bw, row_major[LATENT_DIM, CHANNELS]()),
             TileTensor(film1_b_out, layout_1_128),
             1, LATENT_DIM, CHANNELS,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         ctx.enqueue_function[bias_add_1_128](
             TileTensor(film1_b_out, layout_1_128),
@@ -1096,7 +1096,7 @@ def main() raises:
             TileTensor(conv2_w, row_major[3 * 3 * CHANNELS, CHANNELS]()),
             TileTensor(conv2_out_2d, row_major[H2 * W2, CHANNELS]()),
             H2 * W2, 3 * 3 * CHANNELS, CHANNELS,
-            grid_dim=(W2, 1), block_dim=(1, 16),
+            grid_dim=ceildiv(H2 * W2 * CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         ctx.enqueue_function[bias_conv2](
             TileTensor(conv2_out_2d, row_major[H2 * W2, CHANNELS]()),
@@ -1113,7 +1113,7 @@ def main() raises:
             TileTensor(film2_gw, row_major[LATENT_DIM, CHANNELS]()),
             TileTensor(film2_g_out, layout_1_128),
             1, LATENT_DIM, CHANNELS,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         ctx.enqueue_function[bias_add_1_128](
             TileTensor(film2_g_out, layout_1_128),
@@ -1128,7 +1128,7 @@ def main() raises:
             TileTensor(film2_bw, row_major[LATENT_DIM, CHANNELS]()),
             TileTensor(film2_b_out, layout_1_128),
             1, LATENT_DIM, CHANNELS,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(CHANNELS, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         ctx.enqueue_function[bias_add_1_128](
             TileTensor(film2_b_out, layout_1_128),
@@ -1165,7 +1165,7 @@ def main() raises:
             TileTensor(pool_proj_w, row_major[CHANNELS, LATENT_DIM]()),
             TileTensor(tile_latent, layout_1_latent),
             1, CHANNELS, LATENT_DIM,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(LATENT_DIM, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         var tile_lat_bias = ctx.enqueue_create_buffer[dtype](1 * LATENT_DIM)
         ctx.enqueue_function[bias_add_1_latent](
@@ -1183,7 +1183,7 @@ def main() raises:
             TileTensor(ca_gw, row_major[LATENT_DIM, LATENT_DIM]()),
             TileTensor(gate_pre, layout_1_latent),
             1, LATENT_DIM, LATENT_DIM,
-            grid_dim=1, block_dim=(1, 16),
+            grid_dim=ceildiv(LATENT_DIM, BLOCK_SIZE), block_dim=BLOCK_SIZE,
         )
         var gate_pre_bias = ctx.enqueue_create_buffer[dtype](1 * LATENT_DIM)
         ctx.enqueue_function[bias_add_1_latent](
@@ -1836,11 +1836,11 @@ def main() raises:
 
         ctx.synchronize()
 
-        var scene_name = "shaderball"
-        if step % 2 == 0:
-            scene_name = "cornell"
+        var scene_names = ["cornell", "veach", "shaderball", "studio", "foggy"]
+        var scene_name = scene_names[step % 5]
 
-        print("Step {} - scene: {} - loss: {}".format(step, scene_name, loss_val))
+        if step % 100 == 0 or step == 1:
+            print("Step {} - scene: {} - loss: {}".format(step, scene_name, loss_val))
 
     print("=" * 60)
     print("Training complete!")

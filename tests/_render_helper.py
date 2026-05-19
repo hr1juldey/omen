@@ -9,10 +9,16 @@ import mitsuba as mi
 
 mi.set_variant("scalar_rgb")
 
-from omen.scenes import build_cornell_box, build_shaderball
+from omen.scenes import (
+    build_cornell_box,
+    build_veach_ajar,
+    build_shaderball,
+    build_studio_product,
+    build_foggy_corridor,
+)
 
-_BUILDERS = [build_cornell_box, build_shaderball]
-SCENE_NAMES = ["cornell", "shaderball"]
+_BUILDERS = [build_cornell_box, build_veach_ajar, build_shaderball, build_studio_product, build_foggy_corridor]
+SCENE_NAMES = ["cornell", "veach", "shaderball", "studio", "foggy"]
 _PROJ = None
 
 
