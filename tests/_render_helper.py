@@ -7,7 +7,13 @@ sys.path.insert(0, "/home/riju279/Documents/Projects/MOJO/Cycles_mojo/omen/src")
 import numpy as np
 import mitsuba as mi
 
-mi.set_variant("scalar_rgb")
+# Use GPU variant for rendering — falls back to CPU if unavailable
+_available = set(mi.variants())
+_variant = next(
+    (v for v in ("cuda_ad_rgb", "llvm_ad_rgb", "scalar_rgb") if v in _available),
+    "scalar_rgb",
+)
+mi.set_variant(_variant)
 
 from omen.scenes import (
     build_cornell_box,
