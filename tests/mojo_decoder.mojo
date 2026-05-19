@@ -461,30 +461,30 @@ def main() raises:
     var u2_w = ctx.enqueue_create_buffer[dtype](MID * UP2)
     var u2_b = ctx.enqueue_create_buffer[dtype](UP2)
 
-    # Xavier init
+    # Xavier init — full-size host buffer per weight matrix
     var bn_w_np = rng.randn(LATENT, CH).astype("float32") * np.sqrt(2.0 / LATENT)
+    var host_bn_w = ctx.enqueue_create_host_buffer[dtype](LATENT * CH)
     for i in range(LATENT * CH):
-        var host = ctx.enqueue_create_host_buffer[dtype](1)
-        host[0] = Float32(py=bn_w_np.ravel()[i])
-        ctx.enqueue_copy(dst_buf=bn_w, src_buf=host)
+        host_bn_w[i] = Float32(py=bn_w_np.ravel()[i])
+    ctx.enqueue_copy(dst_buf=bn_w, src_buf=host_bn_w)
     bn_b.enqueue_fill(0.0)
     var u1_np = rng.randn(CH, UP1).astype("float32") * np.sqrt(2.0 / CH)
+    var host_u1_w = ctx.enqueue_create_host_buffer[dtype](CH * UP1)
     for i in range(CH * UP1):
-        var host = ctx.enqueue_create_host_buffer[dtype](1)
-        host[0] = Float32(py=u1_np.ravel()[i])
-        ctx.enqueue_copy(dst_buf=u1_w, src_buf=host)
+        host_u1_w[i] = Float32(py=u1_np.ravel()[i])
+    ctx.enqueue_copy(dst_buf=u1_w, src_buf=host_u1_w)
     u1_b.enqueue_fill(0.0)
     var md_np = rng.randn(CH, MID).astype("float32") * np.sqrt(2.0 / CH)
+    var host_md_w = ctx.enqueue_create_host_buffer[dtype](CH * MID)
     for i in range(CH * MID):
-        var host = ctx.enqueue_create_host_buffer[dtype](1)
-        host[0] = Float32(py=md_np.ravel()[i])
-        ctx.enqueue_copy(dst_buf=md_w, src_buf=host)
+        host_md_w[i] = Float32(py=md_np.ravel()[i])
+    ctx.enqueue_copy(dst_buf=md_w, src_buf=host_md_w)
     md_b.enqueue_fill(0.0)
     var u2_np = rng.randn(MID, UP2).astype("float32") * np.sqrt(2.0 / MID)
+    var host_u2_w = ctx.enqueue_create_host_buffer[dtype](MID * UP2)
     for i in range(MID * UP2):
-        var host = ctx.enqueue_create_host_buffer[dtype](1)
-        host[0] = Float32(py=u2_np.ravel()[i])
-        ctx.enqueue_copy(dst_buf=u2_w, src_buf=host)
+        host_u2_w[i] = Float32(py=u2_np.ravel()[i])
+    ctx.enqueue_copy(dst_buf=u2_w, src_buf=host_u2_w)
     u2_b.enqueue_fill(0.0)
     ctx.synchronize()
 
