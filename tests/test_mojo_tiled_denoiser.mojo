@@ -28,7 +28,7 @@ comptime dtype = DType.float32
 comptime SCENE_FEAT_DIM = 18
 comptime LATENT_DIM = 1024
 comptime CHANNELS = 512
-comptime DEFAULT_DEPTH = 16384
+comptime DEFAULT_DEPTH = 128
 comptime AOV_BASE_CH = 13
 comptime AOV_POS_CH = 2
 comptime AOV_CH = AOV_BASE_CH + AOV_POS_CH  # 15 total
@@ -921,7 +921,7 @@ def main() raises:
     comptime adamw_res = adamw_kernel[type_of(row_major[CHANNELS * CHANNELS]())]
 
     # ── Training loop ─────────────────────────────────────────────────
-    comptime STEPS = 10000
+    comptime STEPS = 100000
     comptime LR: Float32 = 1e-4
     comptime BETA1: Float32 = 0.9
     comptime BETA2: Float32 = 0.999
