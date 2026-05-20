@@ -26,9 +26,9 @@ from layout import TileTensor, TensorLayout, row_major, stack_allocation
 # ── Comptime constants ────────────────────────────────────────────
 comptime dtype = DType.float32
 comptime SCENE_FEAT_DIM = 18
-comptime LATENT_DIM = 1024
+comptime LATENT_DIM = 512
 comptime CHANNELS = 512
-comptime DEFAULT_DEPTH = 1024
+comptime DEFAULT_DEPTH = 512
 comptime AOV_BASE_CH = 13
 comptime AOV_POS_CH = 2
 comptime AOV_CH = AOV_BASE_CH + AOV_POS_CH  # 15 total
